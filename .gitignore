@@ -1,0 +1,12 @@
+build/
+build_*/
+test_db/
+*.wal
+*.wal.tmp
+*.o
+*.obj
+compile_commands.json
+.cache/
+.vscode/
+.idea/
+*.out

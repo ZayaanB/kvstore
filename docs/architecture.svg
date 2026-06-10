@@ -1,0 +1,75 @@
+<svg width="680" height="520" viewBox="0 0 680 520" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>KVStore architecture diagram</title>
+<desc>Diagram showing the embedded key-value store architecture: API layer with Set, Get, Delete and Compact operations, a write path through the WAL mutex and write-ahead log file, a sharded in-memory index of 16 shards each with its own shared mutex and hash map, and a recovery path that replays the WAL into the shards on startup.</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="#5f5e5a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+</defs>
+
+<rect width="680" height="520" fill="#ffffff"/>
+
+<g>
+<rect x="180" y="20" width="320" height="56" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="340" y="40" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="500" fill="#2C2C2A">Public API</text>
+<text x="340" y="60" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#444441">Set, Get, Delete, Compact</text>
+</g>
+
+<line x1="280" y1="76" x2="280" y2="110" stroke="#5f5e5a" stroke-width="0.5" marker-end="url(#arrow)"/>
+<text x="190" y="96" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#444441">writes</text>
+
+<line x1="430" y1="76" x2="430" y2="290" stroke="#5f5e5a" stroke-width="0.5" marker-end="url(#arrow)"/>
+<text x="500" y="96" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#444441">reads</text>
+
+<g>
+<rect x="120" y="110" width="320" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+<text x="280" y="130" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="500" fill="#4A1B0C">WAL append + flush</text>
+<text x="280" y="150" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#712B13">single mutex, ordered log</text>
+</g>
+
+<line x1="280" y1="166" x2="280" y2="200" stroke="#5f5e5a" stroke-width="0.5" marker-end="url(#arrow)"/>
+
+<g>
+<rect x="120" y="200" width="320" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+<text x="280" y="220" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="500" fill="#4A1B0C">db.wal on disk</text>
+<text x="280" y="240" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#712B13">binary records, durable</text>
+</g>
+
+<line x1="280" y1="256" x2="280" y2="290" stroke="#5f5e5a" stroke-width="0.5" marker-end="url(#arrow)"/>
+<text x="200" y="276" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#444441">apply</text>
+
+<g>
+<rect x="60" y="290" width="560" height="160" rx="14" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+<text x="80" y="312" font-family="sans-serif" font-size="14" font-weight="500" fill="#26215C">Sharded in-memory index (16 shards)</text>
+</g>
+
+<g>
+<rect x="80" y="330" width="120" height="100" rx="8" fill="#CECBF6" stroke="#534AB7" stroke-width="0.5"/>
+<text x="140" y="356" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="500" fill="#26215C">Shard 0</text>
+<text x="140" y="376" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#3C3489">shared_mutex</text>
+<text x="140" y="394" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#3C3489">unordered_map</text>
+</g>
+<g>
+<rect x="220" y="330" width="120" height="100" rx="8" fill="#CECBF6" stroke="#534AB7" stroke-width="0.5"/>
+<text x="280" y="356" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="500" fill="#26215C">Shard 1</text>
+<text x="280" y="376" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#3C3489">shared_mutex</text>
+<text x="280" y="394" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#3C3489">unordered_map</text>
+</g>
+<g>
+<rect x="360" y="330" width="120" height="100" rx="8" fill="#CECBF6" stroke="#534AB7" stroke-width="0.5"/>
+<text x="420" y="356" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="500" fill="#26215C">Shard 2</text>
+<text x="420" y="376" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#3C3489">shared_mutex</text>
+<text x="420" y="394" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#3C3489">unordered_map</text>
+</g>
+<g>
+<rect x="500" y="330" width="100" height="100" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="550" y="378" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="500" fill="#2C2C2A">...</text>
+<text x="550" y="402" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#444441">15 more</text>
+</g>
+
+<line x1="280" y1="450" x2="280" y2="480" stroke="#5f5e5a" stroke-width="0.5" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<g>
+<rect x="120" y="480" width="320" height="36" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="280" y="503" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#04342C">Startup recovery: replay WAL into shards</text>
+</g>
+</svg>

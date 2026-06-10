@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: release
+            cxx_flags: "-O2"
+          - name: thread-sanitizer
+            cxx_flags: "-O1 -g -fsanitize=thread"
+          - name: address-undefined-sanitizer
+            cxx_flags: "-O1 -g -fsanitize=address,undefined"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake g++
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Run tests (${{ matrix.name }})
+        working-directory: build
+        run: ./kvstore_test
