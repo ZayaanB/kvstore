@@ -12,7 +12,7 @@ KVStore::KVStore(std::string path)
     : path_(std::move(path)),
       wal_path_(path_ + ".wal"),
       wal_tmp_path_(path_ + ".wal.tmp") {
-    // Ensure parent directory exists.
+    // make sure the directory the db lives in actually exists.
     fs::path p(path_);
     if (p.has_parent_path()) {
         std::error_code ec;
@@ -54,7 +54,7 @@ void KVStore::OpenWalForAppend() {
 void KVStore::Recover() {
     std::ifstream in(wal_path_, std::ios::binary);
     if (!in.is_open()) {
-        // No existing WAL; fresh database.
+        // no log yet, so there's nothing to recover.
         return;
     }
 
@@ -70,7 +70,8 @@ void KVStore::Recover() {
         std::string key(hdr.key_len, '\0');
         if (hdr.key_len > 0) {
             in.read(key.data(), static_cast<std::streamsize>(hdr.key_len));
-            if (!in) break; // truncated record -> stop replay (crash mid-write)
+            // partial key means the last write was cut short by a crash.
+            if (!in) break;
         }
 
         std::string value;
@@ -78,7 +79,8 @@ void KVStore::Recover() {
             value.resize(hdr.value_len);
             if (hdr.value_len > 0) {
                 in.read(value.data(), static_cast<std::streamsize>(hdr.value_len));
-                if (!in) break; // truncated record -> stop replay
+                // same deal - truncated value, stop replaying.
+                if (!in) break;
             }
         }
 
@@ -96,7 +98,7 @@ void KVStore::Recover() {
                 break;
             }
             default:
-                // Unknown/corrupt record type -> stop replay.
+                // unrecognized record type, stop rather than read garbage.
                 return;
         }
     }
@@ -121,12 +123,13 @@ bool KVStore::AppendRecordLocked(RecordType type, const std::string& key,
         wal_stream_.write(value.data(), static_cast<std::streamsize>(value.size()));
     }
 
+    // flush now so the record is on disk before we touch the in-memory map.
     wal_stream_.flush();
     return wal_stream_.good();
 }
 
 bool KVStore::Set(const std::string& key, const std::string& value) {
-    // 1. Durably log the mutation first (WAL-ahead).
+    // log first, apply second, so a crash in between is recoverable.
     {
         std::lock_guard<std::mutex> wal_lock(wal_mutex_);
         if (!AppendRecordLocked(RecordType::kSet, key, value)) {
@@ -134,7 +137,6 @@ bool KVStore::Set(const std::string& key, const std::string& value) {
         }
     }
 
-    // 2. Apply to the in-memory sharded index.
     Shard& shard = ShardFor(key);
     std::unique_lock lock(shard.mutex);
     shard.data[key] = value;
@@ -177,7 +179,7 @@ std::size_t KVStore::Size() const {
 bool KVStore::Compact() {
     bool expected = false;
     if (!compaction_in_progress_.compare_exchange_strong(expected, true)) {
-        // Another compaction is already running.
+        // somebody's already compacting, don't pile on.
         return false;
     }
 
@@ -186,16 +188,14 @@ bool KVStore::Compact() {
         ~CompactionGuard() { flag.store(false); }
     } guard{compaction_in_progress_};
 
-    // 1. Write a clean snapshot of all currently-live keys to a temp file.
-    //    Each shard is locked individually (shared lock) so writers on
-    //    other shards are never blocked, and readers are never blocked
-    //    on this shard either.
+    // step 1: write a clean copy of every live key/value pair to a temp file.
     {
         std::ofstream tmp(wal_tmp_path_, std::ios::binary | std::ios::trunc | std::ios::out);
         if (!tmp.is_open()) {
             return false;
         }
 
+        // shard-by-shard shared locks let other shards (and readers here) keep going.
         for (auto& shard : shards_) {
             std::shared_lock lock(shard.mutex);
             for (const auto& [key, value] : shard.data) {
@@ -226,12 +226,7 @@ bool KVStore::Compact() {
         tmp.close();
     }
 
-    // 2. Atomically swap the temp file in as the new WAL.
-    //    Hold wal_mutex_ for the duration of the swap so that any in-flight
-    //    Set/Delete either completes fully against the old file before the
-    //    swap, or is appended to the new file after the swap. No user write
-    //    is dropped: the close+rename+reopen sequence happens while holding
-    //    the WAL lock, guaranteeing ordering.
+    // step 2: swap the temp file in while holding wal_mutex_ so no write is lost.
     {
         std::lock_guard<std::mutex> wal_lock(wal_mutex_);
 
@@ -243,7 +238,7 @@ bool KVStore::Compact() {
         std::error_code ec;
         fs::rename(wal_tmp_path_, wal_path_, ec);
         if (ec) {
-            // Attempt to reopen the old WAL so the store remains usable.
+            // rename failed, try to reopen the old log and report failure.
             wal_stream_.open(wal_path_, std::ios::binary | std::ios::app | std::ios::out);
             return false;
         }
@@ -257,4 +252,4 @@ bool KVStore::Compact() {
     return true;
 }
 
-} // namespace kvstore
+}

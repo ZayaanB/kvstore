@@ -31,17 +31,15 @@ void PrintHeader(const std::string& title) {
     std::cout << "\n=== " << title << " ===\n";
 }
 
-} // namespace
+}
 
 int main() {
-    // Clean slate for the test run.
+    // clean slate for the test run.
     std::error_code ec;
     fs::remove_all("test_db", ec);
     fs::create_directories("test_db", ec);
 
-    // -------------------------------------------------------------------
-    // Phase 1: Concurrent writers/readers stress test.
-    // -------------------------------------------------------------------
+    // phase 1: concurrent writers/readers stress test.
     PrintHeader("Phase 1: Concurrent stress test (writes + overlapping reads)");
     {
         auto store = std::make_unique<kvstore::KVStore>(kDbPath);
@@ -57,12 +55,11 @@ int main() {
                 for (int i = 0; i < kKeysPerWorker; ++i) {
                     const std::string key = MakeKey(w, i);
                     const std::string value = MakeValue(w, i, 1);
-                    bool ok = store->Set(key, value);
+                    [[maybe_unused]] bool ok = store->Set(key, value);
                     assert(ok && "Set should succeed");
                     total_writes.fetch_add(1, std::memory_order_relaxed);
 
-                    // Overlapping key space: also touch a neighbor's key
-                    // range to create cross-shard contention.
+                    // also touch a neighbor's key range to create cross-shard contention.
                     int neighbor = (w + 1) % kNumWorkers;
                     std::string shared_key = "shared_key_" + std::to_string(i % 50);
                     store->Set(shared_key, MakeValue(neighbor, i, 1));
@@ -70,7 +67,7 @@ int main() {
             });
         }
 
-        // Reader threads concurrently hammer Get() on keys being written.
+        // reader threads concurrently hammer get() on keys being written.
         std::vector<std::thread> readers;
         readers.reserve(static_cast<std::size_t>(kNumWorkers));
         for (int r = 0; r < kNumWorkers; ++r) {
@@ -92,8 +89,8 @@ int main() {
 
         for (auto& t : writers) t.join();
 
-        // A concurrent compaction while readers are still active.
-        bool compacted = store->Compact();
+        // a concurrent compaction while readers are still active.
+        [[maybe_unused]] bool compacted = store->Compact();
         assert(compacted && "Compaction should succeed");
 
         stop_readers.store(true, std::memory_order_relaxed);
@@ -103,7 +100,7 @@ int main() {
         std::cout << "Total successful reads observed: " << total_reads.load() << "\n";
         std::cout << "Store size after phase 1: " << store->Size() << "\n";
 
-        // Verify all worker-specific keys are present and correct.
+        // verify all worker-specific keys are present and correct.
         for (int w = 0; w < kNumWorkers; ++w) {
             for (int i = 0; i < kKeysPerWorker; ++i) {
                 auto val = store->Get(MakeKey(w, i));
@@ -113,43 +110,34 @@ int main() {
         }
         std::cout << "Phase 1 verification PASSED.\n";
 
-        // store goes out of scope -> destructor flushes & closes WAL,
-        // simulating an orderly shutdown before the "crash" phase.
+        // store goes out of scope here, destructor flushes and closes the wal.
     }
 
-    // -------------------------------------------------------------------
-    // Phase 2: Simulate abrupt termination by writing extra records via a
-    // raw handle, then dropping the object WITHOUT calling Compact, and
-    // truncating the file to simulate a torn final write.
-    // -------------------------------------------------------------------
+    // phase 2: simulate abrupt termination via extra writes plus a torn trailing record.
     PrintHeader("Phase 2: Crash simulation (extra writes + torn record)");
     {
         auto store = std::make_unique<kvstore::KVStore>(kDbPath);
 
-        // Additional writes after recovery from phase 1's clean state.
+        // additional writes after recovery from phase 1's clean state.
         for (int i = 0; i < 100; ++i) {
             std::string key = "crash_key_" + std::to_string(i);
             std::string value = "crash_val_" + std::to_string(i);
-            bool ok = store->Set(key, value);
+            [[maybe_unused]] bool ok = store->Set(key, value);
             assert(ok);
         }
 
-        // Delete some pre-existing keys to test delete-record replay.
+        // delete some pre-existing keys to test delete-record replay.
         for (int i = 0; i < 50; ++i) {
-            bool ok = store->Delete(MakeKey(0, i));
+            [[maybe_unused]] bool ok = store->Delete(MakeKey(0, i));
             assert(ok);
         }
 
         std::cout << "Pre-crash size: " << store->Size() << "\n";
 
-        // "Crash": drop the object without graceful shutdown semantics
-        // beyond what the destructor does (it still flushes the OS file
-        // handle since std::ofstream destructor closes the stream; data
-        // already reached the OS via flush() on every Set/Delete).
+        // "crash": drop the object without an orderly shutdown beyond the destructor.
     }
 
-    // Simulate a torn write at the tail of the WAL (e.g., power loss mid
-    // append): append a few garbage bytes that do not form a full record.
+    // simulate a torn write at the tail of the wal with a few incomplete header bytes.
     {
         std::ofstream raw(std::string(kDbPath) + ".wal",
                           std::ios::binary | std::ios::app);
@@ -159,29 +147,27 @@ int main() {
         raw.flush();
     }
 
-    // -------------------------------------------------------------------
-    // Phase 3: Restart and validate recovered state.
-    // -------------------------------------------------------------------
+    // phase 3: restart and validate recovered state.
     PrintHeader("Phase 3: Restart & recovery validation");
     {
         auto store = std::make_unique<kvstore::KVStore>(kDbPath);
 
         std::cout << "Recovered size: " << store->Size() << "\n";
 
-        // Keys 0..49 of worker 0 were deleted in phase 2.
+        // keys 0..49 of worker 0 were deleted in phase 2.
         for (int i = 0; i < 50; ++i) {
             auto val = store->Get(MakeKey(0, i));
             assert(!val.has_value() && "Deleted key must not be present after recovery");
         }
 
-        // Remaining keys of worker 0 must still be present.
+        // remaining keys of worker 0 must still be present.
         for (int i = 50; i < kKeysPerWorker; ++i) {
             auto val = store->Get(MakeKey(0, i));
             assert(val.has_value() && "Non-deleted key must survive recovery");
             assert(*val == MakeValue(0, i, 1));
         }
 
-        // Other workers' keys must be fully intact.
+        // other workers' keys must be fully intact.
         for (int w = 1; w < kNumWorkers; ++w) {
             for (int i = 0; i < kKeysPerWorker; ++i) {
                 auto val = store->Get(MakeKey(w, i));
@@ -190,21 +176,17 @@ int main() {
             }
         }
 
-        // Crash-phase writes must be present.
+        // crash-phase writes must be present.
         for (int i = 0; i < 100; ++i) {
             auto val = store->Get("crash_key_" + std::to_string(i));
             assert(val.has_value());
             assert(*val == "crash_val_" + std::to_string(i));
         }
 
-        // Torn trailing garbage must not corrupt anything beyond it
-        // (recovery stops cleanly at the truncated record).
+        // torn trailing garbage didn't corrupt anything before it.
         std::cout << "Phase 3 verification PASSED.\n";
 
-        // -------------------------------------------------------------
-        // Phase 4: Post-recovery compaction + concurrent ops, then a
-        // second restart to ensure compacted log replays correctly.
-        // -------------------------------------------------------------
+        // phase 4: post-recovery compaction plus concurrent ops, then a second restart.
         PrintHeader("Phase 4: Compaction after recovery + second restart");
 
         std::vector<std::thread> threads;
@@ -219,7 +201,7 @@ int main() {
         }
         for (auto& t : threads) t.join();
 
-        bool compacted = store->Compact();
+        [[maybe_unused]] bool compacted = store->Compact();
         assert(compacted);
 
         std::size_t size_before_restart = store->Size();
@@ -230,13 +212,13 @@ int main() {
         auto store = std::make_unique<kvstore::KVStore>(kDbPath);
         std::cout << "Size after second restart: " << store->Size() << "\n";
 
-        // Verify deleted keys remain deleted after compaction + restart.
+        // verify deleted keys remain deleted after compaction and restart.
         for (int i = 0; i < 50; ++i) {
             auto val = store->Get(MakeKey(0, i));
             assert(!val.has_value());
         }
 
-        // Verify post-recovery writes survived compaction + restart.
+        // verify post-recovery writes survived compaction and restart.
         for (int w = 0; w < kNumWorkers; ++w) {
             for (int i = 0; i < 100; ++i) {
                 std::string key = "post_recovery_" + std::to_string(w) + "_" +
@@ -247,7 +229,7 @@ int main() {
             }
         }
 
-        // Verify crash-phase keys survived compaction + restart.
+        // verify crash-phase keys survived compaction and restart.
         for (int i = 0; i < 100; ++i) {
             auto val = store->Get("crash_key_" + std::to_string(i));
             assert(val.has_value());
