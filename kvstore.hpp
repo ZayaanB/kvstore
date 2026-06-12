@@ -12,58 +12,56 @@
 
 namespace kvstore {
 
+// 16 shards is a decent default for spreading out lock contention.
 constexpr std::size_t kNumShards = 16;
 
-// Binary WAL record types
+// what kind of mutation a wal record represents.
 enum class RecordType : std::uint8_t {
     kSet = 1,
     kDelete = 2,
 };
 
-// On-disk record header (followed by key bytes, then value bytes for kSet)
+// header written before every record, followed by key bytes (and value bytes for a set).
 struct RecordHeader {
     RecordType type;
     std::uint32_t key_len;
-    std::uint32_t value_len; // 0 for delete
+    std::uint32_t value_len;
 };
 
-// A single shard: its own map + its own lock for fine-grained concurrency.
+// one shard of the keyspace: its own map and its own lock.
 struct Shard {
     mutable std::shared_mutex mutex;
     std::unordered_map<std::string, std::string> data;
 };
 
-// Production-grade embedded KV store with WAL durability,
-// crash recovery and online compaction.
+// a simple embedded key-value store with a write-ahead log for durability.
 class KVStore {
 public:
-    // Opens (creating if necessary) the store at the given path.
-    // Performs crash recovery by replaying the WAL.
+    // opens (or creates) the store at the given path and replays its wal.
     explicit KVStore(std::string path);
 
     ~KVStore();
 
+    // not copyable - this thing owns a file handle and a bunch of mutexes.
     KVStore(const KVStore&) = delete;
     KVStore& operator=(const KVStore&) = delete;
 
-    // Insert or update a key. Durable: WAL-flushed before returning true.
+    // insert or overwrite a key.
     bool Set(const std::string& key, const std::string& value);
 
-    // Retrieve a value if present.
+    // look up a key, empty optional if it's not present.
     std::optional<std::string> Get(const std::string& key) const;
 
-    // Remove a key. Durable: WAL-flushed before returning true.
+    // remove a key, still durable/logged even if it wasn't present.
     bool Delete(const std::string& key);
 
-    // Compact the WAL: write only live key/value pairs to a fresh log file
-    // and atomically swap it in as the active log, without blocking readers
-    // or writers for more than the per-shard critical sections.
+    // rewrite the log down to just the live keys and swap it in atomically.
     bool Compact();
 
-    // Number of live keys across all shards (approximate under concurrency).
+    // total number of keys across all shards right now.
     std::size_t Size() const;
 
-    // Path to the active WAL file (for test introspection).
+    // mostly useful for tests that want to peek at the log file directly.
     const std::string& WalPath() const { return wal_path_; }
 
 private:
@@ -72,14 +70,14 @@ private:
     Shard& ShardFor(const std::string& key);
     const Shard& ShardFor(const std::string& key) const;
 
-    // Append a record to the WAL. Caller must hold wal_mutex_.
+    // writes one record to the wal stream and flushes it, caller must hold wal_mutex_.
     bool AppendRecordLocked(RecordType type, const std::string& key,
                              const std::string& value);
 
-    // Replays the WAL on startup to rebuild in-memory state.
+    // reads the wal from the start and replays every record into the shards.
     void Recover();
 
-    // Opens (or re-opens) the WAL output stream in append mode.
+    // (re)opens the wal file for appending.
     void OpenWalForAppend();
 
     std::string path_;
@@ -88,14 +86,12 @@ private:
 
     std::array<Shard, kNumShards> shards_;
 
-    // Guards the WAL output stream itself (separate from per-shard locks
-    // so different shards can mutate concurrently while WAL writes are
-    // serialized for on-disk ordering and atomic swap during compaction).
+    // guards wal writes and doubles as the lock held during compaction's file swap.
     mutable std::mutex wal_mutex_;
     std::ofstream wal_stream_;
 
-    // Guards against concurrent Compact() invocations.
+    // stops two compactions from running at the same time.
     std::atomic<bool> compaction_in_progress_{false};
 };
 
-} // namespace kvstore
+}
