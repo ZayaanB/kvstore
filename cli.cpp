@@ -20,7 +20,7 @@ std::vector<std::string> SplitArgs(const std::string& line) {
 }
 
 void PrintHelp() {
-    std::cout 
+    std::cout <<
         "commands:\n"
         "  set <key> <value>          set a key with no expiry\n"
         "  setttl <key> <ttl> <value> set a key that expires after ttl seconds\n"
