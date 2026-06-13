@@ -1,7 +1,9 @@
 #include "kvstore.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
@@ -237,6 +239,102 @@ int main() {
         }
 
         std::cout << "Phase 4 verification PASSED.\n";
+    }
+
+    // phase 5: ttl expiry, both in-memory and across a restart.
+    PrintHeader("Phase 5: TTL expiry");
+    {
+        auto store = std::make_unique<kvstore::KVStore>(kDbPath);
+
+        // a key with no ttl never expires.
+        store->Set("ttl_permanent", "stays_forever");
+
+        // a key that expires almost immediately.
+        [[maybe_unused]] bool ok = store->SetWithTtl("ttl_short", "soon_gone", 1);
+        assert(ok);
+        assert(store->Get("ttl_short").has_value() && "key should be readable before it expires");
+
+        // a key with a long ttl that should survive a restart.
+        store->SetWithTtl("ttl_long", "around_for_a_while", 3600);
+
+        // wait for the short-lived key to expire.
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        assert(!store->Get("ttl_short").has_value() && "key should be expired by now");
+        assert(store->Get("ttl_permanent").has_value());
+        assert(store->Get("ttl_long").has_value());
+
+        // compaction should drop the expired entry from disk.
+        [[maybe_unused]] bool compacted = store->Compact();
+        assert(compacted);
+        std::cout << "Phase 5a (in-memory expiry) PASSED.\n";
+    }
+    {
+        auto store = std::make_unique<kvstore::KVStore>(kDbPath);
+        // the expired key shouldn't come back after a restart.
+        assert(!store->Get("ttl_short").has_value());
+        // the long-lived and permanent keys should survive recovery.
+        assert(store->Get("ttl_permanent").value() == "stays_forever");
+        assert(store->Get("ttl_long").value() == "around_for_a_while");
+        std::cout << "Phase 5b (ttl survives restart) PASSED.\n";
+    }
+
+    // phase 6: iterator and range scan support.
+    PrintHeader("Phase 6: Iterator and range scan");
+    {
+        auto store = std::make_unique<kvstore::KVStore>(kDbPath);
+
+        // a small, isolated keyspace so the assertions below aren't affected
+        // by the thousands of keys left over from earlier phases.
+        store->Set("scan_a", "1");
+        store->Set("scan_b", "2");
+        store->Set("scan_c", "3");
+        store->Set("scan_d", "4");
+        store->Delete("scan_b");
+        store->SetWithTtl("scan_expired", "gone", 1);
+
+        // give the ttl entry time to expire before scanning.
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+
+        // items() returns everything live and non-expired, sorted by key.
+        auto all = store->Items();
+        [[maybe_unused]] auto find_scan = [&all](const std::string& key) {
+            return std::find_if(all.begin(), all.end(),
+                                 [&key](const kvstore::KeyValue& kv) { return kv.key == key; });
+        };
+        assert(find_scan("scan_a") != all.end());
+        assert(find_scan("scan_b") == all.end()); // deleted
+        assert(find_scan("scan_c") != all.end());
+        assert(find_scan("scan_d") != all.end());
+        assert(find_scan("scan_expired") == all.end()); // expired
+
+        // results must be sorted by key.
+        for (std::size_t i = 1; i < all.size(); ++i) {
+            assert(all[i - 1].key <= all[i].key);
+        }
+
+        // range() with an explicit [start, end) window.
+        auto window = store->Range("scan_a", "scan_d");
+        assert(find_scan("scan_a") != all.end());
+        [[maybe_unused]] bool has_a = false, has_c = false, has_d = false;
+        for (const auto& kv : window) {
+            if (kv.key == "scan_a") has_a = true;
+            if (kv.key == "scan_c") has_c = true;
+            if (kv.key == "scan_d") has_d = true;
+        }
+        assert(has_a && has_c && "range start is inclusive");
+        assert(!has_d && "range end is exclusive");
+
+        // an open-ended range (empty end) includes everything from start onward.
+        auto open_ended = store->Range("scan_c", "");
+        [[maybe_unused]] bool open_has_c = false, open_has_d = false, open_has_a = false;
+        for (const auto& kv : open_ended) {
+            if (kv.key == "scan_c") open_has_c = true;
+            if (kv.key == "scan_d") open_has_d = true;
+            if (kv.key == "scan_a") open_has_a = true;
+        }
+        assert(open_has_c && open_has_d && !open_has_a);
+
+        std::cout << "Phase 6 verification PASSED.\n";
     }
 
     PrintHeader("ALL TESTS PASSED");
