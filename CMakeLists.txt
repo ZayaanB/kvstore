@@ -33,3 +33,9 @@ target_link_libraries(kvstore PUBLIC Threads::Threads)
 
 add_executable(kvstore_test main.cpp)
 target_link_libraries(kvstore_test PRIVATE kvstore Threads::Threads)
+
+add_executable(kvstore_cli cli.cpp)
+target_link_libraries(kvstore_cli PRIVATE kvstore Threads::Threads)
+
+add_executable(kvstore_bench bench.cpp)
+target_link_libraries(kvstore_bench PRIVATE kvstore Threads::Threads)

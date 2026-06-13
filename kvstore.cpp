@@ -1,5 +1,6 @@
 #include "kvstore.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <stdexcept>
@@ -43,6 +44,15 @@ const Shard& KVStore::ShardFor(const std::string& key) const {
     return shards_[ShardIndex(key)];
 }
 
+std::int64_t KVStore::NowSeconds() {
+    using namespace std::chrono;
+    return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
+}
+
+bool KVStore::IsExpired(std::int64_t expires_at) {
+    return expires_at != kNoExpiry && expires_at <= NowSeconds();
+}
+
 void KVStore::OpenWalForAppend() {
     std::lock_guard<std::mutex> lock(wal_mutex_);
     wal_stream_.open(wal_path_, std::ios::binary | std::ios::app | std::ios::out);
@@ -75,7 +85,7 @@ void KVStore::Recover() {
         }
 
         std::string value;
-        if (hdr.type == RecordType::kSet) {
+        if (hdr.type == RecordType::kSet || hdr.type == RecordType::kSetTtl) {
             value.resize(hdr.value_len);
             if (hdr.value_len > 0) {
                 in.read(value.data(), static_cast<std::streamsize>(hdr.value_len));
@@ -84,11 +94,24 @@ void KVStore::Recover() {
             }
         }
 
+        std::int64_t expires_at = kNoExpiry;
+        if (hdr.type == RecordType::kSetTtl) {
+            in.read(reinterpret_cast<char*>(&expires_at), sizeof(expires_at));
+            // truncated ttl field, stop replaying.
+            if (!in) break;
+        }
+
         switch (hdr.type) {
             case RecordType::kSet: {
                 Shard& shard = ShardFor(key);
                 std::unique_lock lock(shard.mutex);
-                shard.data[key] = std::move(value);
+                shard.data[key] = Entry{std::move(value), kNoExpiry};
+                break;
+            }
+            case RecordType::kSetTtl: {
+                Shard& shard = ShardFor(key);
+                std::unique_lock lock(shard.mutex);
+                shard.data[key] = Entry{std::move(value), expires_at};
                 break;
             }
             case RecordType::kDelete: {
@@ -105,13 +128,13 @@ void KVStore::Recover() {
 }
 
 bool KVStore::AppendRecordLocked(RecordType type, const std::string& key,
-                                  const std::string& value) {
+                                  const std::string& value, std::int64_t expires_at) {
     RecordHeader hdr{};
     hdr.type = type;
     hdr.key_len = static_cast<std::uint32_t>(key.size());
-    hdr.value_len = (type == RecordType::kSet)
-                        ? static_cast<std::uint32_t>(value.size())
-                        : 0u;
+    hdr.value_len = (type == RecordType::kDelete)
+                        ? 0u
+                        : static_cast<std::uint32_t>(value.size());
 
     wal_stream_.write(reinterpret_cast<const char*>(&hdr.type), sizeof(hdr.type));
     wal_stream_.write(reinterpret_cast<const char*>(&hdr.key_len), sizeof(hdr.key_len));
@@ -119,8 +142,11 @@ bool KVStore::AppendRecordLocked(RecordType type, const std::string& key,
     if (!key.empty()) {
         wal_stream_.write(key.data(), static_cast<std::streamsize>(key.size()));
     }
-    if (type == RecordType::kSet && !value.empty()) {
+    if (type != RecordType::kDelete && !value.empty()) {
         wal_stream_.write(value.data(), static_cast<std::streamsize>(value.size()));
+    }
+    if (type == RecordType::kSetTtl) {
+        wal_stream_.write(reinterpret_cast<const char*>(&expires_at), sizeof(expires_at));
     }
 
     // flush now so the record is on disk before we touch the in-memory map.
@@ -128,19 +154,37 @@ bool KVStore::AppendRecordLocked(RecordType type, const std::string& key,
     return wal_stream_.good();
 }
 
-bool KVStore::Set(const std::string& key, const std::string& value) {
+bool KVStore::SetInternal(const std::string& key, const std::string& value,
+                            std::int64_t expires_at) {
+    RecordType type = (expires_at == kNoExpiry) ? RecordType::kSet : RecordType::kSetTtl;
+
     // log first, apply second, so a crash in between is recoverable.
     {
         std::lock_guard<std::mutex> wal_lock(wal_mutex_);
-        if (!AppendRecordLocked(RecordType::kSet, key, value)) {
+        if (!AppendRecordLocked(type, key, value, expires_at)) {
             return false;
         }
     }
 
     Shard& shard = ShardFor(key);
     std::unique_lock lock(shard.mutex);
-    shard.data[key] = value;
+    shard.data[key] = Entry{value, expires_at};
     return true;
+}
+
+bool KVStore::Set(const std::string& key, const std::string& value) {
+    return SetInternal(key, value, kNoExpiry);
+}
+
+bool KVStore::SetWithTtl(const std::string& key, const std::string& value,
+                          std::int64_t ttl_seconds) {
+    // ttl <= 0 means "expire immediately" - still a valid, durable write.
+    std::int64_t expires_at = NowSeconds() + ttl_seconds;
+    if (expires_at == kNoExpiry) {
+        // extremely unlikely collision with the sentinel, nudge by one second.
+        expires_at += 1;
+    }
+    return SetInternal(key, value, expires_at);
 }
 
 std::optional<std::string> KVStore::Get(const std::string& key) const {
@@ -150,13 +194,17 @@ std::optional<std::string> KVStore::Get(const std::string& key) const {
     if (it == shard.data.end()) {
         return std::nullopt;
     }
-    return it->second;
+    // expired entries are treated as absent, but stay on disk until compaction.
+    if (IsExpired(it->second.expires_at)) {
+        return std::nullopt;
+    }
+    return it->second.value;
 }
 
 bool KVStore::Delete(const std::string& key) {
     {
         std::lock_guard<std::mutex> wal_lock(wal_mutex_);
-        if (!AppendRecordLocked(RecordType::kDelete, key, std::string())) {
+        if (!AppendRecordLocked(RecordType::kDelete, key, std::string(), kNoExpiry)) {
             return false;
         }
     }
@@ -176,6 +224,37 @@ std::size_t KVStore::Size() const {
     return total;
 }
 
+std::vector<KeyValue> KVStore::Items() const {
+    return Range(std::string(), std::string());
+}
+
+std::vector<KeyValue> KVStore::Range(const std::string& start, const std::string& end) const {
+    std::vector<KeyValue> result;
+
+    // collect matching, non-expired entries shard by shard under shared locks.
+    for (const auto& shard : shards_) {
+        std::shared_lock lock(shard.mutex);
+        for (const auto& [key, entry] : shard.data) {
+            if (IsExpired(entry.expires_at)) {
+                continue;
+            }
+            if (key < start) {
+                continue;
+            }
+            if (!end.empty() && key >= end) {
+                continue;
+            }
+            result.push_back(KeyValue{key, entry.value});
+        }
+    }
+
+    // shards are unordered internally, so sort the merged snapshot by key.
+    std::sort(result.begin(), result.end(),
+              [](const KeyValue& a, const KeyValue& b) { return a.key < b.key; });
+
+    return result;
+}
+
 bool KVStore::Compact() {
     bool expected = false;
     if (!compaction_in_progress_.compare_exchange_strong(expected, true)) {
@@ -188,7 +267,7 @@ bool KVStore::Compact() {
         ~CompactionGuard() { flag.store(false); }
     } guard{compaction_in_progress_};
 
-    // step 1: write a clean copy of every live key/value pair to a temp file.
+    // write a clean copy of every live, non-expired key/value pair to a temp file.
     {
         std::ofstream tmp(wal_tmp_path_, std::ios::binary | std::ios::trunc | std::ios::out);
         if (!tmp.is_open()) {
@@ -198,11 +277,20 @@ bool KVStore::Compact() {
         // shard-by-shard shared locks let other shards (and readers here) keep going.
         for (auto& shard : shards_) {
             std::shared_lock lock(shard.mutex);
-            for (const auto& [key, value] : shard.data) {
+            for (const auto& [key, entry] : shard.data) {
+                // drop expired entries during compaction instead of carrying them forward.
+                if (IsExpired(entry.expires_at)) {
+                    continue;
+                }
+
+                RecordType type = (entry.expires_at == kNoExpiry)
+                                       ? RecordType::kSet
+                                       : RecordType::kSetTtl;
+
                 RecordHeader hdr{};
-                hdr.type = RecordType::kSet;
+                hdr.type = type;
                 hdr.key_len = static_cast<std::uint32_t>(key.size());
-                hdr.value_len = static_cast<std::uint32_t>(value.size());
+                hdr.value_len = static_cast<std::uint32_t>(entry.value.size());
 
                 tmp.write(reinterpret_cast<const char*>(&hdr.type), sizeof(hdr.type));
                 tmp.write(reinterpret_cast<const char*>(&hdr.key_len), sizeof(hdr.key_len));
@@ -210,8 +298,11 @@ bool KVStore::Compact() {
                 if (!key.empty()) {
                     tmp.write(key.data(), static_cast<std::streamsize>(key.size()));
                 }
-                if (!value.empty()) {
-                    tmp.write(value.data(), static_cast<std::streamsize>(value.size()));
+                if (!entry.value.empty()) {
+                    tmp.write(entry.value.data(), static_cast<std::streamsize>(entry.value.size()));
+                }
+                if (type == RecordType::kSetTtl) {
+                    tmp.write(reinterpret_cast<const char*>(&entry.expires_at), sizeof(entry.expires_at));
                 }
             }
         }
@@ -226,7 +317,7 @@ bool KVStore::Compact() {
         tmp.close();
     }
 
-    // step 2: swap the temp file in while holding wal_mutex_ so no write is lost.
+    // swap the temp file in while holding wal_mutex_ so no write is lost.
     {
         std::lock_guard<std::mutex> wal_lock(wal_mutex_);
 
