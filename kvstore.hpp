@@ -14,127 +14,113 @@
 
 namespace kvstore {
 
-    // 16 shards is a decent default for spreading out lock contention.
+    // number of independent keyspace partitions.
     constexpr std::size_t kNumShards = 16;
 
-    // sentinel meaning "no expiry" for entry.expires_at and the ttl wal field.
+    // sentinel value meaning this entry has no expiry.
     constexpr std::int64_t kNoExpiry = 0;
 
-    // what kind of mutation a wal record represents.
+    // type tag written at the start of every log record.
     enum class RecordType : std::uint8_t {
         kSet = 1,
         kDelete = 2,
         kSetTtl = 3,
     };
 
-    // header written before every record.
-    // kSet: followed by key bytes then value bytes.
-    // kDelete: followed by key bytes only.
-    // kSetTtl: followed by key bytes, then value bytes, then an 8-byte expires_at.
+    // fixed-size prefix for every log record, followed by key and value bytes on disk.
     struct RecordHeader {
         RecordType type;
         std::uint32_t key_len;
         std::uint32_t value_len;
     };
 
-    // one value slot in a shard: the payload plus an optional expiry.
+    // a stored value and its optional expiry time.
     struct Entry {
         std::string value;
-        // unix epoch seconds, or kNoExpiry if this entry never expires.
         std::int64_t expires_at = kNoExpiry;
     };
 
-    // one shard of the keyspace: its own map and its own lock.
+    // one partition of the keyspace with its own map and lock.
     struct Shard {
         mutable std::shared_mutex mutex;
         std::unordered_map<std::string, Entry> data;
     };
 
-    // a single key/value pair as returned by range scans.
+    // a key/value pair returned by scans.
     struct KeyValue {
         std::string key;
         std::string value;
     };
 
-    // a simple embedded key-value store with a write-ahead log for durability.
+    // embedded key-value store backed by a write-ahead log.
     class KVStore {
-        public:
-            // opens (or creates) the store at the given path and replays its wal.
-            explicit KVStore(std::string path);
+    public:
+        // opens or creates a store at path, replaying the log if one exists.
+        explicit KVStore(std::string path);
 
-            ~KVStore();
+        ~KVStore();
 
-            // not copyable - this thing owns a file handle and a bunch of mutexes.
-            KVStore(const KVStore&) = delete;
-            KVStore& operator=(const KVStore&) = delete;
+        // non-copyable.
+        KVStore(const KVStore&) = delete;
+        KVStore& operator=(const KVStore&) = delete;
 
-            // insert or overwrite a key with no expiry.
-            bool Set(const std::string& key, const std::string& value);
+        // insert or overwrite a key.
+        bool Set(const std::string& key, const std::string& value);
 
-            // insert or overwrite a key that expires after ttl_seconds from now.
-            bool SetWithTtl(const std::string& key, const std::string& value,
-                            std::int64_t ttl_seconds);
+        // insert or overwrite a key that expires after ttl_seconds.
+        bool SetWithTtl(const std::string& key, const std::string& value,
+                        std::int64_t ttl_seconds);
 
-            // look up a key, empty optional if it's not present or has expired.
-            std::optional<std::string> Get(const std::string& key) const;
+        // returns the value for key, or empty if absent or expired.
+        std::optional<std::string> Get(const std::string& key) const;
 
-            // remove a key, still durable/logged even if it wasn't present.
-            bool Delete(const std::string& key);
+        // removes a key.
+        bool Delete(const std::string& key);
 
-            // rewrite the log down to just the live, non-expired keys and swap it in atomically.
-            bool Compact();
+        // rewrites the log to contain only live keys, then swaps it in atomically.
+        bool Compact();
 
-            // number of live, non-expired keys across all shards right now.
-            std::size_t Size() const;
+        // number of live keys.
+        std::size_t Size() const;
 
-            // snapshot of every live, non-expired key/value pair, sorted by key.
-            std::vector<KeyValue> Items() const;
+        // returns all live key/value pairs sorted by key.
+        std::vector<KeyValue> Items() const;
 
-            // snapshot of every live, non-expired key in [start, end) (end exclusive), sorted by key.
-            // an empty end means "no upper bound".
-            std::vector<KeyValue> Range(const std::string& start, const std::string& end) const;
+        // returns live key/value pairs in [start, end), sorted by key.
+        // an empty end means no upper bound.
+        std::vector<KeyValue> Range(const std::string& start, const std::string& end) const;
 
-            // mostly useful for tests that want to peek at the log file directly.
-            const std::string& WalPath() const { return wal_path_; }
+        // path to the active log file.
+        const std::string& WalPath() const { return wal_path_; }
 
-        private:
-            static std::size_t ShardIndex(const std::string& key);
+    private:
+        static std::size_t ShardIndex(const std::string& key);
 
-            Shard& ShardFor(const std::string& key);
-            const Shard& ShardFor(const std::string& key) const;
+        Shard& ShardFor(const std::string& key);
+        const Shard& ShardFor(const std::string& key) const;
 
-            // current wall-clock time as unix epoch seconds.
-            static std::int64_t NowSeconds();
+        static std::int64_t NowSeconds();
+        static bool IsExpired(std::int64_t expires_at);
 
-            // true if expires_at is set and is at or before now.
-            static bool IsExpired(std::int64_t expires_at);
+        bool AppendRecordLocked(RecordType type, const std::string& key,
+                                const std::string& value, std::int64_t expires_at);
 
-            // writes one record to the wal stream and flushes it, caller must hold wal_mutex_.
-            bool AppendRecordLocked(RecordType type, const std::string& key,
-                                    const std::string& value, std::int64_t expires_at);
+        void Recover();
+        void OpenWalForAppend();
 
-            // reads the wal from the start and replays every record into the shards.
-            void Recover();
+        bool SetInternal(const std::string& key, const std::string& value,
+                        std::int64_t expires_at);
 
-            // (re)opens the wal file for appending.
-            void OpenWalForAppend();
+        std::string path_;
+        std::string wal_path_;
+        std::string wal_tmp_path_;
 
-            // shared logic for Set and SetWithTtl.
-            bool SetInternal(const std::string& key, const std::string& value,
-                            std::int64_t expires_at);
+        std::array<Shard, kNumShards> shards_;
 
-            std::string path_;
-            std::string wal_path_;
-            std::string wal_tmp_path_;
+        mutable std::mutex wal_mutex_;
+        std::ofstream wal_stream_;
 
-            std::array<Shard, kNumShards> shards_;
-
-            // guards wal writes and doubles as the lock held during compaction's file swap.
-            mutable std::mutex wal_mutex_;
-            std::ofstream wal_stream_;
-
-            // stops two compactions from running at the same time.
-            std::atomic<bool> compaction_in_progress_{false};
+        std::atomic<bool> compaction_in_progress_{false};
     };
 
 }
