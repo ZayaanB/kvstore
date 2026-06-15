@@ -20,6 +20,10 @@ namespace kvstore {
     // sentinel value meaning this entry has no expiry.
     constexpr std::int64_t kNoExpiry = 0;
 
+    // upper bounds on record field sizes; a longer field means a corrupt header.
+    constexpr std::uint32_t kMaxKeyLen = 1u << 20;    // 1 MiB
+    constexpr std::uint32_t kMaxValueLen = 1u << 28;  // 256 MiB
+
     // type tag written at the start of every log record.
     enum class RecordType : std::uint8_t {
         kSet = 1,
