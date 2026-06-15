@@ -1,6 +1,6 @@
 # kvstore
 
-A small embedded key-value store written from scratch in C++20. It's a from-scratch systems exercise — sharded in-memory index for concurrency, a binary write-ahead log for durability, crash recovery on startup, and an online compaction routine that doesn't block readers or writers. No external dependencies, just the standard library.
+A small embedded key-value store written from scratch in C++20. It's a from-scratch systems exercise, sharded in-memory index for concurrency, a binary write-ahead log for durability, crash recovery on startup, and a compaction routine that never blocks readers. No external dependencies, just the standard library.
 
 ## How it works
 
@@ -12,7 +12,7 @@ A small embedded key-value store written from scratch in C++20. It's a from-scra
 
 **Recovery.** On startup, the WAL is read sequentially from the beginning and every record is replayed into the sharded index. If the log ends mid-record (a torn write from a crash), recovery stops cleanly at the last complete record instead of throwing.
 
-**Compaction.** `Compact()` walks each shard under a `shared_lock`, writes only the currently-live key/value pairs to a temp file, then — while holding the WAL's write mutex — closes the old log, renames the temp file into place, and reopens it for appends. Any `Set`/`Delete` in flight either finishes against the old file before the swap or lands in the new file after it; nothing is dropped.
+**Compaction.** `Compact()` takes the WAL's write mutex for the duration of the snapshot and swap: it walks each shard under a `shared_lock` writing only the currently-live key/value pairs to a temp file, then closes the old log, renames the temp file into place, and reopens it for appends. Because writers append to the WAL under that same mutex, no `Set`/`Delete` can slip into the old log after its shard has been snapshotted but before the swap, so nothing acknowledged is ever dropped. Readers never take the WAL mutex, so `Get`/`Range`/`Size` proceed concurrently; writers block only for the compaction window.
 
 The API is simple:
 
@@ -45,6 +45,43 @@ cmake --build . -j
 `kvstore_test` runs a stress and crash-recovery suite: 4 worker threads doing concurrent writes/reads, a compaction while readers are active, a simulated crash with a torn WAL record, and a restart with full recovery validation. A successful run ends with:
 
 === ALL TESTS PASSED ===
+
+### Use it interactively (CLI)
+
+`kvstore_cli` is an interactive shell over the store (it takes an optional db path):
+
+```bash
+./kvstore_cli data/mydb.db
+```
+
+```
+> set hello world
+OK
+> get hello
+world
+> setttl session 60 abc   # value "abc", expires in 60s
+OK
+> keys
+hello
+session
+> scan a z                # keys in [a, z), end exclusive
+hello = world
+> del hello
+OK
+> compact
+OK
+> exit
+```
+
+Other commands: `size`, `help`.
+
+### Benchmark
+
+`kvstore_bench` reports write, mixed read/write, and compaction throughput:
+
+```bash
+./kvstore_bench
+```
 
 ### Optional: run under sanitizers
 

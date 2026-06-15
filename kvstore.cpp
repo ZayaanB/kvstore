@@ -77,6 +77,9 @@ namespace kvstore {
             in.read(reinterpret_cast<char*>(&hdr.value_len), sizeof(hdr.value_len));
             if (!in || in.eof()) break;
 
+            // a length past these bounds means a corrupt header, so stop replaying.
+            if (hdr.key_len > kMaxKeyLen || hdr.value_len > kMaxValueLen) break;
+
             std::string key(hdr.key_len, '\0');
             if (hdr.key_len > 0) {
                 in.read(key.data(), static_cast<std::streamsize>(hdr.key_len));
@@ -271,6 +274,10 @@ namespace kvstore {
             ~CompactionGuard() { flag.store(false); }
         } guard{compaction_in_progress_};
 
+        // hold wal_mutex_ across the whole snapshot and swap so no write can land
+        // in the old wal after its shard was snapshotted but before the rename.
+        std::lock_guard<std::mutex> wal_lock(wal_mutex_);
+
         // write a clean copy of every live, non-expired key/value pair to a temp file.
         {
             std::ofstream tmp(wal_tmp_path_, std::ios::binary | std::ios::trunc | std::ios::out);
@@ -321,10 +328,8 @@ namespace kvstore {
             tmp.close();
         }
 
-        // swap the temp file in while holding wal_mutex_ so no write is lost.
+        // swap the temp file in (still holding wal_mutex_) so no write is lost.
         {
-            std::lock_guard<std::mutex> wal_lock(wal_mutex_);
-
             if (wal_stream_.is_open()) {
                 wal_stream_.flush();
                 wal_stream_.close();
