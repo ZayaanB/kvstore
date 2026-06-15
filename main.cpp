@@ -16,22 +16,22 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr int kNumWorkers = 4;
-constexpr int kKeysPerWorker = 500;
-constexpr const char* kDbPath = "test_db/kvstore_test.db";
+    constexpr int kNumWorkers = 4;
+    constexpr int kKeysPerWorker = 500;
+    constexpr const char* kDbPath = "test_db/kvstore_test.db";
 
-std::string MakeKey(int worker_id, int idx) {
-    return "key_" + std::to_string(worker_id) + "_" + std::to_string(idx);
-}
+    std::string MakeKey(int worker_id, int idx) {
+        return "key_" + std::to_string(worker_id) + "_" + std::to_string(idx);
+    }
 
-std::string MakeValue(int worker_id, int idx, int version) {
-    return "val_w" + std::to_string(worker_id) + "_i" + std::to_string(idx) +
-           "_v" + std::to_string(version);
-}
+    std::string MakeValue(int worker_id, int idx, int version) {
+        return "val_w" + std::to_string(worker_id) + "_i" + std::to_string(idx) +
+            "_v" + std::to_string(version);
+    }
 
-void PrintHeader(const std::string& title) {
-    std::cout << "\n=== " << title << " ===\n";
-}
+    void PrintHeader(const std::string& title) {
+        std::cout << "\n=== " << title << " ===\n";
+    }
 
 }
 
