@@ -8,31 +8,31 @@
 
 namespace {
 
-// splits a line on whitespace, respecting nothing fancy - good enough for this cli.
-std::vector<std::string> SplitArgs(const std::string& line) {
-    std::vector<std::string> args;
-    std::istringstream iss(line);
-    std::string tok;
-    while (iss >> tok) {
-        args.push_back(tok);
+    // splits a line on whitespace, respecting nothing fancy - good enough for this cli.
+    std::vector<std::string> SplitArgs(const std::string& line) {
+        std::vector<std::string> args;
+        std::istringstream iss(line);
+        std::string tok;
+        while (iss >> tok) {
+            args.push_back(tok);
+        }
+        return args;
     }
-    return args;
-}
 
-void PrintHelp() {
-    std::cout <<
-        "commands:\n"
-        "  set <key> <value>          set a key with no expiry\n"
-        "  setttl <key> <ttl> <value> set a key that expires after ttl seconds\n"
-        "  get <key>                  print a key's value, or (nil) if absent/expired\n"
-        "  del <key>                  delete a key\n"
-        "  size                       print the number of keys in the store\n"
-        "  keys                       list every live, non-expired key (sorted)\n"
-        "  scan <start> [end]         list keys in [start, end), end exclusive and optional\n"
-        "  compact                    rewrite the log down to live, non-expired keys\n"
-        "  help                       show this message\n"
-        "  exit                       quit\n";
-}
+    void PrintHelp() {
+        std::cout <<
+            "commands:\n"
+            "  set <key> <value>          set a key with no expiry\n"
+            "  setttl <key> <ttl> <value> set a key that expires after ttl seconds\n"
+            "  get <key>                  print a key's value, or (nil) if absent/expired\n"
+            "  del <key>                  delete a key\n"
+            "  size                       print the number of keys in the store\n"
+            "  keys                       list every live, non-expired key (sorted)\n"
+            "  scan <start> [end]         list keys in [start, end), end exclusive and optional\n"
+            "  compact                    rewrite the log down to live, non-expired keys\n"
+            "  help                       show this message\n"
+            "  exit                       quit\n";
+    }
 
 }
 
