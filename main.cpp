@@ -41,7 +41,6 @@ int main() {
     fs::remove_all("test_db", ec);
     fs::create_directories("test_db", ec);
 
-    // phase 1: concurrent writers/readers stress test.
     PrintHeader("Phase 1: Concurrent stress test (writes + overlapping reads)");
     {
         auto store = std::make_unique<kvstore::KVStore>(kDbPath);
@@ -115,7 +114,6 @@ int main() {
         // store goes out of scope here, destructor flushes and closes the wal.
     }
 
-    // phase 2: simulate abrupt termination via extra writes plus a torn trailing record.
     PrintHeader("Phase 2: Crash simulation (extra writes + torn record)");
     {
         auto store = std::make_unique<kvstore::KVStore>(kDbPath);
@@ -149,7 +147,6 @@ int main() {
         raw.flush();
     }
 
-    // phase 3: restart and validate recovered state.
     PrintHeader("Phase 3: Restart & recovery validation");
     {
         auto store = std::make_unique<kvstore::KVStore>(kDbPath);
@@ -188,7 +185,6 @@ int main() {
         // torn trailing garbage didn't corrupt anything before it.
         std::cout << "Phase 3 verification PASSED.\n";
 
-        // phase 4: post-recovery compaction plus concurrent ops, then a second restart.
         PrintHeader("Phase 4: Compaction after recovery + second restart");
 
         std::vector<std::thread> threads;
@@ -241,7 +237,6 @@ int main() {
         std::cout << "Phase 4 verification PASSED.\n";
     }
 
-    // phase 5: ttl expiry, both in-memory and across a restart.
     PrintHeader("Phase 5: TTL expiry");
     {
         auto store = std::make_unique<kvstore::KVStore>(kDbPath);
@@ -278,13 +273,11 @@ int main() {
         std::cout << "Phase 5b (ttl survives restart) PASSED.\n";
     }
 
-    // phase 6: iterator and range scan support.
     PrintHeader("Phase 6: Iterator and range scan");
     {
         auto store = std::make_unique<kvstore::KVStore>(kDbPath);
 
-        // a small, isolated keyspace so the assertions below aren't affected
-        // by the thousands of keys left over from earlier phases.
+        // isolated keyspace so leftover keys from earlier phases don't affect assertions.
         store->Set("scan_a", "1");
         store->Set("scan_b", "2");
         store->Set("scan_c", "3");

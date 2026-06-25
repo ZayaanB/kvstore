@@ -90,8 +90,7 @@ namespace kvstore {
         // returns all live key/value pairs sorted by key.
         std::vector<KeyValue> Items() const;
 
-        // returns live key/value pairs in [start, end), sorted by key.
-        // an empty end means no upper bound.
+        // returns live key/value pairs in [start, end) sorted by key; empty end means no upper bound.
         std::vector<KeyValue> Range(const std::string& start, const std::string& end) const;
 
         // path to the active log file.
