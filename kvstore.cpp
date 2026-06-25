@@ -161,12 +161,10 @@ namespace kvstore {
                                 std::int64_t expires_at) {
         RecordType type = (expires_at == kNoExpiry) ? RecordType::kSet : RecordType::kSetTtl;
 
-        // log first, apply second, so a crash in between is recoverable.
-        {
-            std::lock_guard<std::mutex> wal_lock(wal_mutex_);
-            if (!AppendRecordLocked(type, key, value, expires_at)) {
-                return false;
-            }
+        // hold wal_mutex_ across the append and the apply so wal order and visible state can't diverge.
+        std::lock_guard<std::mutex> wal_lock(wal_mutex_);
+        if (!AppendRecordLocked(type, key, value, expires_at)) {
+            return false;
         }
 
         Shard& shard = ShardFor(key);
@@ -205,11 +203,10 @@ namespace kvstore {
     }
 
     bool KVStore::Delete(const std::string& key) {
-        {
-            std::lock_guard<std::mutex> wal_lock(wal_mutex_);
-            if (!AppendRecordLocked(RecordType::kDelete, key, std::string(), kNoExpiry)) {
-                return false;
-            }
+        // hold wal_mutex_ across the append and the apply so wal order and visible state can't diverge.
+        std::lock_guard<std::mutex> wal_lock(wal_mutex_);
+        if (!AppendRecordLocked(RecordType::kDelete, key, std::string(), kNoExpiry)) {
+            return false;
         }
 
         Shard& shard = ShardFor(key);
@@ -274,8 +271,7 @@ namespace kvstore {
             ~CompactionGuard() { flag.store(false); }
         } guard{compaction_in_progress_};
 
-        // hold wal_mutex_ across the whole snapshot and swap so no write can land
-        // in the old wal after its shard was snapshotted but before the rename.
+        // hold wal_mutex_ across the whole snapshot and swap so no write is lost mid-rename.
         std::lock_guard<std::mutex> wal_lock(wal_mutex_);
 
         // write a clean copy of every live, non-expired key/value pair to a temp file.
