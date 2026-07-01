@@ -178,6 +178,9 @@ namespace kvstore {
             return in.gcount() == static_cast<std::streamsize>(n);
         };
 
+        // offset just past the last fully-valid record.
+        std::streamoff good_offset = 0;
+
         while (true) {
             // buffer the whole record so we can check its crc.
             std::string record;
@@ -246,6 +249,23 @@ namespace kvstore {
                     std::unique_lock lock(shard.mutex);
                     shard.data.erase(key);
                     break;
+                }
+            }
+
+            good_offset = in.tellg();  // record boundary; stream is still good here.
+        }
+
+        // drop any torn/corrupt tail so later appends aren't stranded past it.
+        in.close();
+        std::error_code ec;
+        const std::uintmax_t size = fs::file_size(wal_path_, ec);
+        if (!ec && good_offset >= 0 &&
+            static_cast<std::uintmax_t>(good_offset) < size) {
+            if (::truncate(wal_path_.c_str(), good_offset) == 0) {
+                const int fd = ::open(wal_path_.c_str(), O_WRONLY);
+                if (fd >= 0) {
+                    ::fsync(fd);
+                    ::close(fd);
                 }
             }
         }
