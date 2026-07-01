@@ -1,6 +1,6 @@
 <svg width="680" height="520" viewBox="0 0 680 520" xmlns="http://www.w3.org/2000/svg" role="img">
 <title>KVStore architecture diagram</title>
-<desc>Diagram showing the embedded key-value store architecture: API layer with Set, Get, Delete and Compact operations, a write path through the WAL mutex and write-ahead log file, a sharded in-memory index of 16 shards each with its own shared mutex and hash map, and a recovery path that replays the WAL into the shards on startup.</desc>
+<desc>Diagram showing the embedded key-value store architecture: API layer with Set, Get, Delete and Compact operations, a write path through the WAL mutex that appends and fsyncs CRC32-checked records to the write-ahead log file before applying them, a sharded in-memory index of 16 shards each with its own shared mutex and hash map, and a recovery path that replays the WAL into the shards on startup.</desc>
 <defs>
 <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
 <path d="M2 1L8 5L2 9" fill="none" stroke="#5f5e5a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
@@ -23,7 +23,7 @@
 
 <g>
 <rect x="120" y="110" width="320" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
-<text x="280" y="130" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="500" fill="#4A1B0C">WAL append + flush</text>
+<text x="280" y="130" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="500" fill="#4A1B0C">WAL append + fsync</text>
 <text x="280" y="150" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#712B13">single mutex, ordered log</text>
 </g>
 
@@ -32,7 +32,7 @@
 <g>
 <rect x="120" y="200" width="320" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
 <text x="280" y="220" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="500" fill="#4A1B0C">db.wal on disk</text>
-<text x="280" y="240" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#712B13">binary records, durable</text>
+<text x="280" y="240" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#712B13">crc32 records, fsynced</text>
 </g>
 
 <line x1="280" y1="256" x2="280" y2="290" stroke="#5f5e5a" stroke-width="0.5" marker-end="url(#arrow)"/>

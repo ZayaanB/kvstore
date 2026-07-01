@@ -31,7 +31,7 @@ namespace kvstore {
         kSetTtl = 3,
     };
 
-    // fixed-size prefix for every log record, followed by key and value bytes on disk.
+    // on-disk record: [type][key_len][value_len][key][value][expires_at?][crc32].
     struct RecordHeader {
         RecordType type;
         std::uint32_t key_len;
@@ -121,7 +121,7 @@ namespace kvstore {
         std::array<Shard, kNumShards> shards_;
 
         mutable std::mutex wal_mutex_;
-        std::ofstream wal_stream_;
+        int wal_fd_ = -1;
 
         std::atomic<bool> compaction_in_progress_{false};
     };

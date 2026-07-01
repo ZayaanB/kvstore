@@ -10,3 +10,4 @@ compile_commands.json
 .vscode/
 .idea/
 *.out
+docs/kvstore_report.pdf
