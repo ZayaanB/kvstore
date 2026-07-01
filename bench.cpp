@@ -15,15 +15,16 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr int kOpsPerThread = 20000;
-constexpr int kKeyspaceSize = 10000;
+// kept modest: every Set fdatasyncs, so writes are disk-bound and don't parallelize.
+constexpr int kOpsPerThread = 500;
+constexpr int kKeyspaceSize = 1000;
 
-// builds a key from an index, kept simple so different threads overlap on shards.
+// keys overlap across threads so shards actually contend.
 std::string MakeKey(int idx) {
     return "bench_key_" + std::to_string(idx % kKeyspaceSize);
 }
 
-// pure write throughput: every thread does kOpsPerThread Set() calls.
+// write throughput: every thread does kOpsPerThread Sets.
 double RunWriteBench(kvstore::KVStore& store, int num_threads) {
     std::vector<std::thread> threads;
     threads.reserve(static_cast<std::size_t>(num_threads));
@@ -31,7 +32,7 @@ double RunWriteBench(kvstore::KVStore& store, int num_threads) {
     auto start = std::chrono::steady_clock::now();
     for (int t = 0; t < num_threads; ++t) {
         threads.emplace_back([&store, t]() {
-            std::string value(64, 'x'); // fixed-size payload keeps the comparison fair.
+            std::string value(64, 'x');
             for (int i = 0; i < kOpsPerThread; ++i) {
                 store.Set(MakeKey(t * kOpsPerThread + i), value);
             }
@@ -45,7 +46,7 @@ double RunWriteBench(kvstore::KVStore& store, int num_threads) {
     return total_ops / seconds;
 }
 
-// mixed read/write throughput: each thread does mostly Get with some Set on a shared keyspace.
+// mixed throughput: 80% Get, 20% Set on a shared keyspace.
 double RunMixedBench(kvstore::KVStore& store, int num_threads) {
     std::vector<std::thread> threads;
     threads.reserve(static_cast<std::size_t>(num_threads));
@@ -101,7 +102,7 @@ int main() {
 
     std::cout << "-- write throughput (Set only) --\n";
     for (int n : thread_counts) {
-        // fresh store per run so the working set size stays comparable.
+        // fresh store per run for a fair comparison.
         ResetDb(db_dir);
         kvstore::KVStore store(db_path);
         double ops = RunWriteBench(store, n);
@@ -112,7 +113,7 @@ int main() {
     for (int n : thread_counts) {
         ResetDb(db_dir);
         kvstore::KVStore store(db_path);
-        // pre-populate so reads have something to find.
+        // pre-populate so reads hit.
         std::string value(64, 'z');
         for (int i = 0; i < kKeyspaceSize; ++i) {
             store.Set(MakeKey(i), value);

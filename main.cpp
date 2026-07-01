@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -36,7 +37,7 @@ namespace {
 }
 
 int main() {
-    // clean slate for the test run.
+    // clean slate.
     std::error_code ec;
     fs::remove_all("test_db", ec);
     fs::create_directories("test_db", ec);
@@ -60,7 +61,7 @@ int main() {
                     assert(ok && "Set should succeed");
                     total_writes.fetch_add(1, std::memory_order_relaxed);
 
-                    // also touch a neighbor's key range to create cross-shard contention.
+                    // cross-shard contention.
                     int neighbor = (w + 1) % kNumWorkers;
                     std::string shared_key = "shared_key_" + std::to_string(i % 50);
                     store->Set(shared_key, MakeValue(neighbor, i, 1));
@@ -68,7 +69,7 @@ int main() {
             });
         }
 
-        // reader threads concurrently hammer get() on keys being written.
+        // readers hammering Get while writers run.
         std::vector<std::thread> readers;
         readers.reserve(static_cast<std::size_t>(kNumWorkers));
         for (int r = 0; r < kNumWorkers; ++r) {
@@ -90,7 +91,7 @@ int main() {
 
         for (auto& t : writers) t.join();
 
-        // a concurrent compaction while readers are still active.
+        // compact while readers run.
         [[maybe_unused]] bool compacted = store->Compact();
         assert(compacted && "Compaction should succeed");
 
@@ -101,7 +102,7 @@ int main() {
         std::cout << "Total successful reads observed: " << total_reads.load() << "\n";
         std::cout << "Store size after phase 1: " << store->Size() << "\n";
 
-        // verify all worker-specific keys are present and correct.
+        // verify every key.
         for (int w = 0; w < kNumWorkers; ++w) {
             for (int i = 0; i < kKeysPerWorker; ++i) {
                 auto val = store->Get(MakeKey(w, i));
@@ -110,15 +111,13 @@ int main() {
             }
         }
         std::cout << "Phase 1 verification PASSED.\n";
-
-        // store goes out of scope here, destructor flushes and closes the wal.
     }
 
     PrintHeader("Phase 2: Crash simulation (extra writes + torn record)");
     {
         auto store = std::make_unique<kvstore::KVStore>(kDbPath);
 
-        // additional writes after recovery from phase 1's clean state.
+        // more writes after recovery.
         for (int i = 0; i < 100; ++i) {
             std::string key = "crash_key_" + std::to_string(i);
             std::string value = "crash_val_" + std::to_string(i);
@@ -126,7 +125,7 @@ int main() {
             assert(ok);
         }
 
-        // delete some pre-existing keys to test delete-record replay.
+        // delete some keys (tests delete replay).
         for (int i = 0; i < 50; ++i) {
             [[maybe_unused]] bool ok = store->Delete(MakeKey(0, i));
             assert(ok);
@@ -134,10 +133,10 @@ int main() {
 
         std::cout << "Pre-crash size: " << store->Size() << "\n";
 
-        // "crash": drop the object without an orderly shutdown beyond the destructor.
+        // "crash" by dropping the store.
     }
 
-    // simulate a torn write at the tail of the wal with a few incomplete header bytes.
+    // append a torn (incomplete) record.
     {
         std::ofstream raw(std::string(kDbPath) + ".wal",
                           std::ios::binary | std::ios::app);
@@ -153,20 +152,20 @@ int main() {
 
         std::cout << "Recovered size: " << store->Size() << "\n";
 
-        // keys 0..49 of worker 0 were deleted in phase 2.
+        // worker 0 keys 0..49 were deleted.
         for (int i = 0; i < 50; ++i) {
             auto val = store->Get(MakeKey(0, i));
             assert(!val.has_value() && "Deleted key must not be present after recovery");
         }
 
-        // remaining keys of worker 0 must still be present.
+        // the rest must survive.
         for (int i = 50; i < kKeysPerWorker; ++i) {
             auto val = store->Get(MakeKey(0, i));
             assert(val.has_value() && "Non-deleted key must survive recovery");
             assert(*val == MakeValue(0, i, 1));
         }
 
-        // other workers' keys must be fully intact.
+        // other workers intact.
         for (int w = 1; w < kNumWorkers; ++w) {
             for (int i = 0; i < kKeysPerWorker; ++i) {
                 auto val = store->Get(MakeKey(w, i));
@@ -175,14 +174,13 @@ int main() {
             }
         }
 
-        // crash-phase writes must be present.
+        // crash-phase writes present.
         for (int i = 0; i < 100; ++i) {
             auto val = store->Get("crash_key_" + std::to_string(i));
             assert(val.has_value());
             assert(*val == "crash_val_" + std::to_string(i));
         }
 
-        // torn trailing garbage didn't corrupt anything before it.
         std::cout << "Phase 3 verification PASSED.\n";
 
         PrintHeader("Phase 4: Compaction after recovery + second restart");
@@ -210,13 +208,13 @@ int main() {
         auto store = std::make_unique<kvstore::KVStore>(kDbPath);
         std::cout << "Size after second restart: " << store->Size() << "\n";
 
-        // verify deleted keys remain deleted after compaction and restart.
+        // deletes still gone.
         for (int i = 0; i < 50; ++i) {
             auto val = store->Get(MakeKey(0, i));
             assert(!val.has_value());
         }
 
-        // verify post-recovery writes survived compaction and restart.
+        // post-recovery writes survived.
         for (int w = 0; w < kNumWorkers; ++w) {
             for (int i = 0; i < 100; ++i) {
                 std::string key = "post_recovery_" + std::to_string(w) + "_" +
@@ -227,7 +225,7 @@ int main() {
             }
         }
 
-        // verify crash-phase keys survived compaction and restart.
+        // crash-phase keys survived.
         for (int i = 0; i < 100; ++i) {
             auto val = store->Get("crash_key_" + std::to_string(i));
             assert(val.has_value());
@@ -241,33 +239,32 @@ int main() {
     {
         auto store = std::make_unique<kvstore::KVStore>(kDbPath);
 
-        // a key with no ttl never expires.
         store->Set("ttl_permanent", "stays_forever");
 
-        // a key that expires almost immediately.
+        // expires in 1s.
         [[maybe_unused]] bool ok = store->SetWithTtl("ttl_short", "soon_gone", 1);
         assert(ok);
         assert(store->Get("ttl_short").has_value() && "key should be readable before it expires");
 
-        // a key with a long ttl that should survive a restart.
+        // long ttl.
         store->SetWithTtl("ttl_long", "around_for_a_while", 3600);
 
-        // wait for the short-lived key to expire.
+        // let the short key expire.
         std::this_thread::sleep_for(std::chrono::seconds(2));
         assert(!store->Get("ttl_short").has_value() && "key should be expired by now");
         assert(store->Get("ttl_permanent").has_value());
         assert(store->Get("ttl_long").has_value());
 
-        // compaction should drop the expired entry from disk.
+        // compaction drops it from disk.
         [[maybe_unused]] bool compacted = store->Compact();
         assert(compacted);
         std::cout << "Phase 5a (in-memory expiry) PASSED.\n";
     }
     {
         auto store = std::make_unique<kvstore::KVStore>(kDbPath);
-        // the expired key shouldn't come back after a restart.
+        // expired key stays gone.
         assert(!store->Get("ttl_short").has_value());
-        // the long-lived and permanent keys should survive recovery.
+        // others survive.
         assert(store->Get("ttl_permanent").value() == "stays_forever");
         assert(store->Get("ttl_long").value() == "around_for_a_while");
         std::cout << "Phase 5b (ttl survives restart) PASSED.\n";
@@ -277,7 +274,7 @@ int main() {
     {
         auto store = std::make_unique<kvstore::KVStore>(kDbPath);
 
-        // isolated keyspace so leftover keys from earlier phases don't affect assertions.
+        // isolated keys for this phase.
         store->Set("scan_a", "1");
         store->Set("scan_b", "2");
         store->Set("scan_c", "3");
@@ -285,10 +282,9 @@ int main() {
         store->Delete("scan_b");
         store->SetWithTtl("scan_expired", "gone", 1);
 
-        // give the ttl entry time to expire before scanning.
+        // let the ttl key expire.
         std::this_thread::sleep_for(std::chrono::seconds(2));
 
-        // items() returns everything live and non-expired, sorted by key.
         auto all = store->Items();
         [[maybe_unused]] auto find_scan = [&all](const std::string& key) {
             return std::find_if(all.begin(), all.end(),
@@ -300,12 +296,12 @@ int main() {
         assert(find_scan("scan_d") != all.end());
         assert(find_scan("scan_expired") == all.end()); // expired
 
-        // results must be sorted by key.
+        // sorted by key.
         for (std::size_t i = 1; i < all.size(); ++i) {
             assert(all[i - 1].key <= all[i].key);
         }
 
-        // range() with an explicit [start, end) window.
+        // explicit [start, end).
         auto window = store->Range("scan_a", "scan_d");
         assert(find_scan("scan_a") != all.end());
         [[maybe_unused]] bool has_a = false, has_c = false, has_d = false;
@@ -317,7 +313,7 @@ int main() {
         assert(has_a && has_c && "range start is inclusive");
         assert(!has_d && "range end is exclusive");
 
-        // an open-ended range (empty end) includes everything from start onward.
+        // open-ended range.
         auto open_ended = store->Range("scan_c", "");
         [[maybe_unused]] bool open_has_c = false, open_has_d = false, open_has_a = false;
         for (const auto& kv : open_ended) {
@@ -328,6 +324,50 @@ int main() {
         assert(open_has_c && open_has_d && !open_has_a);
 
         std::cout << "Phase 6 verification PASSED.\n";
+    }
+
+    PrintHeader("Phase 7: CRC corruption detection");
+    {
+        const std::string crc_db = "test_db/kvstore_crc.db";
+        const std::string crc_wal = crc_db + ".wal";
+        std::error_code rm_ec;
+        fs::remove(crc_wal, rm_ec);
+
+        // two records; the 2nd is last on disk.
+        {
+            auto store = std::make_unique<kvstore::KVStore>(crc_db);
+            [[maybe_unused]] bool ok = store->Set("crc_keep", "good");
+            assert(ok);
+            ok = store->Set("crc_corrupt", "target");
+            assert(ok);
+        }
+
+        // corrupt the last record's payload so its crc no longer matches.
+        {
+            std::fstream f(crc_wal, std::ios::binary | std::ios::in | std::ios::out);
+            assert(f.is_open());
+            f.seekg(0, std::ios::end);
+            const std::streamoff size = f.tellg();
+            assert(size > 5);
+            // byte just before the 4-byte crc.
+            const std::streamoff pos = size - 5;
+            f.seekg(pos);
+            char b = 0;
+            f.read(&b, 1);
+            b = static_cast<char>(b ^ 0xFF);
+            f.seekp(pos);
+            f.write(&b, 1);
+            f.flush();
+        }
+
+        {
+            auto store = std::make_unique<kvstore::KVStore>(crc_db);
+            // bad-crc record is dropped; earlier record survives.
+            assert(!store->Get("crc_corrupt").has_value() &&
+                   "record with mismatched CRC must be dropped during recovery");
+            assert(store->Get("crc_keep").value() == "good");
+        }
+        std::cout << "Phase 7 (CRC corruption detection) PASSED.\n";
     }
 
     PrintHeader("ALL TESTS PASSED");
