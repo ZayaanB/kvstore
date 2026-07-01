@@ -360,12 +360,36 @@ int main() {
             f.flush();
         }
 
+        std::uintmax_t size_before_reopen = 0;
         {
+            std::error_code sz_ec;
+            size_before_reopen = fs::file_size(crc_wal, sz_ec);
+            assert(!sz_ec);
+
             auto store = std::make_unique<kvstore::KVStore>(crc_db);
             // bad-crc record is dropped; earlier record survives.
             assert(!store->Get("crc_corrupt").has_value() &&
                    "record with mismatched CRC must be dropped during recovery");
             assert(store->Get("crc_keep").value() == "good");
+
+            // recovery must truncate the corrupt tail, not leave it in place.
+            std::error_code sz_ec2;
+            const std::uintmax_t size_after = fs::file_size(crc_wal, sz_ec2);
+            assert(!sz_ec2 && size_after < size_before_reopen &&
+                   "corrupt tail must be truncated during recovery");
+
+            // writes after recovery must land at the clean boundary.
+            [[maybe_unused]] bool ok = store->Set("crc_after", "fresh");
+            assert(ok);
+        }
+
+        // reopen once more: the post-recovery write must survive.
+        {
+            auto store = std::make_unique<kvstore::KVStore>(crc_db);
+            assert(store->Get("crc_keep").value() == "good");
+            assert(store->Get("crc_after").value() == "fresh" &&
+                   "writes appended after recovery must persist across restart");
+            assert(!store->Get("crc_corrupt").has_value());
         }
         std::cout << "Phase 7 (CRC corruption detection) PASSED.\n";
     }
