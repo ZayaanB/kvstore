@@ -1,20 +1,41 @@
 # kvstore
 
-A small embedded key-value store written from scratch in C++20. It's a from-scratch systems exercise, sharded in-memory index for concurrency, a binary write-ahead log for durability, crash recovery on startup, and a compaction routine that never blocks readers. No external dependencies, just the standard library.
+An embedded key-value store in C++20. Writes go to a binary write-ahead log and
+are `fsync`ed to disk before memory changes, so acknowledged writes survive both
+process crashes and power loss. Every record carries a CRC32 so recovery rejects
+torn or corrupted data instead of trusting it. The index is split into 16 shards
+for concurrency, and a compaction step reclaims dead log space without blocking
+readers. No dependencies beyond the standard library (POSIX for `fsync`).
 
-## How it works
+## Design
 
-![KVStore architecture](docs/architecture.svg)
+```
+  Set/Delete                         Get/Range/Size
+      |                                    |
+      v                                    v
+  [wal_mutex] append + fsync -> db.wal   shard shared_lock
+      |                                    |
+      v                                    v
+  shard unique_lock --> map           read from map
 
-**Sharded index.** The keyspace is split across 16 independent shards (`std::unordered_map` + `std::shared_mutex` each), chosen via `std::hash<std::string> % 16`. Reads take a `shared_lock` so concurrent `Get()` calls on the same shard never block each other; writes take a `unique_lock` scoped to just that shard. There's no global database lock.
+  index: 16 shards, each { shared_mutex, unordered_map<string,Entry> }
+         shard = hash(key) % 16
+  start: replay db.wal record by record
+  compact: live keys -> db.wal.tmp --(atomic rename)--> db.wal
+```
 
-**Write-ahead log.** Every `Set` and `Delete` is serialized as a binary record (type + key length + value length + payload), written to `db.wal`, and `flush()`ed before the in-memory shard is updated. If the process dies between the flush and the in-memory update, the WAL still has the record and recovery will replay it.
-
-**Recovery.** On startup, the WAL is read sequentially from the beginning and every record is replayed into the sharded index. If the log ends mid-record (a torn write from a crash), recovery stops cleanly at the last complete record instead of throwing.
-
-**Compaction.** `Compact()` takes the WAL's write mutex for the duration of the snapshot and swap: it walks each shard under a `shared_lock` writing only the currently-live key/value pairs to a temp file, then closes the old log, renames the temp file into place, and reopens it for appends. Because writers append to the WAL under that same mutex, no `Set`/`Delete` can slip into the old log after its shard has been snapshotted but before the swap, so nothing acknowledged is ever dropped. Readers never take the WAL mutex, so `Get`/`Range`/`Size` proceed concurrently; writers block only for the compaction window.
-
-The API is simple:
+- **Sharded index** — each shard has its own `shared_mutex`, so reads run in
+  parallel and writes only lock one shard. No global lock.
+- **Write-ahead log** — each `Set`/`Delete` is a binary record (type, key len,
+  value len, payload, trailing CRC32) written to `db.wal` and `fdatasync`ed
+  before the in-memory map changes. A failed or partial write is truncated back
+  to the last record boundary so the tail stays valid.
+- **Recovery** — on startup the log is replayed; each record's CRC32 is checked,
+  so a torn or corrupted record stops replay cleanly instead of loading garbage.
+- **Compaction** — `Compact()` holds the WAL mutex while it writes live keys to a
+  temp file, `fdatasync`s it, and atomically renames it into place (syncing the
+  directory), so no acknowledged write is lost even across power loss. Readers
+  never touch the WAL mutex and keep running.
 
 ```cpp
 kvstore::KVStore store("data/mydb.db"); // opens (or creates) and recovers
@@ -25,15 +46,48 @@ store.Delete("hello");                  // -> bool
 store.Compact();                        // -> bool
 ```
 
-## Running it yourself
+## On-disk format
 
-### Prerequisites
+The WAL is a flat sequence of self-describing records. Each record is:
 
-- A C++20 compiler (GCC ≥ 11 or Clang ≥ 14)
-- CMake ≥ 3.20
-- Linux or macOS
+```
++--------+---------+-----------+-----+-------+--------------+--------+
+| type   | key_len | value_len | key | value | expires_at   | crc32  |
+| 1 byte | 4 bytes | 4 bytes   | ... | ...   | 8 bytes*     | 4 bytes|
++--------+---------+-----------+-----+-------+--------------+--------+
+        \___________________ covered by crc32 ______________/
+```
 
-### Build and run
+- **`type`** — `1` set, `2` delete, `3` set-with-ttl. A delete has no `value`.
+- **`expires_at`** — Unix seconds; present only for `type == 3` (`*`).
+- **`crc32`** — IEEE CRC32 over every preceding byte of the record.
+- Integers are written in host byte order, so a WAL is single-host, not portable
+  across architectures.
+
+`Get`/`Set`/`Delete` are `O(1)` on one shard; `Range`/`Items`/`Size` scan all
+shards and cost `O(n)` (plus an `O(n log n)` sort for ordered results).
+
+## Durability
+
+`SetInternal`/`Delete` hold `wal_mutex_` across the whole append-then-apply so the
+log order and the visible in-memory state can never diverge. The write path is:
+
+1. serialize the record (with its CRC) and `write()` it to the WAL;
+2. `fdatasync()` the WAL so the bytes are on physical media;
+3. only then mutate the shard's map and return success.
+
+If the `write` or `fdatasync` fails, the WAL is `ftruncate`d back to the previous
+record boundary and the call returns `false` without touching memory, so the tail
+is always a run of whole, valid records. On startup `Recover()` replays records
+and stops at the first one whose CRC fails or whose header/payload is short — a
+torn tail from a crash — instead of loading garbage.
+
+> **Format note:** records now end with a CRC32. WAL files written by an earlier
+> version (no CRC) will not replay and should be recreated.
+
+## Build and run
+
+Needs a C++20 compiler (GCC 11+ / Clang 14+) and CMake 3.20+ on Linux or macOS.
 
 ```bash
 mkdir build && cd build
@@ -42,13 +96,14 @@ cmake --build . -j
 ./kvstore_test
 ```
 
-`kvstore_test` runs a stress and crash-recovery suite: 4 worker threads doing concurrent writes/reads, a compaction while readers are active, a simulated crash with a torn WAL record, and a restart with full recovery validation. A successful run ends with:
+`kvstore_test` runs the stress and crash-recovery suite: concurrent
+writes/reads, a compaction while readers are active, a simulated crash with a
+torn WAL record, and a restart that re-validates everything. It ends with
+`=== ALL TESTS PASSED ===`.
 
-=== ALL TESTS PASSED ===
+## CLI
 
-### Use it interactively (CLI)
-
-`kvstore_cli` is an interactive shell over the store (it takes an optional db path):
+`kvstore_cli` is an interactive shell (optional db path argument):
 
 ```bash
 ./kvstore_cli data/mydb.db
@@ -75,7 +130,7 @@ OK
 
 Other commands: `size`, `help`.
 
-### Benchmark
+## Benchmark
 
 `kvstore_bench` reports write, mixed read/write, and compaction throughput:
 
@@ -83,14 +138,12 @@ Other commands: `size`, `help`.
 ./kvstore_bench
 ```
 
-### Optional: run under sanitizers
+## Sanitizers
 
 ```bash
-# Data race detection
-g++ -std=c++20 -O1 -g -fsanitize=thread -pthread kvstore.cpp main.cpp -o kvstore_tsan
-./kvstore_tsan
+# data races
+g++ -std=c++20 -O1 -g -fsanitize=thread -pthread kvstore.cpp main.cpp -o kvstore_tsan && ./kvstore_tsan
 
-# Memory errors and undefined behavior
-g++ -std=c++20 -O1 -g -fsanitize=address,undefined -pthread kvstore.cpp main.cpp -o kvstore_asan
-./kvstore_asan
+# memory / undefined behavior
+g++ -std=c++20 -O1 -g -fsanitize=address,undefined -pthread kvstore.cpp main.cpp -o kvstore_asan && ./kvstore_asan
 ```

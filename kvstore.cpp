@@ -1,13 +1,98 @@
 #include "kvstore.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <stdexcept>
 
 namespace kvstore {
 
     namespace fs = std::filesystem;
+
+    namespace {
+
+        // ieee 802.3 crc32, computed on the fly so there's no table to initialize.
+        std::uint32_t Crc32(const void* data, std::size_t len) {
+            const auto* p = static_cast<const std::uint8_t*>(data);
+            std::uint32_t crc = 0xFFFFFFFFu;
+            for (std::size_t i = 0; i < len; ++i) {
+                crc ^= p[i];
+                for (int k = 0; k < 8; ++k) {
+                    // branchless: mask is all-ones when the low bit is set.
+                    crc = (crc >> 1) ^ (0xEDB88320u & (~(crc & 1u) + 1u));
+                }
+            }
+            return ~crc;
+        }
+
+        void AppendBytes(std::string& buf, const void* data, std::size_t len) {
+            buf.append(static_cast<const char*>(data), len);
+        }
+
+        // serializes a record to on-disk form with a trailing crc32 over prior bytes.
+        std::string SerializeRecord(RecordType type, const std::string& key,
+                                    const std::string& value, std::int64_t expires_at) {
+            const auto key_len = static_cast<std::uint32_t>(key.size());
+            const std::uint32_t value_len =
+                (type == RecordType::kDelete) ? 0u
+                                              : static_cast<std::uint32_t>(value.size());
+            const auto type_raw = static_cast<std::uint8_t>(type);
+
+            std::string buf;
+            buf.reserve(sizeof(type_raw) + sizeof(key_len) + sizeof(value_len) +
+                        key.size() + value_len + sizeof(expires_at) + sizeof(std::uint32_t));
+
+            AppendBytes(buf, &type_raw, sizeof(type_raw));
+            AppendBytes(buf, &key_len, sizeof(key_len));
+            AppendBytes(buf, &value_len, sizeof(value_len));
+            if (!key.empty()) {
+                AppendBytes(buf, key.data(), key.size());
+            }
+            if (type != RecordType::kDelete && value_len > 0) {
+                AppendBytes(buf, value.data(), value_len);
+            }
+            if (type == RecordType::kSetTtl) {
+                AppendBytes(buf, &expires_at, sizeof(expires_at));
+            }
+
+            const std::uint32_t crc = Crc32(buf.data(), buf.size());
+            AppendBytes(buf, &crc, sizeof(crc));
+            return buf;
+        }
+
+        // writes the whole buffer, retrying short writes and EINTR.
+        bool WriteFully(int fd, const char* data, std::size_t len) {
+            std::size_t written = 0;
+            while (written < len) {
+                const ssize_t n = ::write(fd, data + written, len - written);
+                if (n < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    return false;
+                }
+                written += static_cast<std::size_t>(n);
+            }
+            return true;
+        }
+
+        // fsyncs the directory holding path so a create or rename is itself durable.
+        void SyncParentDir(const std::string& path) {
+            fs::path p(path);
+            const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
+            const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+            if (dfd >= 0) {
+                ::fsync(dfd);
+                ::close(dfd);
+            }
+        }
+
+    }  // namespace
 
     KVStore::KVStore(std::string path)
         : path_(std::move(path)),
@@ -26,9 +111,10 @@ namespace kvstore {
 
     KVStore::~KVStore() {
         std::lock_guard<std::mutex> lock(wal_mutex_);
-        if (wal_stream_.is_open()) {
-            wal_stream_.flush();
-            wal_stream_.close();
+        if (wal_fd_ >= 0) {
+            ::fsync(wal_fd_);
+            ::close(wal_fd_);
+            wal_fd_ = -1;
         }
     }
 
@@ -55,9 +141,14 @@ namespace kvstore {
 
     void KVStore::OpenWalForAppend() {
         std::lock_guard<std::mutex> lock(wal_mutex_);
-        wal_stream_.open(wal_path_, std::ios::binary | std::ios::app | std::ios::out);
-        if (!wal_stream_.is_open()) {
+        const bool existed = fs::exists(wal_path_);
+        wal_fd_ = ::open(wal_path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (wal_fd_ < 0) {
             throw std::runtime_error("KVStore: failed to open WAL file: " + wal_path_);
+        }
+        // if we just created the file, persist its directory entry too.
+        if (!existed) {
+            SyncParentDir(wal_path_);
         }
     }
 
@@ -68,50 +159,75 @@ namespace kvstore {
             return;
         }
 
+        // reads exactly n bytes into the record buffer; false on short read (torn tail).
+        const auto read_into = [&in](std::string& sink, std::size_t n) -> bool {
+            const std::size_t old_size = sink.size();
+            sink.resize(old_size + n);
+            in.read(sink.data() + old_size, static_cast<std::streamsize>(n));
+            return in.gcount() == static_cast<std::streamsize>(n);
+        };
+
         while (true) {
-            RecordHeader hdr{};
-            in.read(reinterpret_cast<char*>(&hdr.type), sizeof(hdr.type));
-            if (in.eof()) break;
-            in.read(reinterpret_cast<char*>(&hdr.key_len), sizeof(hdr.key_len));
-            if (!in || in.eof()) break;
-            in.read(reinterpret_cast<char*>(&hdr.value_len), sizeof(hdr.value_len));
-            if (!in || in.eof()) break;
+            // accumulate every byte of the record so we can verify its crc.
+            std::string record;
 
-            // a length past these bounds means a corrupt header, so stop replaying.
-            if (hdr.key_len > kMaxKeyLen || hdr.value_len > kMaxValueLen) break;
+            std::uint8_t type_raw = 0;
+            in.read(reinterpret_cast<char*>(&type_raw), sizeof(type_raw));
+            if (in.gcount() != static_cast<std::streamsize>(sizeof(type_raw))) break;
+            AppendBytes(record, &type_raw, sizeof(type_raw));
 
-            std::string key(hdr.key_len, '\0');
-            if (hdr.key_len > 0) {
-                in.read(key.data(), static_cast<std::streamsize>(hdr.key_len));
-                // partial key means the last write was cut short by a crash.
-                if (!in) break;
+            const RecordType type = static_cast<RecordType>(type_raw);
+            if (type != RecordType::kSet && type != RecordType::kSetTtl &&
+                type != RecordType::kDelete) {
+                // unrecognized record type, stop rather than read garbage.
+                break;
             }
 
-            std::string value;
-            if (hdr.type == RecordType::kSet || hdr.type == RecordType::kSetTtl) {
-                value.resize(hdr.value_len);
-                if (hdr.value_len > 0) {
-                    in.read(value.data(), static_cast<std::streamsize>(hdr.value_len));
-                    // same deal - truncated value, stop replaying.
-                    if (!in) break;
-                }
+            if (!read_into(record, sizeof(std::uint32_t))) break;  // key_len
+            if (!read_into(record, sizeof(std::uint32_t))) break;  // value_len
+
+            std::uint32_t key_len = 0;
+            std::uint32_t value_len = 0;
+            std::memcpy(&key_len, record.data() + 1, sizeof(key_len));
+            std::memcpy(&value_len, record.data() + 1 + sizeof(key_len), sizeof(value_len));
+
+            // a length past these bounds means a corrupt header, so stop replaying.
+            if (key_len > kMaxKeyLen || value_len > kMaxValueLen) break;
+
+            const std::size_t key_off = record.size();
+            if (key_len > 0 && !read_into(record, key_len)) break;
+
+            std::size_t value_off = record.size();
+            if (type == RecordType::kSet || type == RecordType::kSetTtl) {
+                if (value_len > 0 && !read_into(record, value_len)) break;
             }
 
             std::int64_t expires_at = kNoExpiry;
-            if (hdr.type == RecordType::kSetTtl) {
-                in.read(reinterpret_cast<char*>(&expires_at), sizeof(expires_at));
-                // truncated ttl field, stop replaying.
-                if (!in) break;
+            if (type == RecordType::kSetTtl) {
+                const std::size_t exp_off = record.size();
+                if (!read_into(record, sizeof(expires_at))) break;
+                std::memcpy(&expires_at, record.data() + exp_off, sizeof(expires_at));
             }
 
-            switch (hdr.type) {
+            std::uint32_t stored_crc = 0;
+            in.read(reinterpret_cast<char*>(&stored_crc), sizeof(stored_crc));
+            if (in.gcount() != static_cast<std::streamsize>(sizeof(stored_crc))) break;
+
+            // a mismatch means a torn or corrupted record: stop at the first bad one.
+            if (Crc32(record.data(), record.size()) != stored_crc) break;
+
+            std::string key = record.substr(key_off, key_len);
+
+            switch (type) {
                 case RecordType::kSet: {
+                    std::string value = record.substr(value_off, value_len);
                     Shard& shard = ShardFor(key);
                     std::unique_lock lock(shard.mutex);
                     shard.data[key] = Entry{std::move(value), kNoExpiry};
                     break;
                 }
                 case RecordType::kSetTtl: {
+                    std::string value = record.substr(value_off, value_len);
                     Shard& shard = ShardFor(key);
                     std::unique_lock lock(shard.mutex);
                     shard.data[key] = Entry{std::move(value), expires_at};
@@ -123,38 +239,32 @@ namespace kvstore {
                     shard.data.erase(key);
                     break;
                 }
-                default:
-                    // unrecognized record type, stop rather than read garbage.
-                    return;
             }
         }
     }
 
     bool KVStore::AppendRecordLocked(RecordType type, const std::string& key,
                                     const std::string& value, std::int64_t expires_at) {
-        RecordHeader hdr{};
-        hdr.type = type;
-        hdr.key_len = static_cast<std::uint32_t>(key.size());
-        hdr.value_len = (type == RecordType::kDelete)
-                            ? 0u
-                            : static_cast<std::uint32_t>(value.size());
+        const std::string record = SerializeRecord(type, key, value, expires_at);
 
-        wal_stream_.write(reinterpret_cast<const char*>(&hdr.type), sizeof(hdr.type));
-        wal_stream_.write(reinterpret_cast<const char*>(&hdr.key_len), sizeof(hdr.key_len));
-        wal_stream_.write(reinterpret_cast<const char*>(&hdr.value_len), sizeof(hdr.value_len));
-        if (!key.empty()) {
-            wal_stream_.write(key.data(), static_cast<std::streamsize>(key.size()));
-        }
-        if (type != RecordType::kDelete && !value.empty()) {
-            wal_stream_.write(value.data(), static_cast<std::streamsize>(value.size()));
-        }
-        if (type == RecordType::kSetTtl) {
-            wal_stream_.write(reinterpret_cast<const char*>(&expires_at), sizeof(expires_at));
+        // remember the tail so a failed write can be rolled back cleanly.
+        const off_t before = ::lseek(wal_fd_, 0, SEEK_END);
+        if (before < 0) {
+            return false;
         }
 
-        // flush now so the record is on disk before we touch the in-memory map.
-        wal_stream_.flush();
-        return wal_stream_.good();
+        if (!WriteFully(wal_fd_, record.data(), record.size())) {
+            // roll back any partial bytes so the tail stays on a record boundary.
+            if (::ftruncate(wal_fd_, before) != 0) { /* best effort rollback */ }
+            return false;
+        }
+
+        // fsync so the record is durable before the map changes; roll back on failure.
+        if (::fdatasync(wal_fd_) != 0) {
+            if (::ftruncate(wal_fd_, before) != 0) { /* best effort rollback */ }
+            return false;
+        }
+        return true;
     }
 
     bool KVStore::SetInternal(const std::string& key, const std::string& value,
@@ -276,11 +386,13 @@ namespace kvstore {
 
         // write a clean copy of every live, non-expired key/value pair to a temp file.
         {
-            std::ofstream tmp(wal_tmp_path_, std::ios::binary | std::ios::trunc | std::ios::out);
-            if (!tmp.is_open()) {
+            const int tmp_fd =
+                ::open(wal_tmp_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (tmp_fd < 0) {
                 return false;
             }
 
+            bool write_ok = true;
             // shard-by-shard shared locks let other shards (and readers here) keep going.
             for (auto& shard : shards_) {
                 std::shared_lock lock(shard.mutex);
@@ -290,57 +402,57 @@ namespace kvstore {
                         continue;
                     }
 
-                    RecordType type = (entry.expires_at == kNoExpiry)
-                                        ? RecordType::kSet
-                                        : RecordType::kSetTtl;
-
-                    RecordHeader hdr{};
-                    hdr.type = type;
-                    hdr.key_len = static_cast<std::uint32_t>(key.size());
-                    hdr.value_len = static_cast<std::uint32_t>(entry.value.size());
-
-                    tmp.write(reinterpret_cast<const char*>(&hdr.type), sizeof(hdr.type));
-                    tmp.write(reinterpret_cast<const char*>(&hdr.key_len), sizeof(hdr.key_len));
-                    tmp.write(reinterpret_cast<const char*>(&hdr.value_len), sizeof(hdr.value_len));
-                    if (!key.empty()) {
-                        tmp.write(key.data(), static_cast<std::streamsize>(key.size()));
+                    const RecordType type = (entry.expires_at == kNoExpiry)
+                                                ? RecordType::kSet
+                                                : RecordType::kSetTtl;
+                    const std::string record =
+                        SerializeRecord(type, key, entry.value, entry.expires_at);
+                    if (!WriteFully(tmp_fd, record.data(), record.size())) {
+                        write_ok = false;
+                        break;
                     }
-                    if (!entry.value.empty()) {
-                        tmp.write(entry.value.data(), static_cast<std::streamsize>(entry.value.size()));
-                    }
-                    if (type == RecordType::kSetTtl) {
-                        tmp.write(reinterpret_cast<const char*>(&entry.expires_at), sizeof(entry.expires_at));
-                    }
+                }
+                if (!write_ok) {
+                    break;
                 }
             }
 
-            tmp.flush();
-            if (!tmp.good()) {
-                tmp.close();
+            // fsync the temp file so its contents are durable before the rename.
+            if (write_ok && ::fdatasync(tmp_fd) != 0) {
+                write_ok = false;
+            }
+            ::close(tmp_fd);
+
+            if (!write_ok) {
                 std::error_code ec;
                 fs::remove(wal_tmp_path_, ec);
                 return false;
             }
-            tmp.close();
         }
 
         // swap the temp file in (still holding wal_mutex_) so no write is lost.
         {
-            if (wal_stream_.is_open()) {
-                wal_stream_.flush();
-                wal_stream_.close();
+            if (wal_fd_ >= 0) {
+                ::fsync(wal_fd_);
+                ::close(wal_fd_);
+                wal_fd_ = -1;
             }
 
             std::error_code ec;
             fs::rename(wal_tmp_path_, wal_path_, ec);
             if (ec) {
-                // rename failed, try to reopen the old log and report failure.
-                wal_stream_.open(wal_path_, std::ios::binary | std::ios::app | std::ios::out);
+                // rename failed: clean up the temp file and reopen the old log.
+                std::error_code rm_ec;
+                fs::remove(wal_tmp_path_, rm_ec);
+                wal_fd_ = ::open(wal_path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
                 return false;
             }
 
-            wal_stream_.open(wal_path_, std::ios::binary | std::ios::app | std::ios::out);
-            if (!wal_stream_.is_open()) {
+            // persist the rename itself before we start appending again.
+            SyncParentDir(wal_path_);
+
+            wal_fd_ = ::open(wal_path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (wal_fd_ < 0) {
                 return false;
             }
         }
