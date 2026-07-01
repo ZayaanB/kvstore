@@ -14,86 +14,77 @@
 
 namespace kvstore {
 
-    // number of independent keyspace partitions.
     constexpr std::size_t kNumShards = 16;
 
-    // sentinel value meaning this entry has no expiry.
+    // "no expiry" sentinel.
     constexpr std::int64_t kNoExpiry = 0;
 
-    // upper bounds on record field sizes; a longer field means a corrupt header.
+    // sanity bounds; a bigger field means a corrupt header.
     constexpr std::uint32_t kMaxKeyLen = 1u << 20;    // 1 MiB
     constexpr std::uint32_t kMaxValueLen = 1u << 28;  // 256 MiB
 
-    // type tag written at the start of every log record.
     enum class RecordType : std::uint8_t {
         kSet = 1,
         kDelete = 2,
         kSetTtl = 3,
     };
 
-    // on-disk record: [type][key_len][value_len][key][value][expires_at?][crc32].
+    // record prefix. on-disk layout: [type][key_len][value_len][key][value][expires_at?][crc32].
+    // sizeof(RecordHeader) is not the serialized size -- don't use it as a byte count.
     struct RecordHeader {
         RecordType type;
         std::uint32_t key_len;
         std::uint32_t value_len;
     };
 
-    // a stored value and its optional expiry time.
     struct Entry {
         std::string value;
         std::int64_t expires_at = kNoExpiry;
     };
 
-    // one partition of the keyspace with its own map and lock.
+    // one keyspace partition, with its own lock.
     struct Shard {
         mutable std::shared_mutex mutex;
         std::unordered_map<std::string, Entry> data;
     };
 
-    // a key/value pair returned by scans.
     struct KeyValue {
         std::string key;
         std::string value;
     };
 
-    // embedded key-value store backed by a write-ahead log.
+    // key-value store backed by a write-ahead log.
     class KVStore {
     public:
-        // opens or creates a store at path, replaying the log if one exists.
+        // opens or creates a store at path, replaying any existing log.
         explicit KVStore(std::string path);
 
         ~KVStore();
 
-        // non-copyable.
         KVStore(const KVStore&) = delete;
         KVStore& operator=(const KVStore&) = delete;
 
-        // insert or overwrite a key.
         bool Set(const std::string& key, const std::string& value);
 
-        // insert or overwrite a key that expires after ttl_seconds.
+        // like Set, but the key expires after ttl_seconds.
         bool SetWithTtl(const std::string& key, const std::string& value,
                         std::int64_t ttl_seconds);
 
-        // returns the value for key, or empty if absent or expired.
+        // value, or empty if absent or expired.
         std::optional<std::string> Get(const std::string& key) const;
 
-        // removes a key.
         bool Delete(const std::string& key);
 
-        // rewrites the log to contain only live keys, then swaps it in atomically.
+        // rewrite the log with only live keys, swapped in atomically.
         bool Compact();
 
-        // number of live keys.
         std::size_t Size() const;
 
-        // returns all live key/value pairs sorted by key.
         std::vector<KeyValue> Items() const;
 
-        // returns live key/value pairs in [start, end) sorted by key; empty end means no upper bound.
+        // live pairs in [start, end); empty end means no upper bound.
         std::vector<KeyValue> Range(const std::string& start, const std::string& end) const;
 
-        // path to the active log file.
         const std::string& WalPath() const { return wal_path_; }
 
     private:

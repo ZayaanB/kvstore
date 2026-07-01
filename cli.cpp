@@ -8,7 +8,7 @@
 
 namespace {
 
-    // splits a line on whitespace, respecting nothing fancy - good enough for this cli.
+    // split a line on whitespace.
     std::vector<std::string> SplitArgs(const std::string& line) {
         std::vector<std::string> args;
         std::istringstream iss(line);
@@ -76,7 +76,7 @@ int main(int argc, char** argv) {
                 std::cout << "usage: set <key> <value>\n";
                 continue;
             }
-            // everything after the key is the value, joined back with spaces.
+            // join the rest as the value.
             std::string value;
             for (std::size_t i = 2; i < args.size(); ++i) {
                 if (i > 2) value += ' ';

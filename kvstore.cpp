@@ -16,16 +16,26 @@ namespace kvstore {
 
     namespace {
 
-        // ieee 802.3 crc32, computed on the fly so there's no table to initialize.
+        // precomputed crc32 table.
+        struct Crc32Table {
+            std::uint32_t v[256];
+            constexpr Crc32Table() : v{} {
+                for (std::uint32_t i = 0; i < 256; ++i) {
+                    std::uint32_t c = i;
+                    for (int k = 0; k < 8; ++k) {
+                        c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+                    }
+                    v[i] = c;
+                }
+            }
+        };
+        constexpr Crc32Table kCrc32Table{};
+
         std::uint32_t Crc32(const void* data, std::size_t len) {
             const auto* p = static_cast<const std::uint8_t*>(data);
             std::uint32_t crc = 0xFFFFFFFFu;
             for (std::size_t i = 0; i < len; ++i) {
-                crc ^= p[i];
-                for (int k = 0; k < 8; ++k) {
-                    // branchless: mask is all-ones when the low bit is set.
-                    crc = (crc >> 1) ^ (0xEDB88320u & (~(crc & 1u) + 1u));
-                }
+                crc = kCrc32Table.v[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
             }
             return ~crc;
         }
@@ -34,7 +44,7 @@ namespace kvstore {
             buf.append(static_cast<const char*>(data), len);
         }
 
-        // serializes a record to on-disk form with a trailing crc32 over prior bytes.
+        // build a record: header, payload, then a crc over it all.
         std::string SerializeRecord(RecordType type, const std::string& key,
                                     const std::string& value, std::int64_t expires_at) {
             const auto key_len = static_cast<std::uint32_t>(key.size());
@@ -65,7 +75,7 @@ namespace kvstore {
             return buf;
         }
 
-        // writes the whole buffer, retrying short writes and EINTR.
+        // write every byte, retrying partial writes and EINTR.
         bool WriteFully(int fd, const char* data, std::size_t len) {
             std::size_t written = 0;
             while (written < len) {
@@ -76,12 +86,15 @@ namespace kvstore {
                     }
                     return false;
                 }
+                if (n == 0) {
+                    return false;  // no progress; don't spin.
+                }
                 written += static_cast<std::size_t>(n);
             }
             return true;
         }
 
-        // fsyncs the directory holding path so a create or rename is itself durable.
+        // fsync the parent dir so a create/rename survives a crash.
         void SyncParentDir(const std::string& path) {
             fs::path p(path);
             const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
@@ -98,7 +111,7 @@ namespace kvstore {
         : path_(std::move(path)),
         wal_path_(path_ + ".wal"),
         wal_tmp_path_(path_ + ".wal.tmp") {
-        // make sure the directory the db lives in actually exists.
+        // ensure the db directory exists.
         fs::path p(path_);
         if (p.has_parent_path()) {
             std::error_code ec;
@@ -146,7 +159,6 @@ namespace kvstore {
         if (wal_fd_ < 0) {
             throw std::runtime_error("KVStore: failed to open WAL file: " + wal_path_);
         }
-        // if we just created the file, persist its directory entry too.
         if (!existed) {
             SyncParentDir(wal_path_);
         }
@@ -155,11 +167,10 @@ namespace kvstore {
     void KVStore::Recover() {
         std::ifstream in(wal_path_, std::ios::binary);
         if (!in.is_open()) {
-            // no log yet, so there's nothing to recover.
-            return;
+            return;  // nothing to recover.
         }
 
-        // reads exactly n bytes into the record buffer; false on short read (torn tail).
+        // read n bytes; false on a short read (torn tail).
         const auto read_into = [&in](std::string& sink, std::size_t n) -> bool {
             const std::size_t old_size = sink.size();
             sink.resize(old_size + n);
@@ -168,7 +179,7 @@ namespace kvstore {
         };
 
         while (true) {
-            // accumulate every byte of the record so we can verify its crc.
+            // buffer the whole record so we can check its crc.
             std::string record;
 
             std::uint8_t type_raw = 0;
@@ -179,8 +190,7 @@ namespace kvstore {
             const RecordType type = static_cast<RecordType>(type_raw);
             if (type != RecordType::kSet && type != RecordType::kSetTtl &&
                 type != RecordType::kDelete) {
-                // unrecognized record type, stop rather than read garbage.
-                break;
+                break;  // unknown type.
             }
 
             if (!read_into(record, sizeof(std::uint32_t))) break;  // key_len
@@ -191,8 +201,7 @@ namespace kvstore {
             std::memcpy(&key_len, record.data() + 1, sizeof(key_len));
             std::memcpy(&value_len, record.data() + 1 + sizeof(key_len), sizeof(value_len));
 
-            // a length past these bounds means a corrupt header, so stop replaying.
-            if (key_len > kMaxKeyLen || value_len > kMaxValueLen) break;
+            if (key_len > kMaxKeyLen || value_len > kMaxValueLen) break;  // corrupt header.
 
             const std::size_t key_off = record.size();
             if (key_len > 0 && !read_into(record, key_len)) break;
@@ -213,8 +222,7 @@ namespace kvstore {
             in.read(reinterpret_cast<char*>(&stored_crc), sizeof(stored_crc));
             if (in.gcount() != static_cast<std::streamsize>(sizeof(stored_crc))) break;
 
-            // a mismatch means a torn or corrupted record: stop at the first bad one.
-            if (Crc32(record.data(), record.size()) != stored_crc) break;
+            if (Crc32(record.data(), record.size()) != stored_crc) break;  // bad crc.
 
             std::string key = record.substr(key_off, key_len);
 
@@ -245,23 +253,30 @@ namespace kvstore {
 
     bool KVStore::AppendRecordLocked(RecordType type, const std::string& key,
                                     const std::string& value, std::int64_t expires_at) {
+        // reject oversized fields; recovery would treat them as corrupt.
+        if (key.size() > kMaxKeyLen) {
+            return false;
+        }
+        if (type != RecordType::kDelete && value.size() > kMaxValueLen) {
+            return false;
+        }
+
         const std::string record = SerializeRecord(type, key, value, expires_at);
 
-        // remember the tail so a failed write can be rolled back cleanly.
+        // tail offset, for rollback on failure.
         const off_t before = ::lseek(wal_fd_, 0, SEEK_END);
         if (before < 0) {
             return false;
         }
 
         if (!WriteFully(wal_fd_, record.data(), record.size())) {
-            // roll back any partial bytes so the tail stays on a record boundary.
-            if (::ftruncate(wal_fd_, before) != 0) { /* best effort rollback */ }
+            if (::ftruncate(wal_fd_, before) != 0) {}  // roll back partial write.
             return false;
         }
 
-        // fsync so the record is durable before the map changes; roll back on failure.
+        // fsync before the record is visible in memory.
         if (::fdatasync(wal_fd_) != 0) {
-            if (::ftruncate(wal_fd_, before) != 0) { /* best effort rollback */ }
+            if (::ftruncate(wal_fd_, before) != 0) {}
             return false;
         }
         return true;
@@ -271,7 +286,7 @@ namespace kvstore {
                                 std::int64_t expires_at) {
         RecordType type = (expires_at == kNoExpiry) ? RecordType::kSet : RecordType::kSetTtl;
 
-        // hold wal_mutex_ across the append and the apply so wal order and visible state can't diverge.
+        // append + apply under one lock so log order matches memory.
         std::lock_guard<std::mutex> wal_lock(wal_mutex_);
         if (!AppendRecordLocked(type, key, value, expires_at)) {
             return false;
@@ -289,11 +304,9 @@ namespace kvstore {
 
     bool KVStore::SetWithTtl(const std::string& key, const std::string& value,
                             std::int64_t ttl_seconds) {
-        // ttl <= 0 means "expire immediately" - still a valid, durable write.
         std::int64_t expires_at = NowSeconds() + ttl_seconds;
         if (expires_at == kNoExpiry) {
-            // extremely unlikely collision with the sentinel, nudge by one second.
-            expires_at += 1;
+            expires_at += 1;  // avoid the no-expiry sentinel.
         }
         return SetInternal(key, value, expires_at);
     }
@@ -305,7 +318,7 @@ namespace kvstore {
         if (it == shard.data.end()) {
             return std::nullopt;
         }
-        // expired entries are treated as absent, but stay on disk until compaction.
+        // expired reads as absent; removed at compaction.
         if (IsExpired(it->second.expires_at)) {
             return std::nullopt;
         }
@@ -313,7 +326,7 @@ namespace kvstore {
     }
 
     bool KVStore::Delete(const std::string& key) {
-        // hold wal_mutex_ across the append and the apply so wal order and visible state can't diverge.
+        // append + apply under one lock so log order matches memory.
         std::lock_guard<std::mutex> wal_lock(wal_mutex_);
         if (!AppendRecordLocked(RecordType::kDelete, key, std::string(), kNoExpiry)) {
             return false;
@@ -345,7 +358,6 @@ namespace kvstore {
     std::vector<KeyValue> KVStore::Range(const std::string& start, const std::string& end) const {
         std::vector<KeyValue> result;
 
-        // collect matching, non-expired entries shard by shard under shared locks.
         for (const auto& shard : shards_) {
             std::shared_lock lock(shard.mutex);
             for (const auto& [key, entry] : shard.data) {
@@ -362,7 +374,7 @@ namespace kvstore {
             }
         }
 
-        // shards are unordered internally, so sort the merged snapshot by key.
+        // sort by key.
         std::sort(result.begin(), result.end(),
                 [](const KeyValue& a, const KeyValue& b) { return a.key < b.key; });
 
@@ -372,8 +384,7 @@ namespace kvstore {
     bool KVStore::Compact() {
         bool expected = false;
         if (!compaction_in_progress_.compare_exchange_strong(expected, true)) {
-            // somebody's already compacting, don't pile on.
-            return false;
+            return false;  // already compacting.
         }
 
         struct CompactionGuard {
@@ -381,10 +392,10 @@ namespace kvstore {
             ~CompactionGuard() { flag.store(false); }
         } guard{compaction_in_progress_};
 
-        // hold wal_mutex_ across the whole snapshot and swap so no write is lost mid-rename.
+        // lock across the snapshot and swap so no write is lost.
         std::lock_guard<std::mutex> wal_lock(wal_mutex_);
 
-        // write a clean copy of every live, non-expired key/value pair to a temp file.
+        // write live entries to a temp file.
         {
             const int tmp_fd =
                 ::open(wal_tmp_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -393,12 +404,10 @@ namespace kvstore {
             }
 
             bool write_ok = true;
-            // shard-by-shard shared locks let other shards (and readers here) keep going.
             for (auto& shard : shards_) {
                 std::shared_lock lock(shard.mutex);
                 for (const auto& [key, entry] : shard.data) {
-                    // drop expired entries during compaction instead of carrying them forward.
-                    if (IsExpired(entry.expires_at)) {
+                    if (IsExpired(entry.expires_at)) {  // drop expired.
                         continue;
                     }
 
@@ -417,7 +426,7 @@ namespace kvstore {
                 }
             }
 
-            // fsync the temp file so its contents are durable before the rename.
+            // fsync before the rename.
             if (write_ok && ::fdatasync(tmp_fd) != 0) {
                 write_ok = false;
             }
@@ -430,7 +439,7 @@ namespace kvstore {
             }
         }
 
-        // swap the temp file in (still holding wal_mutex_) so no write is lost.
+        // swap the temp file in.
         {
             if (wal_fd_ >= 0) {
                 ::fsync(wal_fd_);
@@ -441,14 +450,14 @@ namespace kvstore {
             std::error_code ec;
             fs::rename(wal_tmp_path_, wal_path_, ec);
             if (ec) {
-                // rename failed: clean up the temp file and reopen the old log.
+                // rename failed: keep the old log.
                 std::error_code rm_ec;
                 fs::remove(wal_tmp_path_, rm_ec);
                 wal_fd_ = ::open(wal_path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
                 return false;
             }
 
-            // persist the rename itself before we start appending again.
+            // persist the rename.
             SyncParentDir(wal_path_);
 
             wal_fd_ = ::open(wal_path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -457,7 +466,7 @@ namespace kvstore {
             }
         }
 
-        // purge expired entries from the in-memory shards so scan and Size() reflect reality
+        // drop expired from memory too.
         for (auto& shard : shards_) {
             std::unique_lock lock(shard.mutex);
             for (auto it = shard.data.begin(); it != shard.data.end(); ) {
