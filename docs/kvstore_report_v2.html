@@ -1,0 +1,2274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>kvstore — A Complete Beginner's Guide</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  body {
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 11pt; line-height: 1.55; color: #1a1a1a;
+    max-width: 175mm; margin: 0 auto;
+  }
+  h1 { font-size: 22pt; color: #14532d; border-bottom: 3px solid #14532d; padding-bottom: 6px; page-break-before: always; }
+  h1.first { page-break-before: avoid; }
+  h2 { font-size: 15pt; color: #166534; margin-top: 28px; }
+  h3 { font-size: 12.5pt; color: #1a1a1a; margin-top: 22px; }
+  p { margin: 8px 0; text-align: justify; }
+  .cover { text-align: center; padding-top: 120px; }
+  .cover .kicker { font-size: 10pt; letter-spacing: 3px; color: #666; text-transform: uppercase; }
+  .cover h1 { font-size: 34pt; border: none; color: #14532d; page-break-before: avoid; margin: 18px 0 6px; }
+  .cover .sub { font-size: 14pt; color: #333; margin-bottom: 26px; }
+  .badges { margin: 18px 0 30px; }
+  .badge {
+    display: inline-block; background: #dcfce7; color: #14532d; border: 1px solid #86efac;
+    border-radius: 12px; padding: 3px 12px; font-size: 9pt; margin: 3px;
+    font-family: 'DejaVu Sans', Arial, sans-serif;
+  }
+  .cover .note { font-size: 10pt; color: #555; max-width: 130mm; margin: 40px auto 0; text-align: center; }
+  .codelabel {
+    font-family: 'DejaVu Sans Mono', 'Courier New', monospace; font-size: 8.5pt;
+    background: #14532d; color: #dcfce7; display: inline-block;
+    padding: 3px 10px; border-radius: 4px 4px 0 0; margin-top: 14px;
+  }
+  pre {
+    background: #f6f8f6; border: 1px solid #cfe3cf; border-radius: 0 4px 4px 4px;
+    padding: 10px 12px; font-family: 'DejaVu Sans Mono', 'Courier New', monospace;
+    font-size: 8.6pt; line-height: 1.45; overflow-x: hidden; white-space: pre-wrap;
+    margin: 0 0 10px 0; page-break-inside: avoid;
+  }
+  code {
+    font-family: 'DejaVu Sans Mono', 'Courier New', monospace; font-size: 9pt;
+    background: #eef4ee; padding: 1px 4px; border-radius: 3px;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 9.5pt; page-break-inside: avoid; }
+  th { background: #14532d; color: #fff; text-align: left; padding: 6px 8px; font-family: Arial, sans-serif; font-size: 9pt; }
+  td { border: 1px solid #cbd5c9; padding: 6px 8px; vertical-align: top; }
+  tr:nth-child(even) td { background: #f4f8f4; }
+  .defbox {
+    background: #f0fdf4; border-left: 4px solid #16a34a; padding: 8px 14px;
+    margin: 12px 0; page-break-inside: avoid;
+  }
+  .defbox .term { font-weight: bold; color: #14532d; font-family: Arial, sans-serif; font-size: 10pt; }
+  .why {
+    background: #fefce8; border-left: 4px solid #ca8a04; padding: 8px 14px;
+    margin: 12px 0; page-break-inside: avoid;
+  }
+  .why .t { font-weight: bold; color: #854d0e; font-family: Arial, sans-serif; font-size: 10pt; }
+  .diagram {
+    background: #1e293b; color: #e2e8f0; border-radius: 6px; padding: 14px 16px;
+    font-family: 'DejaVu Sans Mono', monospace; font-size: 8.5pt; line-height: 1.4;
+    white-space: pre; page-break-inside: avoid; margin: 12px 0;
+  }
+  .toc { columns: 1; }
+  .toc li { margin: 4px 0; }
+  ul, ol { margin: 8px 0; padding-left: 24px; }
+  li { margin: 4px 0; }
+  .footer-note { font-size: 9pt; color: #666; border-top: 1px solid #ccc; margin-top: 30px; padding-top: 8px; text-align: center; }
+  .inlinedef {
+    display: block; background: #eef6ff; border: 1px solid #93c5fd; border-left: 4px solid #2563eb;
+    border-radius: 4px; padding: 6px 12px; margin: 8px 0 8px 18px; font-size: 9.5pt;
+    font-family: Arial, 'Helvetica Neue', sans-serif; color: #1e3a5f; page-break-inside: avoid;
+  }
+  .inlinedef b { color: #1d4ed8; }
+</style>
+</head>
+<body>
+
+<!-- ============================== COVER ============================== -->
+<div class="cover">
+  <div class="kicker">Systems Programming Project Report — Second Edition</div>
+  <h1>kvstore</h1>
+  <div class="sub">An embedded, crash-safe, sharded key&ndash;value store in C++20<br>
+  <em>A complete beginner-to-intermediate guide</em></div>
+  <div class="badges">
+    <span class="badge">C++20</span>
+    <span class="badge">Write-Ahead Log</span>
+    <span class="badge">fsync Durability</span>
+    <span class="badge">CRC32 Integrity</span>
+    <span class="badge">Sharded Concurrency</span>
+    <span class="badge">Crash Recovery</span>
+    <span class="badge">Compaction</span>
+    <span class="badge">Portable Serialization</span>
+    <span class="badge">Process Locking</span>
+  </div>
+  <div class="note">
+    This document assumes no prior database experience. It starts from the absolute basics
+    (&ldquo;what is a key&ndash;value store?&rdquo;), builds up every concept and vocabulary word in plain
+    English, and ends with a line-by-line walkthrough of the entire codebase. Every code block
+    is quoted verbatim from the current source files, with the exact file and line range
+    labelled above it.
+  </div>
+</div>
+
+<!-- ============================== CONTENTS ============================== -->
+<h1>Contents</h1>
+<ol class="toc">
+  <li><b>Part 1 — The Basics:</b> what a key&ndash;value store is, what &ldquo;embedded&rdquo; means, what kvstore can do,
+      and the promises a real database must keep</li>
+  <li><b>Part 2 — The Core Ideas, One at a Time:</b> memory vs. disk, the journey of a byte, durability,
+      the write-ahead log, checksums, recovery, compaction, threads and locks, sharding, atomics, TTL,
+      endianness, file locks, and the honest trade-offs</li>
+  <li><b>Part 3 — The Architecture:</b> how the pieces fit together, the write path, the read path,
+      the on-disk record format byte by byte, the files on disk, a crash-timeline analysis, and the
+      startup sequence</li>
+  <li><b>Part 4 — Real-Life Applications:</b> the famous systems that use these exact ideas, where you
+      would use kvstore yourself, what production engines add on top, and the distributed staircase</li>
+  <li><b>Part 5 — Full Code Walkthrough:</b>
+    <ol>
+      <li>kvstore.hpp — the interface &amp; data model</li>
+      <li>kvstore.cpp — the storage engine</li>
+      <li>cli.cpp — the interactive shell</li>
+      <li>main.cpp — the test harness (7 phases)</li>
+      <li>bench.cpp — the benchmark</li>
+    </ol>
+  </li>
+  <li><b>Appendix:</b> concept-to-code map &amp; how to build and run</li>
+</ol>
+
+<!-- ============================== PART 1 ============================== -->
+<h1>Part 1 — The Basics</h1>
+
+<h2>1.1 What is a database, really?</h2>
+<p>
+A <b>database</b> is any program whose job is to remember data for you — reliably. That last word is the
+whole game. Any program can hold data in variables while it runs, but that data vanishes the instant the
+program exits, crashes, or the computer loses power. A database's promise is: <em>give me your data,
+and I will still have it tomorrow, even if things go wrong tonight.</em>
+</p>
+<p>
+Databases come in many shapes. The one you have probably heard of — SQL databases like MySQL or
+PostgreSQL — organize data into tables with rows and columns and answer complex queries. But underneath
+almost every fancy database sits something much simpler, and that simpler thing is what this project builds.
+</p>
+<p>
+You might reasonably ask: <em>why not just write my data to a file?</em> After all, files survive
+restarts too. The answer is that a plain file solves the easy half of the problem and none of the hard
+half. What happens if the program is killed halfway through saving? What if two threads save at once?
+What if the file slowly fills the disk? What if a few bytes on the disk silently go bad? A database is,
+at its heart, <em>a file plus disciplined answers to all of those questions</em>. This report is the
+story of those answers.
+</p>
+<p>
+Database theory summarizes the promises a trustworthy database makes with a famous four-letter acronym:
+</p>
+<span class="inlinedef"><b>ACID</b> — <b>A</b>tomicity (an operation fully happens or not at all),
+<b>C</b>onsistency (the data never enters an invalid state), <b>I</b>solation (concurrent operations do not
+see each other's half-finished work), and <b>D</b>urability (finished work survives crashes).
+kvstore delivers atomicity and durability for every single operation, isolation between concurrent
+threads, and consistency of its own on-disk format. Full ACID across <em>groups</em> of operations —
+multi-key transactions — is what heavyweight databases add on top; §2.17 discusses that boundary honestly.</span>
+<p>
+One more foundation before we start. Everything a computer stores — text, numbers, images — is
+ultimately <em>bytes</em>, and this report talks about bytes constantly, so let's define them once:
+</p>
+<span class="inlinedef"><b>Bit, byte, and hexadecimal</b> — a <b>bit</b> is the smallest unit of data: a
+single 0 or 1. A <b>byte</b> is 8 bits, which can represent 256 distinct values (0–255). Because binary is
+unreadable and decimal doesn't line up with bytes, programmers write bytes in <b>hexadecimal</b> (base 16,
+digits <code>0–9</code> then <code>A–F</code>): one byte is exactly two hex digits, e.g.
+<code>0x00</code>&nbsp;=&nbsp;0, <code>0x41</code>&nbsp;=&nbsp;65 (the letter 'A' in ASCII),
+<code>0xFF</code>&nbsp;=&nbsp;255. The <code>0x</code> prefix just marks &ldquo;this is hex&rdquo;. A number like
+<code>0xEDB88320</code> is four bytes.</span>
+
+<h2>1.2 What is a key&ndash;value store?</h2>
+<div class="defbox"><span class="term">Key&ndash;value store</span> — the simplest kind of database. You hand it a
+<em>key</em> (a name, like <code>"user_42"</code>) and a <em>value</em> (any data, like <code>"Alice"</code>).
+Later you give it the key back and it returns the value. It is exactly like a dictionary or a
+<code>HashMap</code> — except it survives your program closing.</div>
+<p>
+Three operations cover almost everything: <b>set</b> (store or overwrite a key), <b>get</b> (look a key up),
+and <b>delete</b> (remove a key). kvstore adds a few more conveniences: keys that expire automatically
+after a time limit, listing keys in sorted order, and scanning a range of keys.
+</p>
+<div class="why"><span class="t">Why does this simple thing matter?</span><br>
+Because it is the foundation layer. Amazon's shopping cart, Discord's message metadata, your browser's
+local storage, the settings on your smart thermostat — all of these are key&ndash;value lookups at the bottom.
+If you understand how to build one <em>safely</em>, you understand the hardest 20% of what real database
+engines do.</div>
+<p>
+Where does a key&ndash;value store sit in the wider database landscape? Think of it as a trade: a SQL
+database can answer &ldquo;find every user in Toronto who signed up last week and joined more than three
+groups&rdquo; — arbitrary questions over structured data — but pays for that power with query planners,
+indexes, and complexity. A key&ndash;value store answers exactly one kind of question — &ldquo;what is the value
+for this key?&rdquo; — and in exchange can be tiny, extremely fast, and easy to reason about. Neither is
+&ldquo;better&rdquo;; they occupy opposite ends of a power-versus-simplicity spectrum, and large systems routinely
+use both. (In fact, several SQL databases store their tables <em>inside</em> a key&ndash;value engine:
+MySQL's MyRocks backend and CockroachDB both sit on top of RocksDB, a key&ndash;value store.)
+</p>
+
+<h2>1.3 What does &ldquo;embedded&rdquo; mean?</h2>
+<div class="defbox"><span class="term">Embedded database</span> — a database that runs <em>inside your own
+program</em>, as a library you link against, rather than as a separate server you talk to over a network.
+SQLite is the most famous example: there is no &ldquo;SQLite server&rdquo; — the code lives inside your app and
+reads/writes an ordinary file.</div>
+<p>
+kvstore works the same way. You write:
+</p>
+<pre>kvstore::KVStore store("data/my_database.db");
+store.Set("greeting", "hello world");
+auto v = store.Get("greeting");   // v contains "hello world"</pre>
+<p>
+No server to install, no network, no configuration. The store is just a C++ object backed by files on disk.
+This is why embedded stores are everywhere: phones, browsers, game consoles, routers, and tiny
+internet-of-things devices that could never run a full database server.
+</p>
+
+<h2>1.4 What kvstore can do — the full API</h2>
+<table>
+<tr><th>Operation</th><th>Signature</th><th>Plain meaning</th></tr>
+<tr><td><b>Set</b></td><td><code>bool Set(key, value)</code></td><td>Store a key, or overwrite it if it already exists.</td></tr>
+<tr><td><b>Set with TTL</b></td><td><code>bool SetWithTtl(key, value, ttl)</code></td><td>Store a key that automatically disappears after <code>ttl</code> seconds.</td></tr>
+<tr><td><b>Get</b></td><td><code>optional&lt;string&gt; Get(key)</code></td><td>Read a value; returns &ldquo;nothing&rdquo; if the key is missing or expired.</td></tr>
+<tr><td><b>Delete</b></td><td><code>bool Delete(key)</code></td><td>Remove a key.</td></tr>
+<tr><td><b>Items / Range</b></td><td><code>Items()</code> / <code>Range(start, end)</code></td><td>List live keys (optionally within a range), sorted alphabetically.</td></tr>
+<tr><td><b>Size</b></td><td><code>size_t Size()</code></td><td>Count of live, non-expired keys.</td></tr>
+<tr><td><b>Compact</b></td><td><code>bool Compact()</code></td><td>Shrink the on-disk file so it only holds live data.</td></tr>
+</table>
+
+<h2>1.5 What makes it interesting</h2>
+<p>kvstore is small (~700 lines), but it takes three promises seriously that toy projects usually skip:</p>
+<ul>
+<li><b>Durability</b> — once a write is acknowledged, it survives a crash <em>or a power cut</em>. Not
+&ldquo;usually survives&rdquo; — survives, provably, because every write is forced onto the physical disk before
+the store says &ldquo;done&rdquo;.</li>
+<li><b>Concurrency</b> — many threads can read and write at the same time without corrupting anything
+or losing updates. The data is split across 16 independent partitions so threads rarely wait on each other.</li>
+<li><b>Bounded growth</b> — an append-only file would grow forever; compaction rewrites it down to
+just the live data, safely, even while other threads are still reading.</li>
+</ul>
+<p>
+Why are these three specifically the hard part? Because each one is <em>invisible when it works</em>.
+A store that loses data one time in a thousand crashes looks identical to a correct one in every demo.
+A race condition may only strike under production load, months in. A growing log file only matters after
+weeks of uptime. Getting these right requires reasoning about what happens at every possible instant of
+failure — which is exactly the discipline this report tries to teach.
+</p>
+
+<h2>1.6 How to read this report</h2>
+<p>
+If you are new to systems programming, read linearly — Part 2 builds every concept in order, and each
+one is used by the next. If you already know threads and file I/O, skim Part 2's boxes, study Part 3's
+architecture, and go deep on Part 5's code. Every term of art is defined in a highlighted box at the
+point where it first matters, so you never need to look anything up elsewhere:
+green boxes define <em>concepts</em>, blue boxes define <em>supporting terms</em> inline, and yellow boxes
+explain <em>why a design decision matters</em>. If a term resurfaces later and feels slippery, flip back
+to its box — the section references (like &ldquo;§2.4&rdquo;) scattered through the text point the way.
+</p>
+
+<!-- ============================== PART 2 ============================== -->
+<h1>Part 2 — The Core Ideas, One at a Time</h1>
+<p>
+This is the vocabulary-building part. Each idea below is a self-contained mini-lesson. If you read these
+in order, nothing in the code walkthrough will surprise you.
+</p>
+
+<h2>2.1 Memory vs. disk — the two worlds your data lives in</h2>
+<p>
+A computer stores data in two fundamentally different places:
+</p>
+<ul>
+<li><b>RAM (memory)</b> — blazing fast (nanoseconds), but <em>volatile</em>: everything in it is erased
+the moment power is lost or the process exits.</li>
+<li><b>Disk (SSD / hard drive / SD card)</b> — thousands of times slower (microseconds to milliseconds),
+but <em>persistent</em>: data survives power-off.</li>
+</ul>
+<p>
+How big is the speed gap? Big enough that intuition fails. Here are rough, order-of-magnitude latencies —
+worth internalizing, because every database design decision traces back to this table:
+</p>
+<table>
+<tr><th>Where the data is</th><th>Typical access time</th><th>Scaled to human time (1&nbsp;ns = 1&nbsp;second)</th></tr>
+<tr><td>CPU cache</td><td>~1 nanosecond</td><td>1 second</td></tr>
+<tr><td>RAM</td><td>~100 nanoseconds</td><td>~2 minutes</td></tr>
+<tr><td>SSD read</td><td>~100 microseconds</td><td>~1 day</td></tr>
+<tr><td>SSD flush (fsync)</td><td>~1 millisecond or more</td><td>~2 weeks</td></tr>
+<tr><td>Spinning hard disk seek</td><td>~10 milliseconds</td><td>~4 months</td></tr>
+</table>
+<p>
+Every database is a negotiation between these two worlds. kvstore keeps a full copy of the data in RAM
+(a hash map, for fast reads) <em>and</em> a record of every change on disk (for safety). The art is in
+keeping the two in agreement at every instant — even the instant the power dies. And the table explains
+the strategy: answer every <em>read</em> from RAM (seconds, in scaled time), and make every <em>write</em>
+pay one trip to disk (weeks, in scaled time) — but only one, appended at the end of a file, never
+scattered around it.
+</p>
+
+<h2>2.2 What is a &ldquo;crash&rdquo;, and what is durability?</h2>
+<div class="defbox"><span class="term">Crash</span> — any abrupt stop: the program is killed, it hits a bug and
+aborts, the OS panics, or the power goes out. The defining feature is <em>no warning and no cleanup</em>:
+whatever was half-done stays half-done.</div>
+<div class="defbox"><span class="term">Durability</span> — the guarantee that once the database says &ldquo;your write
+succeeded&rdquo;, that write can never be lost — not by a crash, not by a power cut. It is the &ldquo;D&rdquo; in the
+famous ACID acronym from database theory.</div>
+<div class="why"><span class="t">Why is durability hard?</span><br>
+Because writing to a file does <em>not</em> actually write to the disk. When your program calls
+<code>write()</code>, the operating system copies the bytes into a RAM cache and returns immediately —
+the physical disk write happens seconds later, whenever the OS feels like it. If power dies in that window,
+the &ldquo;written&rdquo; data is gone. A program that only calls <code>write()</code> (or C++'s
+<code>ofstream::flush()</code>) is <em>not</em> durable, even though it looks like it is.</div>
+<p>
+To really understand this, follow one byte on its journey from your program to permanent storage.
+There are more way-stations than most programmers realize:
+</p>
+<div class="diagram">your variable (program memory)
+      |  your code assembles a record buffer
+      v
+write() system call ................ byte enters the KERNEL
+      |
+      v
+OS page cache (RAM!) ............... write() RETURNS HERE — "success"
+      |  the OS flushes lazily, seconds later
+      v
+disk controller's own cache ........ still volatile on cheap drives!
+      |  fsync()/fdatasync() forces BOTH of these flushes
+      v
+physical medium (NAND flash / platter)   &lt;-- only NOW power-cut safe</div>
+<span class="inlinedef"><b>System call</b> — the formal doorway from your program into the operating
+system <b>kernel</b> (the privileged core of the OS that owns all hardware). Ordinary code cannot touch a
+disk directly; it must ask the kernel via calls like <code>open</code>, <code>write</code>, and
+<code>fsync</code>. Each call has a cost (~hundreds of nanoseconds) because the CPU switches into
+kernel mode and back.</span>
+<span class="inlinedef"><b>Page cache</b> — the kernel's RAM staging area for file contents, organized in
+4&nbsp;KiB &ldquo;pages&rdquo;. Reads are served from it when possible; writes land in it and are flushed to the
+device in the background. It is why file I/O <em>feels</em> fast — and why &ldquo;written&rdquo; does not mean
+&ldquo;safe&rdquo;.</span>
+
+<h2>2.3 flush vs. fsync — forcing bytes onto the metal</h2>
+<div class="defbox"><span class="term">flush</span> — pushes bytes from your program's internal buffer to the
+<em>operating system's</em> cache. The data is now safe from your program crashing — but not from
+power loss, because it is still only in RAM.</div>
+<div class="defbox"><span class="term">fsync / fdatasync</span> — a system call that says to the OS: &ldquo;do not
+return until these bytes are physically on the storage device.&rdquo; This is the only way to survive a power
+cut. <code>fdatasync</code> is a slightly cheaper variant that skips flushing file metadata (like the
+last-modified time) when only the contents matter.</div>
+<p>
+kvstore calls <code>fdatasync</code> after <em>every single write</em>, before telling the caller the write
+succeeded. This is expensive — an fsync can take milliseconds — and it is the honest price of real
+durability. (Real databases offer the same trade-off: PostgreSQL's <code>synchronous_commit</code>,
+Redis's <code>appendfsync always</code>.)
+</p>
+<p>
+Why is fsync so slow, when the write itself felt instant? Because it forbids every shortcut. A normal
+write is the OS <em>promising to get around to it</em>; fsync makes it actually happen, now: the kernel
+must locate the dirty pages, issue real commands to the device, and — critically — tell the drive to
+flush its own internal cache, then wait for the hardware to confirm. An SSD confirming a flush must
+physically program NAND flash cells, which takes on the order of a millisecond; a spinning disk must wait
+for the platter to rotate under the head. Datacenter hardware sidesteps this with batteries: a drive with
+a <em>power-loss-protected cache</em> can safely confirm an fsync the moment data reaches its RAM, because
+its capacitors guarantee the RAM will be drained to flash even if the cord is pulled. This is why the
+same code can run 50&times; faster on server hardware — the durability contract is identical; the
+hardware just keeps it more cheaply.
+</p>
+
+<h2>2.4 The write-ahead log (WAL) — the single most important idea</h2>
+<div class="defbox"><span class="term">Write-ahead log (WAL)</span> — an append-only file where every change is
+written <em>before</em> the in-memory data is updated. &ldquo;Append-only&rdquo; means new data is only ever added
+at the end; nothing in the middle is ever modified.</div>
+<span class="inlinedef"><b>Record</b> — one serialized change in the log: &ldquo;set this key to this value&rdquo;,
+&ldquo;set it with an expiry&rdquo;, or &ldquo;delete it&rdquo;. Each record is a self-contained chunk of bytes framed with
+its own lengths and a trailing checksum (the exact byte layout is dissected in §3.3). The log is nothing
+but records, one after another.</span>
+<p>
+The rule is: <em>log the intent before changing the state.</em> Suppose you call
+<code>Set("name", "Alice")</code>. kvstore first appends a record saying &ldquo;set name=Alice&rdquo; to the log
+file and fsyncs it. Only then does it update the in-memory map. Now consider a crash at any possible moment:
+</p>
+<ul>
+<li><b>Crash before the log write finishes</b> — the log has a half-written record at the end; memory was
+never touched. On restart, recovery detects and discards the partial record. The write is cleanly lost —
+which is correct, because the caller was never told it succeeded.</li>
+<li><b>Crash after the log write, before the memory update</b> — memory is gone anyway (it is RAM).
+On restart, the log contains the complete record, and replaying the log rebuilds the memory state
+<em>including</em> this write.</li>
+<li><b>Crash any time later</b> — same as above: the log has everything; replay rebuilds everything.</li>
+</ul>
+<div class="why"><span class="t">Why a log instead of just saving the map to a file?</span><br>
+Two reasons. First, appending to the end of a file is the fastest and safest kind of disk write —
+you can never corrupt existing data by adding after it. Second, rewriting a whole file on every change
+would be catastrophically slow and, worse, a crash mid-rewrite could destroy the <em>old</em> copy too.
+The same principle powers filesystem journaling (ext4, NTFS), database redo logs, and the replication
+logs of Raft and Paxos clusters.</div>
+<span class="inlinedef"><b>Log-structured storage</b> — the general name for this school of design:
+treat storage as an ever-growing log of changes rather than a structure edited in place. It trades some
+read-side complexity and periodic cleanup (compaction, §2.8) for write speed and crash safety. kvstore,
+Redis's AOF, Bitcask, LSM-tree engines (§4.4), and even SSD firmware internals are all log-structured.</span>
+<p>
+A subtle but crucial property of the log: it is a <em>history</em>, not a snapshot. If you set
+<code>name=Alice</code>, then <code>name=Bob</code>, the log contains both records. The current state —
+<code>name=Bob</code> — emerges by reading the history in order and letting later entries win. This
+&ldquo;last write wins&rdquo; replay rule is what lets a log <em>overwrite</em> without ever <em>editing</em>.
+</p>
+<p>
+The same logic explains something that surprises many people: <em>deleting a key adds bytes to the
+file</em>. There is no way to reach back and erase the old &ldquo;set&rdquo; records — the log is append-only —
+so a delete is recorded as one more entry in the history: &ldquo;as of now, this key is gone.&rdquo;
+</p>
+<span class="inlinedef"><b>Tombstone</b> — the storage-engineering name for a logged delete: a record
+that marks a key dead rather than physically removing it. During replay, a tombstone erases the key from
+the in-memory map; during compaction, the tombstone and every older record for that key are finally
+dropped together. Cassandra, RocksDB, and Bitcask all use exactly this term.</span>
+
+<h2>2.5 Torn writes — when a crash cuts a record in half</h2>
+<div class="defbox"><span class="term">Torn write</span> — a record that a crash or power cut interrupted partway
+through, leaving only some of its bytes on disk. The tail of the log after a crash may contain half a
+record — or a full record whose bytes were scrambled.</div>
+<p>
+Recovery must never trust the tail of the log blindly. kvstore handles this two ways: it stops replaying
+at the first record that is incomplete (a &ldquo;short read&rdquo;), and it verifies every record's checksum
+(next section). It then <em>truncates</em> the file back to the last good record, so future appends land
+on a clean boundary instead of being stranded after garbage.
+</p>
+<p>
+Notice a quiet gift of the append-only design here: damage from a crash can only ever be <em>at the
+end</em> of the file. Since existing bytes are never rewritten, records that were fully synced in the past
+cannot be harmed by a crash today. A store that edited its file in place would enjoy no such guarantee —
+a crash mid-edit could corrupt data written months ago, anywhere in the file. Append-only logging converts
+&ldquo;corruption could be anywhere&rdquo; into &ldquo;corruption is only at the tail, where we know to look&rdquo;.
+(One thing kvstore deliberately does <em>not</em> assume: that disks write any particular chunk — a
+512-byte sector, say — atomically. Some do, some don't; the CRC makes the question irrelevant, because
+a record is trusted only if <em>every one</em> of its bytes checks out.)
+</p>
+
+<h2>2.6 Checksums (CRC32) — catching corruption</h2>
+<div class="defbox"><span class="term">Checksum</span> — a short number computed from a block of bytes, designed so
+that if even one bit of the block changes, the recomputed number will almost certainly differ.
+<b>CRC32</b> (cyclic redundancy check, 32-bit) is a classic, fast checksum used by ZIP files, Ethernet,
+and PNG images.</div>
+<p>
+Build the idea up in three steps. <b>Step 1 — parity:</b> the simplest integrity check is to store one
+extra bit saying whether the data has an even or odd number of 1-bits; flip any single bit and the parity
+no longer matches. Cheap, but blind to two flips. <b>Step 2 — sums:</b> add all the bytes up and store
+the total; better, but reordered or offsetting changes can slip through. <b>Step 3 — CRC:</b> treat the
+whole message as one giant number and take its remainder when divided by a carefully chosen constant (the
+&ldquo;polynomial&rdquo; — for CRC32, the famous <code>0xEDB88320</code>). The division mixes every input bit into
+every output bit, so <em>any</em> single-bit flip, <em>any</em> burst of errors up to 32 bits, and the
+overwhelming majority of larger corruptions change the result. That remainder is the checksum.
+</p>
+<p>
+Every record kvstore writes ends with a CRC32 of all the record's preceding bytes. During recovery, the
+CRC is recomputed and compared with the stored one. A mismatch means the record was torn by a crash or
+silently corrupted on disk (&ldquo;bit rot&rdquo; — storage media really do occasionally flip bits). Either way,
+the record is rejected rather than loaded as garbage.
+</p>
+<span class="inlinedef"><b>Checksum vs. hash vs. cryptographic hash</b> — three cousins, often confused.
+A <b>checksum</b> (CRC32) detects <em>accidental</em> corruption, fast. A <b>hash function</b>
+(<code>std::hash</code>, §2.11) spreads keys evenly across buckets, fast, with no integrity promise.
+A <b>cryptographic hash</b> (SHA-256) resists <em>deliberate</em> forgery, but is ~50× slower. kvstore
+needs only the first two: disks fail by accident, not malice.</span>
+<div class="why"><span class="t">Why not just trust the disk?</span><br>
+Because at scale, disks lie. Consumer SSDs have error rates around one undetected bad bit per ~10<sup>14</sup>
+bits read. A database that loads whatever bytes it finds will eventually serve corrupted data with a straight
+face. The CRC turns silent corruption into a detected, contained event.</div>
+
+<h2>2.7 Recovery (replay) — rebuilding memory from the log</h2>
+<div class="defbox"><span class="term">Recovery / replay</span> — on startup, reading the log from the beginning,
+one record at a time, and re-applying each one to the in-memory map — re-doing history to arrive back
+at the present.</div>
+<p>
+If the log says &ldquo;set a=1, set b=2, delete a, set b=3&rdquo;, then after replay memory contains exactly
+<code>{b: 3}</code>. Note that later records override earlier ones — this is why the log can simply
+append an overwrite instead of editing old data. Replay stops at the first incomplete, unknown, or
+checksum-failing record, and everything before that point is trusted.
+</p>
+<p>
+Two properties make replay trustworthy. First, it is <b>deterministic</b>: the same log always rebuilds
+the same map, no matter when or on what machine it is replayed — there is no randomness and no dependence
+on timing. Second, applying a record is <b>idempotent</b> — a fancy word for &ldquo;doing it twice is the same
+as doing it once&rdquo;. &ldquo;Set a=1&rdquo; leaves <code>a</code> at 1 whether applied once or five times; the same
+goes for a delete. Together these mean recovery needs no cleverness and no bookkeeping about &ldquo;how far
+did I get last time&rdquo; — just start at byte zero and march forward. Simple procedures are the ones you can
+trust to run correctly on the worst morning of your life, right after a production crash.
+</p>
+
+<h2>2.8 Compaction — garbage collection for the log</h2>
+<div class="defbox"><span class="term">Compaction</span> — rewriting the log so it contains only the <em>current</em>
+value of each live key, dropping every overwritten, deleted, and expired record. It is garbage collection
+for on-disk data.</div>
+<p>
+An append-only log never forgets: overwrite a key 1,000 times and the log holds 1,000 records for it.
+Compaction fixes this: write all live entries to a fresh temporary file, fsync it, then <em>atomically
+rename</em> it over the old log. If a crash happens at any point, either the old complete log or the new
+complete log exists — never a half-and-half mixture.
+</p>
+<span class="inlinedef"><b>Write amplification</b> — the ratio of bytes <em>physically written</em> to
+bytes of <em>useful data stored</em>. If you store 1&nbsp;MB of live data but the log plus compaction
+rewrites cost 3&nbsp;MB of disk writes, the amplification is 3×. Every log-structured system pays this tax;
+tuning <em>when</em> to compact is the balancing act between disk space (compact often) and write
+amplification plus pause time (compact rarely). kvstore leaves the timing to the caller — real engines
+trigger it automatically on thresholds.</span>
+<div class="why"><span class="t">Why is compaction the hardest thing in this codebase?</span><br>
+Because it must rewrite the store's single source of truth <em>while the store is live</em>, without
+losing a concurrent write, without a reader noticing, and while remaining crash-safe at every instant.
+Notice the recurring recipe, used by everything from package managers to firmware updaters:
+<em>build the replacement completely off to the side, make it durable, then swap it in with one atomic
+operation.</em> Never edit the real thing in place.</div>
+<div class="defbox"><span class="term">Atomic operation</span> — a step that either fully happens or does not happen
+at all, with no observable in-between state. The POSIX <code>rename()</code> system call is atomic:
+the filename points to the old file, and then it points to the new file, and there is no instant where
+it points to nothing or to half of each.</div>
+
+<h2>2.9 Threads, race conditions, and mutexes</h2>
+<div class="defbox"><span class="term">Thread</span> — an independent line of execution inside one program. A program
+with 4 threads is doing 4 things literally at the same time (on 4 CPU cores). Threads share the same
+memory, which is both their superpower and their danger.</div>
+<span class="inlinedef"><b>Process vs. thread</b> — a <b>process</b> is one running program: the OS gives
+it its own private memory, its own file descriptors, its own identity. Run the same program twice and you
+get two processes that cannot see each other's variables at all. <b>Threads</b> live <em>inside</em> a
+process and share all of its memory. The distinction decides which tool coordinates whom: a mutex lives in
+memory, so it can only coordinate threads <em>within</em> one process; two separate processes can't even
+see each other's mutexes. Coordinating processes requires something both can reach — like a lock attached
+to a file (§2.16). kvstore needs both: mutexes for its threads, a file lock against other processes.</span>
+<div class="defbox"><span class="term">Race condition</span> — a bug where the result depends on the unpredictable
+timing of two threads touching the same data. Example: two threads both run <code>counter = counter + 1</code>
+at once; both read 5, both write 6, and one increment is silently lost. Race conditions are nightmarish
+because they strike rarely and randomly.</div>
+<div class="defbox"><span class="term">Mutex</span> (mutual exclusion lock) — an object only one thread can &ldquo;hold&rdquo;
+at a time. A thread locks the mutex, touches the shared data, and unlocks it; any other thread trying to
+lock it meanwhile is paused until it is free. Whatever a mutex guards is therefore touched by one thread
+at a time — no races.</div>
+<div class="why"><span class="t">Why not just use one big mutex for everything?</span><br>
+Correct, but slow: every operation would wait in a single line, and 8 CPU cores would perform like 1.
+The next two ideas are the classic fixes.</div>
+<p>
+Mutexes protect <em>regions of code</em>; sometimes you only need to protect a <em>single variable</em>,
+and there is a lighter tool for that:
+</p>
+<span class="inlinedef"><b>Atomic variable</b> (<code>std::atomic</code>) — a variable the CPU itself
+guarantees to read, write, or update in one indivisible hardware step, with no lock at all. The broken
+<code>counter = counter + 1</code> example becomes correct as
+<code>counter.fetch_add(1)</code>: the read-modify-write happens as one instruction no other core can
+interleave with. kvstore uses an atomic <code>bool</code> to ensure only one compaction runs at a time,
+and the test suite uses atomic counters. Atomics also let you specify a <b>memory order</b> — how much
+cross-thread ordering you need. The default (<code>seq_cst</code>) is strongest and safest;
+<code>memory_order_relaxed</code>, which the test counters use, promises only atomicity, which is all a
+statistics counter needs and is cheaper on weakly-ordered CPUs like ARM.</span>
+
+<h2>2.10 Shared vs. exclusive locks — letting readers run in parallel</h2>
+<div class="defbox"><span class="term">Shared / exclusive lock</span> (reader&ndash;writer lock, C++'s
+<code>std::shared_mutex</code>) — a smarter mutex with two modes. A <b>shared</b> lock can be held by any
+number of readers at once (reading cannot corrupt anything). An <b>exclusive</b> lock is for writing:
+one holder only, and it excludes all readers too.</div>
+<p>
+Most real workloads read far more than they write. Letting unlimited concurrent readers proceed —
+and only serializing the writes — is a huge win. In kvstore, <code>Get</code>, <code>Range</code>, and
+<code>Size</code> take shared locks; <code>Set</code> and <code>Delete</code> take exclusive ones.
+</p>
+<p>
+Why would anyone ever use a plain mutex, then? Because reader&ndash;writer locks are not free: they must
+count the active readers, which makes each lock/unlock slightly more expensive, and a steady stream of
+readers can make a writer wait a long time for its exclusive turn (&ldquo;writer starvation&rdquo; — implementations
+vary in how fairly they handle this). The rule of thumb: shared locks win when the protected work is long
+and read-mostly — exactly a hash-map lookup serving many readers — and a plain mutex wins for short,
+write-heavy critical sections, which is exactly why the WAL, where every operation is a write, uses one.
+kvstore uses each tool where it fits.
+</p>
+
+<h2>2.11 Sharding (lock striping) — splitting the keyspace 16 ways</h2>
+<div class="defbox"><span class="term">Shard</span> — one slice of the data. kvstore splits keys across 16
+independent maps, each with its own lock, chosen by <code>hash(key) % 16</code>. A thread writing
+<code>"apple"</code> and a thread writing <code>"zebra"</code> almost certainly touch different shards
+and never wait on each other. This pattern is called <b>lock striping</b>.</div>
+<div class="defbox"><span class="term">Hash / hash map</span> — a hash function turns any string into a
+pseudo-random number; a hash map uses that number to find where a key's value is stored, making lookups
+nearly instant regardless of size. C++'s <code>std::unordered_map</code> is a hash map. Taking the hash
+<code>% 16</code> assigns every key a stable home shard.</div>
+<span class="inlinedef"><b>Contention</b> — the situation where multiple threads want the same lock at
+the same moment; all but one must wait. Contention, not locking itself, is what kills scalability — an
+uncontended lock costs nanoseconds. Sharding works by converting one highly-contended lock into 16 rarely
+contended ones: with 4 threads spread over 16 shards, the chance that any two collide on the same shard
+at a given instant is small, so most operations never wait at all.</span>
+<div class="why"><span class="t">Why 16?</span><br>
+A power of two comfortably larger than typical core counts. More shards = less contention but more
+memory overhead; 16 is a sensible teaching default. Java's <code>ConcurrentHashMap</code> and many
+kernel structures use exactly this technique. One caveat worth knowing: sharding a <em>hash</em> map
+means keys are scattered pseudo-randomly, so sorted scans (<code>Range</code>) must visit every shard and
+sort afterwards — the price of fast point lookups. Engines that need fast sorted scans use ordered
+structures (B-trees, skip lists) instead; §4.4 returns to this trade-off.</div>
+
+<h2>2.12 Lock ordering — how to never deadlock</h2>
+<div class="defbox"><span class="term">Deadlock</span> — thread A holds lock 1 and waits for lock 2, while thread B
+holds lock 2 and waits for lock 1. Both wait forever. The standard cure: every thread acquires locks in the
+same globally-agreed order.</div>
+<p>
+kvstore's rule: <em>always take the WAL mutex first, then a shard lock — never the reverse.</em>
+Every code path follows it, so the deadly cycle can never form.
+</p>
+<p>
+Why does a fixed order make deadlock <em>impossible</em>, rather than just unlikely? Picture the waiting
+threads as arrows: an arrow points from the lock a thread holds to the lock it wants. A deadlock is a
+<em>cycle</em> of arrows — A waits for B while B waits for A. If every thread acquires locks in one
+agreed order (WAL mutex ranked before shard locks), then every arrow points strictly &ldquo;up the ranking&rdquo;,
+and arrows that only ever point upward can never loop back around into a cycle. This is a proof, not a
+heuristic — which is what you want, because deadlocks, like race conditions, are far too rare and
+timing-dependent to find by testing.
+</p>
+
+<h2>2.13 TTL and lazy expiry — keys that clean up after themselves</h2>
+<div class="defbox"><span class="term">TTL</span> (time-to-live) — an optional lifespan on a key.
+<code>SetWithTtl("session", data, 3600)</code> stores a key that acts deleted after one hour.</div>
+<div class="defbox"><span class="term">Lazy expiry</span> — instead of a background thread scanning for expired keys
+(complex, wasteful), expired keys are simply <em>hidden</em> whenever they are read, and physically removed
+later during compaction. The user-visible behaviour is identical; the implementation is far simpler.
+Redis uses this same strategy.</div>
+<div class="defbox"><span class="term">Sentinel value</span> — a reserved special value meaning &ldquo;none&rdquo;.
+kvstore stores the expiry as an absolute Unix timestamp, and uses <code>0</code> as the sentinel for
+&ldquo;never expires&rdquo; (no real expiry is at timestamp 0, which was midnight, January 1st, 1970).</div>
+<span class="inlinedef"><b>Unix timestamp</b> — the number of seconds elapsed since midnight UTC on
+January 1st, 1970 (&ldquo;the epoch&rdquo;). It is computing's shared clock: a single 64-bit number, timezone-free,
+trivially comparable. Storing the <em>absolute</em> expiry moment (rather than &ldquo;30 seconds from now&rdquo;)
+is what makes TTLs survive restarts: the deadline in the log means the same thing whenever it is replayed.
+One honest caveat: the system clock can jump (a user changes it, NTP corrects it), which shifts pending
+expiries with it — an accepted limitation shared by most TTL systems.</span>
+
+<h2>2.14 Serialization and endianness — turning data into portable bytes</h2>
+<div class="defbox"><span class="term">Serialization</span> — converting in-memory data (numbers, strings, structs)
+into a flat sequence of bytes that can be written to a file, and converting those bytes back on read.</div>
+<div class="defbox"><span class="term">Endianness</span> — the order a CPU stores a multi-byte number's bytes in.
+The number <code>0x11223344</code> is stored as <code>44 33 22 11</code> on a <b>little-endian</b> machine
+(x86, most ARM) but <code>11 22 33 44</code> on a <b>big-endian</b> one (some network gear, older
+PowerPC). If you write raw memory to a file on one kind of machine and read it on the other, every number
+is scrambled.</div>
+<p>
+kvstore explicitly encodes every integer in the log in <em>little-endian byte order</em>, byte by byte,
+regardless of what CPU it runs on. The log file is therefore portable: written on a PC, readable on a
+big-endian router. (On x86/ARM the encoded bytes are identical to raw memory, so this safety costs
+nothing.) This mirrors how network protocols pin down a single &ldquo;wire format&rdquo;.
+</p>
+<p>
+The deeper lesson generalizes beyond endianness: <em>never write raw memory to a file</em>. A struct's
+in-memory layout depends on the CPU's byte order, the compiler's padding between fields, and even compiler
+flags — none of which you control years later when someone opens the file on different hardware. A file
+format must be defined <em>as bytes</em>, precisely, the way §3.3 defines kvstore's record: this field is
+exactly 4 bytes, low byte first, at this offset. (Why little-endian rather than big? Pure pragmatism:
+virtually every CPU the file will ever meet — x86, mainstream ARM — is little-endian, so the common case
+costs zero conversion work. Network protocols historically chose big-endian; either works, as long as the
+choice is written down and enforced.)
+</p>
+
+<h2>2.15 File descriptors and POSIX — talking to the OS directly</h2>
+<div class="defbox"><span class="term">POSIX</span> — the standard Unix/Linux system-call interface:
+<code>open</code>, <code>write</code>, <code>fsync</code>, <code>rename</code>, <code>flock</code>, and
+friends. These are the raw doors into the operating system, one level below C++'s comfortable
+<code>fstream</code>.</div>
+<div class="defbox"><span class="term">File descriptor (fd)</span> — a small integer the OS hands you when you
+<code>open</code> a file; you pass it to every subsequent call about that file. kvstore uses raw fds for
+its log because durability requires calls that <code>fstream</code> simply does not offer:
+<code>fdatasync</code> (force to disk) and <code>ftruncate</code> (roll back a partial write).</div>
+<p>
+A good mental model: <code>fstream</code> is a comfortable wrapper <em>around</em> a file descriptor. It
+adds its own buffering and pleasant C++ syntax, and for everyday file work it is the right choice —
+kvstore itself uses an <code>ifstream</code> for reading during recovery, where comfort is fine. But the
+wrapper hides the fd, and the durability-critical calls (<code>fdatasync</code>, <code>ftruncate</code>,
+<code>flock</code>) take an fd. So on the <em>write</em> path, where every guarantee lives, kvstore drops
+down to the raw POSIX layer. There is one more subtlety the raw layer exposes: creating a file only
+durably exists once its <em>parent directory</em> is also fsynced — a directory is itself a small file
+mapping names to files, with its own cache. kvstore does exactly this (<code>SyncParentDir</code> in the
+walkthrough) after creating or renaming the log — a detail even experienced programmers miss.
+</p>
+
+<h2>2.16 Advisory file locks — one process at a time</h2>
+<div class="defbox"><span class="term">Advisory lock</span> (<code>flock</code>) — a lock attached to a file that
+cooperating processes check before using it. &ldquo;Advisory&rdquo; means the OS does not force anyone to obey it —
+but every well-behaved program (like kvstore) checks first.</div>
+<p>
+Why it matters: imagine two copies of your program opening the same store. Both would append to the same
+log with no coordination, interleaving and corrupting each other's records. kvstore prevents this by taking
+an <em>exclusive</em> advisory lock on a <code>.lock</code> file at startup; a second process gets a clean
+error (&ldquo;store is locked by another process&rdquo;) instead of a corrupted database. SQLite, LevelDB, and
+virtually every embedded database do exactly this.
+</p>
+<p>
+A pleasant property of <code>flock</code>: the lock belongs to the open file descriptor, not to the file's
+contents. If the process crashes, the OS closes its descriptors and thereby <em>releases the lock
+automatically</em>. There is no &ldquo;stale lock&rdquo; problem to clean up — unlike naive schemes that create a
+lock file and delete it on exit, which break the first time an exit isn't clean.
+</p>
+
+<h2>2.17 The honest trade-offs — what this design gives up</h2>
+<p>
+Intermediate systems thinking means knowing what a design <em>doesn't</em> do. kvstore's choices are
+principled, and each has a cost. Understanding these five is understanding the design:
+</p>
+<ul>
+<li><b>One fsync per write.</b> Durability costs ~1&nbsp;ms of disk flush per operation, and all writers
+serialize on one WAL mutex — so write throughput is capped by the disk, not the CPU, no matter how many
+threads you add. Production engines soften this with <b>group commit</b>: batch many pending writes into
+one fsync, amortizing the cost. (A natural extension exercise for this codebase.)</li>
+<li><b>No multi-key transactions.</b> Each operation is atomic and durable <em>by itself</em>, but there is
+no way to make &ldquo;debit account A, credit account B&rdquo; a single all-or-nothing unit. Full transaction
+support needs undo/redo logging or snapshots — a large step up in complexity.</li>
+<li><b>The dataset must fit in RAM.</b> Every key and value lives in the in-memory maps; the disk is a
+recovery log, not an overflow area. Fine for caches and config stores; wrong for a terabyte of data.
+Engines like RocksDB keep only an index in memory and read values from disk (§4.4).</li>
+<li><b>Scans are O(n).</b> <code>Range</code> visits every entry in every shard and sorts the survivors.
+Hash maps have no order; engines built for range queries use ordered structures instead.</li>
+<li><b>Recovery time grows with the log.</b> Startup replays every record since the last compaction.
+Compact rarely and a restart can take a while — another reason real engines automate compaction.</li>
+</ul>
+<!-- ============================== PART 3 ============================== -->
+<h1>Part 3 — The Architecture</h1>
+
+<h2>3.1 The two layers</h2>
+<p>
+kvstore is two layers glued together by one golden rule:
+</p>
+<ul>
+<li>The <b>in-memory index</b> — 16 shards, each a <code>std::unordered_map&lt;string, Entry&gt;</code>
+guarded by its own reader&ndash;writer lock. This is where every read is answered, at RAM speed. It is lost
+on every shutdown or crash — and that is fine, because of the second layer.</li>
+<li>The <b>on-disk write-ahead log</b> (<code>db.wal</code>) — the durable source of truth. Every change
+is appended and fsynced here <em>first</em>. On startup, replaying it rebuilds the in-memory index
+exactly.</li>
+</ul>
+<div class="why"><span class="t">The golden rule</span><br>
+A change hits the disk log (fsynced) <em>before</em> the in-memory map is updated, and both steps happen
+while one lock (<code>wal_mutex_</code>) is held. Consequence: memory never claims something the disk
+doesn't know, the log's record order always matches the order changes became visible, and a crash at any
+instant leaves a log that replays to a correct state.</div>
+
+<h2>3.2 The write path and read path</h2>
+<div class="diagram">     WRITE PATH                                READ PATH
+     ----------                                ---------
+  Set / SetWithTtl / Delete                Get / Range / Size / Items
+          |                                        |
+          v                                        v
+   lock wal_mutex_                        lock shard (shared mode)
+          |                                        |
+   serialize record                                v
+   append to db.wal                     look up in unordered_map
+   fdatasync  (now durable)                        |
+          |                                hide if expired (TTL)
+          v                                        |
+   lock shard (exclusive)                          v
+   update unordered_map                     return the value
+          |
+          v
+   unlock everything, return true
+
+  16 shards, each = { shared_mutex, unordered_map&lt;string, Entry&gt; }
+  which shard?  -&gt;  hash(key) % 16
+
+  STARTUP   : lock db.lock -&gt; replay db.wal (CRC-checked) -&gt; truncate torn tail
+  COMPACTION: live keys -&gt; db.wal.tmp -&gt; fdatasync -&gt; atomic rename -&gt; db.wal</div>
+<p>
+Notice the asymmetry: reads never touch the disk or the WAL mutex at all — they take one shared shard
+lock and read RAM. This is why reads scale nearly linearly with cores. Writes pay the full durability
+price: serialize, append, fsync, then update memory.
+</p>
+
+<h2>3.3 The on-disk record format</h2>
+<p>
+Every change becomes one binary record in the log, laid out as:
+</p>
+<div class="diagram">[ type:1 ][ key_len:4 ][ value_len:4 ][ key bytes ][ value bytes ][ expires_at:8 (kSetTtl only) ][ crc32:4 ]</div>
+<ul>
+<li><b>type</b> (1 byte) — what kind of change: <code>1</code>=Set, <code>2</code>=Delete, <code>3</code>=SetTtl.</li>
+<li><b>key_len / value_len</b> (4 bytes each, little-endian) — how many bytes of key and value follow.
+Lengths let the reader know exactly where each field ends without any separators.</li>
+<li><b>key / value bytes</b> — the raw data. A Delete record carries no value.</li>
+<li><b>expires_at</b> (8 bytes, little-endian, only for SetTtl) — the absolute Unix timestamp when the key dies.</li>
+<li><b>crc32</b> (4 bytes, little-endian) — checksum over every preceding byte of the record.</li>
+</ul>
+<p>
+This is <b>fixed-width binary framing</b>: compact (no JSON overhead), fast to parse, self-checking, and —
+because every integer is written in explicit little-endian order — identical on every CPU architecture.
+</p>
+<p>
+Why lengths up front, rather than a separator between fields (the way CSV uses commas)? Because separators
+create the <em>escaping problem</em>: if a comma splits fields, what happens when a value contains a
+comma? Every delimiter-based format needs escape rules, and escape rules breed bugs and parsing ambiguity.
+Length-prefixed framing has no such problem — a key or value may contain <em>any bytes whatsoever</em>,
+including zeros and newlines, because the reader never searches for a boundary; it is told exactly how
+many bytes to take. The lengths also give recovery an early sanity check: a length exceeding the caps
+(<code>kMaxKeyLen</code>, <code>kMaxValueLen</code>) proves the header is garbage before a single payload
+byte is read. This is the same reason network protocols (TCP options, TLS records, protobuf) are
+length-prefixed rather than delimiter-based.
+</p>
+
+<h3>A worked example, byte by byte</h3>
+<p>
+Let's make it concrete. Suppose you call <code>Set("cat", "meow")</code>. The key is 3 bytes, the value is
+4 bytes, so the record is <code>1 + 4 + 4 + 3 + 4 + 4 = 20</code> bytes on disk. Here is every one of them
+(hex on the left, meaning on the right):
+</p>
+<div class="diagram">01              type = 1 (kSet)
+03 00 00 00     key_len = 3      (little-endian: low byte first)
+04 00 00 00     value_len = 4
+63 61 74        "cat"            (ASCII: c=0x63, a=0x61, t=0x74)
+6d 65 6f 77     "meow"
+55 ba 87 3d     crc32 of the 16 bytes above = 0x3d87ba55 (little-endian)</div>
+<p>
+Read the <code>03 00 00 00</code> line carefully — that is little-endian in action: the number 3 stored
+lowest-byte-first. A big-endian machine writing raw memory would have produced <code>00 00 00 03</code>,
+which a little-endian reader would decode as 50,331,648 — and instantly reject via the 1&nbsp;MiB length cap.
+This is exactly the corruption class the explicit encoding (§2.14) eliminates. Now recovery in reverse:
+read <code>01</code> (a known type), read the lengths (3 and 4 — plausible), read 3 + 4 payload bytes,
+read the CRC, recompute it over the first 16 bytes, compare. Match → apply <code>cat=meow</code> to shard
+<code>hash("cat") % 16</code>. Mismatch → stop, truncate. Every record in every kvstore log follows this
+exact dance.
+</p>
+
+<h3>The life of one key — from set to compaction</h3>
+<p>
+Now zoom out from one record to one key's whole lifetime, and watch the log and the map diverge and
+reconcile. Suppose you set <code>cat=meow</code>, later change it to <code>cat=purr</code>, and finally
+delete it:
+</p>
+<div class="diagram">action              log on disk (grows only)                 in-memory map
+------              ------------------------                 -------------
+Set(cat, meow)      [set cat=meow]                           {cat: meow}
+Set(cat, purr)      [set cat=meow][set cat=purr]             {cat: purr}
+Delete(cat)         [set cat=meow][set cat=purr][del cat]    {}
+  ...crash + restart: replay all 3 records in order...       {}   &lt;- same state!
+Compact()           (empty — no live keys to keep)           {}</div>
+<p>
+Every row illustrates a concept from Part 2. The overwrite does not touch the first record — it appends,
+and &ldquo;last write wins&rdquo; (§2.4) makes the map show <code>purr</code>. The delete <em>adds</em> a third
+record — the tombstone (§2.4) — while the map shrinks; log size and map size have now fully parted ways
+(three records on disk, zero keys in memory). Replay after a crash walks the same history and lands on the
+same empty map, because replay is deterministic (§2.7). And compaction (§2.8) finally reconciles the two:
+it writes only what the <em>map</em> holds — nothing — so all three records, tombstone included,
+vanish together. The log is a diary; the map is the present moment; compaction is rewriting the diary to
+say only how things ended up.
+</p>
+
+<h2>3.4 The files on disk</h2>
+<table>
+<tr><th>File</th><th>Purpose</th></tr>
+<tr><td><code>mydb.db.wal</code></td><td>The write-ahead log — the durable source of truth. Grows by appends; shrunk by compaction.</td></tr>
+<tr><td><code>mydb.db.wal.tmp</code></td><td>Scratch file used during compaction; atomically renamed over the <code>.wal</code> on success, deleted on failure.</td></tr>
+<tr><td><code>mydb.db.lock</code></td><td>The advisory lock file guaranteeing only one process opens the store at a time. Content is irrelevant; only the lock on it matters.</td></tr>
+</table>
+
+<h2>3.5 Failure handling — the part that separates real engines from toys</h2>
+<ul>
+<li><b>Write fails halfway?</b> The log is <code>ftruncate</code>d back to its previous end, so the tail
+stays on a clean record boundary, and the caller gets <code>false</code>. Memory is never touched.</li>
+<li><b>fsync fails?</b> Same rollback, same <code>false</code>. A write is never acknowledged unless it is
+physically on disk.</li>
+<li><b>Crash mid-write?</b> Recovery finds a short or CRC-failing record at the tail, stops there, and
+truncates the garbage off.</li>
+<li><b>Crash mid-compaction?</b> The atomic rename means either the old or the new log exists in full.
+The temp file, if orphaned, is simply overwritten next time.</li>
+<li><b>Compaction can't reopen the new log?</b> The store remembers the file descriptor is closed and
+<em>retries the open on the next write</em>, instead of failing forever.</li>
+<li><b>Second process opens the store?</b> Refused cleanly at the lock file, before it can touch anything.</li>
+</ul>
+
+<h2>3.6 A crash-timeline analysis of one write</h2>
+<p>
+The strongest way to convince yourself the design is correct: enumerate <em>every instant</em> a power cut
+could strike during <code>Set("cat", "meow")</code>, and check the outcome. This style of exhaustive
+&ldquo;what if it dies right <em>here</em>?&rdquo; reasoning is the core skill of storage engineering:
+</p>
+<table>
+<tr><th>Power dies&hellip;</th><th>State of the log</th><th>After restart</th><th>Correct?</th></tr>
+<tr><td>T0: before the append starts</td><td>unchanged</td><td>key absent</td><td>Yes — caller never got an acknowledgement</td></tr>
+<tr><td>T1: mid-<code>write()</code>, partial record on disk</td><td>clean records + a torn tail</td><td>replay stops at the short read, tail truncated; key absent</td><td>Yes — write was never acknowledged</td></tr>
+<tr><td>T2: after <code>write()</code>, before <code>fdatasync</code> finishes</td><td>record may or may not be fully on the physical disk</td><td>if complete-and-valid: key present; if torn: truncated, absent</td><td>Yes — either way, never acknowledged, and the log is never garbage</td></tr>
+<tr><td>T3: after <code>fdatasync</code>, before the memory update</td><td>full record, durable</td><td>replay applies it; key present</td><td>Yes — disk is the source of truth, memory is rebuilt from it</td></tr>
+<tr><td>T4: after the memory update, any time later</td><td>full record, durable</td><td>key present</td><td>Yes — the acknowledged write survives</td></tr>
+</table>
+<p>
+Notice the pattern: before the fsync completes, the caller has not been told &ldquo;success&rdquo;, so losing the
+write is <em>allowed</em>; after it, the disk guarantees survival. There is no instant at which an
+acknowledged write can be lost, and no instant at which the log can end up unreadable. That is the whole
+durability argument, made airtight by the CRC and the tail truncation.
+</p>
+
+<h2>3.7 The startup sequence — and the memory bill</h2>
+<p>
+One path remains: what happens inside <code>KVStore store("my.db")</code> before the constructor returns.
+The order is rigid, and each step exists to protect the ones after it:
+</p>
+<ol>
+<li><b>Create the parent directory</b> if the path needs one — everything else needs somewhere to live.</li>
+<li><b>Acquire the process lock</b> (§2.16) — <em>before touching any data file</em>. If another process
+owns the store, the constructor throws here, having modified nothing. Locking first means the replay and
+truncation below can never race against another process's appends.</li>
+<li><b>Replay the WAL</b> (§2.7) — rebuild the in-memory shards record by record, CRC-checking each.</li>
+<li><b>Truncate the torn tail</b> (§2.5) — if replay stopped early, cut the file back to the last good
+record, so the garbage can never sit in the middle of the log once new appends follow it.</li>
+<li><b>Open the WAL for appending</b> — only now, with the file known-clean, is the append fd opened.
+The constructor returns; the store is live.</li>
+</ol>
+<p>
+Step 2 before step 3 and step 4 before step 5 are the load-bearing orderings — swap either pair and you
+get, respectively, two processes replaying/appending simultaneously, or fresh records appended after
+undetected garbage.
+</p>
+<p>
+Startup is also the honest place to present the memory bill. Every live key and value is in RAM, and the
+containers add bookkeeping on top of the raw bytes: a <code>std::string</code> carries a pointer, size, and
+capacity (and stores short strings inline), and each <code>unordered_map</code> node adds hash-bucket
+linkage — typically 50–100 bytes of overhead per entry beyond the key and value themselves. A million
+entries of 20-byte keys and 100-byte values is ~120&nbsp;MB of raw data but closer to ~200&nbsp;MB
+resident. Rule of thumb: <em>budget roughly twice the raw data size, and remember replay must also read the
+entire log before the store opens</em> — both are reasons the §2.17 &ldquo;fits in RAM&rdquo; trade-off deserves
+respect.
+</p>
+
+<!-- ============================== PART 4 ============================== -->
+<h1>Part 4 — Real-Life Applications</h1>
+
+<h2>4.1 The famous systems built on these exact ideas</h2>
+<table>
+<tr><th>System</th><th>What it shares with kvstore</th></tr>
+<tr><td><b>RocksDB / LevelDB</b> (Google, Meta)</td><td>Append-only writes, a write-ahead log, CRC-checked records, and background compaction. RocksDB powers the storage inside MySQL (MyRocks), CockroachDB, and TiKV.</td></tr>
+<tr><td><b>SQLite</b></td><td>The most-deployed database on Earth is also an <em>embedded</em> library, uses a WAL mode for durability with concurrent readers, and takes file locks exactly like kvstore's <code>.lock</code>. It ships in every phone and browser.</td></tr>
+<tr><td><b>Redis</b></td><td>In-memory data plus an append-only file (AOF) that is periodically rewritten — precisely kvstore's WAL + <code>Compact()</code>. Its <code>EXPIRE</code> keys use the same lazy-expiry trick as <code>SetWithTtl</code>.</td></tr>
+<tr><td><b>Bitcask / Riak</b></td><td>The classic design kvstore is closest to: an in-memory map of keys over an append-only log, compacted periodically.</td></tr>
+<tr><td><b>etcd / Consul</b></td><td>The configuration brains of Kubernetes clusters: each node keeps a WAL + in-memory index, and TTL keys implement &ldquo;leases&rdquo; that expire when a machine dies.</td></tr>
+<tr><td><b>ext4 / NTFS journaling</b></td><td>Filesystems log metadata changes to a journal before applying them — the WAL idea applied to the filesystem itself.</td></tr>
+</table>
+
+<h2>4.2 Where you would use something like kvstore</h2>
+<ul>
+<li><b>Caches with expiry</b> — session tokens, rate-limit counters, cached API responses that should
+vanish after N seconds: the TTL feature is purpose-built for this.</li>
+<li><b>Local durable state for a service</b> — a daemon that must remember a little state across
+restarts without dragging in a database server.</li>
+<li><b>Game saves and settings</b> — data that must survive the console losing power mid-save.</li>
+<li><b>IoT and embedded devices</b> — sensor calibration, device config on a router or thermostat,
+where every design constraint below applies.</li>
+</ul>
+<p>
+And, just as importantly, where you would <em>not</em> use it — each &ldquo;no&rdquo; traces straight back to a
+trade-off from §2.17: data larger than RAM (the map holds everything in memory), multiple programs needing
+the same store at once (the process lock admits exactly one), workloads needing multi-key transactions
+(each operation is atomic only by itself), or heavy sorted-range queries over millions of keys (hash-map
+scans are O(n)). Knowing a tool's &ldquo;no&rdquo; list is what separates choosing a design from merely liking one.
+</p>
+
+<h2>4.3 Why this design fits embedded systems especially well</h2>
+<ul>
+<li><b>Compact binary serialization</b> — fixed-width framing with a trailing checksum is exactly how
+embedded protocols (CAN bus, Modbus, BLE packets) are encoded: small, fast, predictable, self-checking.</li>
+<li><b>Bounded, defensive parsing</b> — <code>kMaxKeyLen</code>/<code>kMaxValueLen</code> cap what recovery
+will believe from a length field. On a memory-limited device, one corrupt byte must not trigger a
+256&nbsp;MB allocation. The write path enforces the same caps, so it can never produce a record recovery
+would reject.</li>
+<li><b>Flash-friendly appends</b> — append-only logging suits NOR/NAND flash and SD cards, where in-place
+rewrites cause wear. Embedded filesystems (LittleFS, SPIFFS) are log-structured for the same reason.</li>
+<li><b>Power-loss resilience</b> — brown-outs are routine for battery devices. The fsync-before-acknowledge
+write path plus torn-record recovery is the standard &ldquo;brown-out safe&rdquo; pattern; the fsynced temp file +
+atomic rename in compaction mirrors dual-bank A/B firmware updates.</li>
+<li><b>Deterministic resources</b> — zero third-party libraries, a compile-time shard count
+(<code>constexpr</code>, <code>std::array</code>), no unbounded background threads. Predictable, statically
+sized resource use is a hard requirement in real-time systems.</li>
+<li><b>Portable log format</b> — the explicit little-endian encoding means an SD card written by an ARM
+device can be read on any workstation for debugging.</li>
+</ul>
+
+<h2>4.4 From kvstore to RocksDB — what production engines add</h2>
+<p>
+kvstore is a faithful miniature of a production storage engine's core. If you understand it, here is the
+remaining staircase to a real engine like RocksDB, one step at a time — each step solving a limitation
+from §2.17:
+</p>
+<span class="inlinedef"><b>Group commit</b> — instead of one fsync per write, collect all writes that
+arrive within a window and flush them with a single fsync, sharing the ~1&nbsp;ms cost across dozens of
+operations. Same durability, order-of-magnitude more write throughput. The first upgrade any real engine
+makes.</span>
+<span class="inlinedef"><b>SSTable</b> (sorted string table) — an immutable file of key–value pairs
+stored <em>in sorted order</em>. Because it is sorted, a range scan is a sequential read, and a lookup is
+a binary search — fixing the &ldquo;hash maps can't scan&rdquo; problem. Because it is immutable, it needs no
+locks and can be checksummed once.</span>
+<span class="inlinedef"><b>LSM-tree</b> (log-structured merge tree) — the full architecture: recent
+writes live in a small in-memory sorted map (backed by a WAL — exactly kvstore's trick); when it fills,
+it is flushed to disk as an SSTable; background compaction repeatedly merges SSTables into bigger, older
+ones. The dataset no longer needs to fit in RAM — RAM holds only the newest slice, and reads consult
+the SSTable stack. RocksDB, LevelDB, Cassandra, and ScyllaDB are all LSM engines.</span>
+<span class="inlinedef"><b>Bloom filter</b> — a tiny probabilistic bitmap that answers &ldquo;is this key
+<em>definitely not</em> in this SSTable?&rdquo; in nanoseconds, letting reads skip most files without touching
+the disk. The classic cure for LSM read amplification.</span>
+<span class="inlinedef"><b>MVCC / snapshots</b> (multi-version concurrency control) — keep multiple
+timestamped versions of values so readers see a frozen, consistent snapshot while writers proceed — no
+reader–writer blocking at all, and the foundation for multi-key transactions.</span>
+<p>
+Every one of these builds directly on the concepts you now know: the WAL is still there, the CRCs are
+still there, compaction is still there — just generalized. That is why this project is worth studying:
+the hard ideas in a 100,000-line engine are the same ones in these 700 lines.
+</p>
+
+<h2>4.5 The other staircase — going distributed</h2>
+<p>
+§4.4 scaled kvstore <em>down the storage stack</em>: bigger-than-RAM data on one machine. The other axis
+is <em>more machines</em>, and it is where the famous cloud databases live. Two new failure modes force it:
+a single machine can die taking its disk with it, and a single machine has a ceiling on traffic and
+capacity. The remedies are three ideas — and each one, satisfyingly, is a concept from Part 2 wearing a
+bigger coat:
+</p>
+<span class="inlinedef"><b>Replication</b> — keep full copies of the data on several machines, so losing
+one loses nothing. The standard mechanism: a leader machine appends each write to its WAL, then streams
+<em>the same log records</em> to follower machines, which replay them — exactly kvstore's recovery
+(§2.7), just over a network. The WAL literally becomes the replication protocol. This works only because
+replay is deterministic: the same log produces the same state on every machine. PostgreSQL streaming
+replication and Redis replicas are precisely this.</span>
+<span class="inlinedef"><b>Partitioning</b> — kvstore's <code>hash(key) % 16</code> (§2.11), with
+machines instead of shards: <code>hash(key)</code> now chooses which <em>server</em> owns the key, so
+capacity and traffic spread across the fleet. One refinement is needed — with naive <code>% N</code>,
+adding a server reshuffles nearly every key; <b>consistent hashing</b> arranges servers on a ring so that
+adding one moves only its small slice. Amazon's Dynamo paper made this famous; Cassandra and DynamoDB are
+its descendants.</span>
+<span class="inlinedef"><b>Consensus</b> (Raft, Paxos) — replication's hard edge case: if the leader dies
+mid-stream, which follower's log is the truth, and who becomes the new leader? Consensus protocols have
+the machines <em>vote</em> so that a majority always agrees on a single, identical log — the lock-ordering
+discipline of §2.12 writ large: a global agreement that makes a whole class of disaster impossible rather
+than unlikely. etcd — the store Kubernetes trusts with an entire cluster's state — is Raft consensus
+wrapped around a kvstore-like WAL + in-memory map.</span>
+<p>
+Notice what did <em>not</em> change on the way up either staircase: an append-only log of records, replayed
+deterministically, checksummed against corruption, compacted to bound growth. From a 700-line class to a
+planet-scale database, that core is the same — which is the strongest argument that it is the part worth
+learning first.
+</p>
+
+<!-- ============================== PART 5 ============================== -->
+<h1>Part 5 — Full Code Walkthrough</h1>
+<p>
+Everything below is quoted verbatim from the current source tree, in small fragments, each followed by a
+plain-English explanation. The green label above each block gives the exact file and line range.
+</p>
+<p>
+How to read it: don't rush. For each fragment, first ask yourself <em>what job does this piece have?</em>
+(the label's parenthetical tells you), then read the code, then the explanation. If a C++ construct is
+unfamiliar (<code>constexpr</code>, lambdas, RAII, <code>std::optional</code>), the explanation defines it
+at first use — this walkthrough doubles as a tour of modern C++ idioms. The order follows the files
+top-to-bottom, which conveniently is also dependency order: low-level helpers first, then the engine built
+on them. Two useful threads to trace as you go: <em>where does every byte of a record come from and go
+to?</em> (SerializeRecord &rarr; AppendRecordLocked &rarr; Recover) and <em>which lock is held at every
+line?</em> (the golden rule from §3.1).
+</p>
+
+<h2>5.1 kvstore.hpp — the public interface &amp; data model</h2>
+<p>
+A header file (<code>.hpp</code>) declares <em>what exists</em> — types, constants, and function
+signatures — so other files can use them. The matching <code>.cpp</code> file contains the actual logic.
+</p>
+
+<div class="codelabel">kvstore.hpp · lines 1–13 (includes)</div>
+<pre>#pragma once
+
+#include &lt;array&gt;
+#include &lt;atomic&gt;
+#include &lt;chrono&gt;
+#include &lt;cstdint&gt;
+#include &lt;fstream&gt;
+#include &lt;mutex&gt;
+#include &lt;optional&gt;
+#include &lt;shared_mutex&gt;
+#include &lt;string&gt;
+#include &lt;unordered_map&gt;
+#include &lt;vector&gt;</pre>
+<p>
+<code>#pragma once</code> stops the header being processed twice in one build. Each <code>#include</code>
+pulls in one standard-library tool: <code>array</code> for the fixed set of 16 shards, <code>atomic</code>
+for the compaction flag, <code>chrono</code> for TTL clocks, <code>cstdint</code> for exact-width integers
+like <code>uint32_t</code>, <code>fstream</code> for reading the log during recovery,
+<code>mutex</code>&nbsp;/&nbsp;<code>shared_mutex</code> for locking, <code>optional</code> for &ldquo;maybe
+there is no value&rdquo;, <code>unordered_map</code> for the hash maps, and <code>vector</code> for scan
+results. There are no third-party headers — the build is completely self-contained.
+</p>
+
+<div class="codelabel">kvstore.hpp · lines 15–24 (constants)</div>
+<pre>namespace kvstore {
+
+    constexpr std::size_t kNumShards = 16;
+
+    // "no expiry" sentinel
+    constexpr std::int64_t kNoExpiry = 0;
+
+    // sanity bounds, a bigger field means a corrupt header
+    constexpr std::uint32_t kMaxKeyLen = 1u &lt;&lt; 20;    // 1 MiB
+    constexpr std::uint32_t kMaxValueLen = 1u &lt;&lt; 28;  // 256 MiB</pre>
+<p>
+Four compile-time constants (<code>constexpr</code> means the compiler bakes the value in — zero runtime
+cost). <code>kNumShards</code> is the number of keyspace partitions. <code>kNoExpiry = 0</code> is the
+sentinel meaning &ldquo;this key never expires&rdquo;. The two <code>kMax…</code> bounds are the largest key and
+value sizes the store will accept or believe: <code>1u &lt;&lt; 20</code> is a bit-shift spelling of
+2<sup>20</sup> = 1,048,576 bytes (1&nbsp;MiB), and <code>1u &lt;&lt; 28</code> is 256&nbsp;MiB. These caps
+serve double duty: the write path refuses anything bigger, and recovery treats a bigger length in a header
+as proof of corruption.
+</p>
+
+<div class="codelabel">kvstore.hpp · lines 26–37 (record types)</div>
+<pre>    enum class RecordType : std::uint8_t {
+        kSet = 1,
+        kDelete = 2,
+        kSetTtl = 3,
+    };
+
+    // record prefix, serialized as [type][key_len][value_len][key][value][expires_at?][crc32]
+    struct RecordHeader {
+        RecordType type;
+        std::uint32_t key_len;
+        std::uint32_t value_len;
+    };</pre>
+<p>
+<code>RecordType</code> is the 1-byte tag (<code>: std::uint8_t</code> pins its size) written at the start
+of every log record, telling recovery what follows: a plain write, a deletion, or a write with an expiry.
+An <code>enum class</code> is a type-safe list of named constants. <code>RecordHeader</code> documents the
+fixed front of every record; note that the fields are serialized individually — the struct is never dumped
+to disk as raw memory (which would embed compiler padding and machine byte order into the file format).
+</p>
+
+<div class="codelabel">kvstore.hpp · lines 39–53 (data model)</div>
+<pre>    struct Entry {
+        std::string value;
+        std::int64_t expires_at = kNoExpiry;
+    };
+
+    // one keyspace partition, with its own lock
+    struct Shard {
+        mutable std::shared_mutex mutex;
+        std::unordered_map&lt;std::string, Entry&gt; data;
+    };
+
+    struct KeyValue {
+        std::string key;
+        std::string value;
+    };</pre>
+<p>
+<code>Entry</code> is what memory holds for one key: the value plus an absolute expiry timestamp
+(defaulting to &ldquo;never&rdquo;). <code>Shard</code> is one of the 16 partitions: a hash map and its own
+reader–writer lock. The <code>mutable</code> keyword lets <code>const</code> (read-only) methods still
+lock the mutex — locking changes the mutex's state but not the logical data, which is exactly what
+<code>mutable</code> is for. <code>KeyValue</code> is the simple pair returned by scans.
+</p>
+
+<div class="codelabel">kvstore.hpp · lines 55–87 (public interface)</div>
+<pre>    // key-value store backed by a write-ahead log
+    class KVStore {
+    public:
+        // opens or creates a store at path, replaying any existing log
+        explicit KVStore(std::string path);
+        ~KVStore();
+
+        KVStore(const KVStore&amp;) = delete;
+        KVStore&amp; operator=(const KVStore&amp;) = delete;
+
+        bool Set(const std::string&amp; key, const std::string&amp; value);
+
+        // like Set, but the key expires after ttl_seconds
+        bool SetWithTtl(const std::string&amp; key, const std::string&amp; value,
+                        std::int64_t ttl_seconds);
+
+        // value, or empty if absent or expired
+        std::optional&lt;std::string&gt; Get(const std::string&amp; key) const;
+
+        bool Delete(const std::string&amp; key);
+
+        // rewrite the log with only live keys, swapped in atomically
+        bool Compact();
+
+        std::size_t Size() const;
+        std::vector&lt;KeyValue&gt; Items() const;
+
+        // live pairs in [start, end), empty end means no upper bound
+        std::vector&lt;KeyValue&gt; Range(const std::string&amp; start, const std::string&amp; end) const;
+
+        const std::string&amp; WalPath() const { return wal_path_; }</pre>
+<p>
+The public face of the store. <code>explicit</code> on the constructor stops C++ silently converting a
+string into a KVStore by accident. The two <code>= delete</code> lines forbid copying — a store owns a
+file descriptor and locks, which cannot be meaningfully duplicated. Read methods are marked
+<code>const</code>; mutating methods return <code>bool</code> to report whether the durable write
+succeeded. <code>Get</code> returns <code>std::optional</code> so &ldquo;key not found&rdquo; is cleanly distinct
+from &ldquo;key maps to an empty string&rdquo;.
+</p>
+
+<div class="codelabel">kvstore.hpp · lines 89–126 (private helpers &amp; state)</div>
+<pre>    private:
+        static std::size_t ShardIndex(const std::string&amp; key);
+        Shard&amp; ShardFor(const std::string&amp; key);
+        const Shard&amp; ShardFor(const std::string&amp; key) const;
+
+        static std::int64_t NowSeconds();
+        static bool IsExpired(std::int64_t expires_at);
+
+        bool AppendRecordLocked(RecordType type, const std::string&amp; key,
+                                const std::string&amp; value, std::int64_t expires_at);
+        void Recover();
+        void OpenWalForAppend();
+        // open or reopen the wal fd, caller must hold wal_mutex_
+        bool OpenWalLocked();
+        // exclusive advisory lock so only one process uses the store
+        void AcquireProcessLock();
+
+        bool SetInternal(const std::string&amp; key, const std::string&amp; value,
+                        std::int64_t expires_at);
+
+        std::string path_;
+        std::string wal_path_;
+        std::string wal_tmp_path_;
+        std::string lock_path_;
+        int lock_fd_ = -1;
+
+        std::array&lt;Shard, kNumShards&gt; shards_;
+
+        mutable std::mutex wal_mutex_;
+        int wal_fd_ = -1;
+
+        std::atomic&lt;bool&gt; compaction_in_progress_{false};
+    };
+}</pre>
+<p>
+The private machinery. <code>ShardIndex</code>/<code>ShardFor</code> route a key to its shard.
+<code>AppendRecordLocked</code> writes one log record — the <code>Locked</code> suffix is a naming
+convention meaning &ldquo;the caller must already hold <code>wal_mutex_</code>&rdquo;. <code>Recover</code> replays
+the log at startup. <code>OpenWalLocked</code> opens or re-opens the log file descriptor — the
+&ldquo;re-open&rdquo; part is the self-healing path used after a failed compaction. <code>AcquireProcessLock</code>
+takes the exclusive <code>flock</code> so only one process can use the store. The state at the bottom:
+four file paths, the lock-file descriptor, the fixed array of 16 shards, the single mutex serializing all
+log access, the raw WAL file descriptor (an <code>int</code>, because durability needs POSIX calls), and
+the atomic flag ensuring one compaction at a time. Both descriptors initialize to <code>-1</code>, the
+conventional &ldquo;not open&rdquo; value.
+</p>
+
+<h2>5.2 kvstore.cpp — the storage engine</h2>
+
+<div class="codelabel">kvstore.cpp · lines 1–18 (includes &amp; anonymous namespace)</div>
+<pre>#include "kvstore.hpp"
+
+#include &lt;fcntl.h&gt;
+#include &lt;sys/file.h&gt;
+#include &lt;unistd.h&gt;
+
+#include &lt;algorithm&gt;
+#include &lt;cerrno&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstring&gt;
+#include &lt;filesystem&gt;
+#include &lt;stdexcept&gt;
+
+namespace kvstore {
+
+    namespace fs = std::filesystem;
+
+    namespace {</pre>
+<p>
+The first three system headers are POSIX: <code>fcntl.h</code> for <code>open</code> and its flags,
+<code>sys/file.h</code> for <code>flock</code> (the advisory file lock), and <code>unistd.h</code> for
+<code>write</code>, <code>fsync</code>, <code>close</code>, and <code>truncate</code>. The alias
+<code>fs</code> shortens <code>std::filesystem</code>. The unnamed <code>namespace {</code> that follows
+is C++'s way of saying &ldquo;these helpers are private to this file&rdquo; — nothing outside can see or link
+against them.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 20–42 (the CRC32 table and function)</div>
+<pre>        // precomputed crc32 table
+        struct Crc32Table {
+            std::uint32_t v[256];
+            constexpr Crc32Table() : v{} {
+                for (std::uint32_t i = 0; i &lt; 256; ++i) {
+                    std::uint32_t c = i;
+                    for (int k = 0; k &lt; 8; ++k) {
+                        c = (c &amp; 1u) ? (0xEDB88320u ^ (c &gt;&gt; 1)) : (c &gt;&gt; 1);
+                    }
+                    v[i] = c;
+                }
+            }
+        };
+        constexpr Crc32Table kCrc32Table{};
+
+        std::uint32_t Crc32(const void* data, std::size_t len) {
+            const auto* p = static_cast&lt;const std::uint8_t*&gt;(data);
+            std::uint32_t crc = 0xFFFFFFFFu;
+            for (std::size_t i = 0; i &lt; len; ++i) {
+                crc = kCrc32Table.v[(crc ^ p[i]) &amp; 0xFFu] ^ (crc &gt;&gt; 8);
+            }
+            return ~crc;
+        }</pre>
+<p>
+This is the standard IEEE&nbsp;802.3 CRC32 — the same one used by ZIP and PNG. The clever part: because the
+constructor is <code>constexpr</code>, the <em>compiler</em> computes the whole 256-entry lookup table at
+build time and embeds it in the binary as read-only data. At runtime, checksumming costs one table lookup
+and two XORs per byte — roughly 8&times; faster than computing bit-by-bit. <code>0xEDB88320</code> is the
+standard reversed CRC32 polynomial; the leading <code>~</code>/<code>0xFFFFFFFF</code> pre- and
+post-inversion is part of the specification so that runs of zeros do not checksum to zero.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 44–46 (AppendBytes)</div>
+<pre>        void AppendBytes(std::string&amp; buf, const void* data, std::size_t len) {
+            buf.append(static_cast&lt;const char*&gt;(data), len);
+        }</pre>
+<p>
+A tiny convenience: tack <code>len</code> raw bytes onto the end of a growing buffer. Here
+<code>std::string</code> is used as a general byte buffer, which is idiomatic C++ — a string is just a
+managed array of bytes and is allowed to contain anything, including zero bytes.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 48–83 (little-endian encode/decode helpers)</div>
+<pre>        // fixed little-endian encoding so the wal is portable across architectures
+        void AppendU32Le(std::string&amp; buf, std::uint32_t v) {
+            const char b[4] = {
+                static_cast&lt;char&gt;(v &amp; 0xFFu),
+                static_cast&lt;char&gt;((v &gt;&gt; 8) &amp; 0xFFu),
+                static_cast&lt;char&gt;((v &gt;&gt; 16) &amp; 0xFFu),
+                static_cast&lt;char&gt;((v &gt;&gt; 24) &amp; 0xFFu),
+            };
+            buf.append(b, sizeof(b));
+        }
+
+        void AppendI64Le(std::string&amp; buf, std::int64_t v) {
+            const auto u = static_cast&lt;std::uint64_t&gt;(v);
+            char b[8];
+            for (int i = 0; i &lt; 8; ++i) {
+                b[i] = static_cast&lt;char&gt;((u &gt;&gt; (8 * i)) &amp; 0xFFu);
+            }
+            buf.append(b, sizeof(b));
+        }
+
+        std::uint32_t LoadU32Le(const char* p) {
+            const auto* u = reinterpret_cast&lt;const unsigned char*&gt;(p);
+            return static_cast&lt;std::uint32_t&gt;(u[0]) |
+                   (static_cast&lt;std::uint32_t&gt;(u[1]) &lt;&lt; 8) |
+                   (static_cast&lt;std::uint32_t&gt;(u[2]) &lt;&lt; 16) |
+                   (static_cast&lt;std::uint32_t&gt;(u[3]) &lt;&lt; 24);
+        }
+
+        std::int64_t LoadI64Le(const char* p) {
+            const auto* u = reinterpret_cast&lt;const unsigned char*&gt;(p);
+            std::uint64_t v = 0;
+            for (int i = 0; i &lt; 8; ++i) {
+                v |= static_cast&lt;std::uint64_t&gt;(u[i]) &lt;&lt; (8 * i);
+            }
+            return static_cast&lt;std::int64_t&gt;(v);
+        }</pre>
+<p>
+These four functions are the portability layer (recall endianness from §2.14). Instead of copying a
+number's raw memory to disk — whose byte order depends on the CPU — they build the bytes explicitly.
+<code>AppendU32Le</code> peels off the lowest byte first (<code>v &amp; 0xFF</code>), then each next byte by
+shifting right 8 bits at a time: least-significant byte first, which is little-endian, by construction, on
+any machine. The <code>Load…</code> functions do the mirror image: take byte 0 as the low byte, shift each
+next byte into place, and OR them together. The 64-bit versions route through <code>uint64_t</code>
+because bit-shifting signed negative numbers is implementation-defined in C++ — converting to unsigned
+first makes it exact and portable.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 85–114 (SerializeRecord)</div>
+<pre>        // build a record with header, payload, then a crc over it all
+        std::string SerializeRecord(RecordType type, const std::string&amp; key,
+                                    const std::string&amp; value, std::int64_t expires_at) {
+            const auto key_len = static_cast&lt;std::uint32_t&gt;(key.size());
+            const std::uint32_t value_len =
+                (type == RecordType::kDelete) ? 0u
+                                              : static_cast&lt;std::uint32_t&gt;(value.size());
+            const auto type_raw = static_cast&lt;std::uint8_t&gt;(type);
+
+            std::string buf;
+            buf.reserve(sizeof(type_raw) + sizeof(key_len) + sizeof(value_len) +
+                        key.size() + value_len + sizeof(expires_at) + sizeof(std::uint32_t));
+
+            AppendBytes(buf, &amp;type_raw, sizeof(type_raw));
+            AppendU32Le(buf, key_len);
+            AppendU32Le(buf, value_len);
+            if (!key.empty()) {
+                AppendBytes(buf, key.data(), key.size());
+            }
+            if (type != RecordType::kDelete &amp;&amp; value_len &gt; 0) {
+                AppendBytes(buf, value.data(), value_len);
+            }
+            if (type == RecordType::kSetTtl) {
+                AppendI64Le(buf, expires_at);
+            }
+
+            const std::uint32_t crc = Crc32(buf.data(), buf.size());
+            AppendU32Le(buf, crc);
+            return buf;
+        }</pre>
+<p>
+This one function is the definition of the on-disk format. It assembles the record in order — type byte,
+the two lengths (little-endian), the key, the value (skipped for deletes), the expiry (only for TTL
+records) — then computes a CRC32 over everything so far and appends it last.
+<code>buf.reserve(…)</code> pre-allocates the final size so the string never reallocates mid-build (a small
+performance courtesy). Because both the write path and compaction call this single function, and recovery
+reads with the matching <code>Load…</code> helpers, writer and reader can never disagree about the layout.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 116–133 (WriteFully)</div>
+<pre>        // write every byte, retrying partial writes and EINTR
+        bool WriteFully(int fd, const char* data, std::size_t len) {
+            std::size_t written = 0;
+            while (written &lt; len) {
+                const ssize_t n = ::write(fd, data + written, len - written);
+                if (n &lt; 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    return false;
+                }
+                if (n == 0) {
+                    return false;  // no progress, don't spin
+                }
+                written += static_cast&lt;std::size_t&gt;(n);
+            }
+            return true;
+        }</pre>
+<p>
+A surprise for newcomers: the POSIX <code>write()</code> call is allowed to write fewer bytes than you
+asked (a &ldquo;partial write&rdquo;), and can be interrupted by a signal before writing anything
+(<code>errno == EINTR</code>, which is harmless and simply retried). This loop keeps calling
+<code>write</code> until every byte is delivered, treats a persistent zero-byte result as failure (so it
+can never spin forever), and reports any real error. The <code>::</code> prefix means &ldquo;the global
+function&rdquo;, i.e. the OS call, not something in the current namespace.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 135–144 (SyncParentDir)</div>
+<pre>        // fsync the parent dir so a create/rename survives a crash
+        void SyncParentDir(const std::string&amp; path) {
+            fs::path p(path);
+            const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
+            const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+            if (dfd &gt;= 0) {
+                ::fsync(dfd);
+                ::close(dfd);
+            }
+        }</pre>
+<p>
+Here is a subtlety most programmers never learn (previewed in §2.15): a file's contents and its
+<em>name</em> are stored separately. The name lives in the parent directory, which is itself a small file
+the OS caches. You can fsync a new file perfectly and still lose it in a crash, because the directory
+entry naming it never reached the disk. The fix is to open the directory itself and fsync <em>that</em>.
+kvstore does this after creating the log and after compaction's rename.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 148–165 (constructor)</div>
+<pre>    KVStore::KVStore(std::string path)
+        : path_(std::move(path)),
+        wal_path_(path_ + ".wal"),
+        wal_tmp_path_(path_ + ".wal.tmp"),
+        lock_path_(path_ + ".lock") {
+        // ensure the db directory exists
+        fs::path p(path_);
+        if (p.has_parent_path()) {
+            std::error_code ec;
+            fs::create_directories(p.parent_path(), ec);
+        }
+        // lock out other processes before touching the wal
+        AcquireProcessLock();
+        Recover();
+        OpenWalForAppend();
+    }</pre>
+<p>
+The lines after the <code>:</code> are the <b>initializer list</b> — the C++ way to set members before the
+constructor body runs. <code>std::move(path)</code> takes ownership of the caller's string without copying
+it, and the three derived paths (<code>.wal</code>, <code>.wal.tmp</code>, <code>.lock</code>) are built
+from it. The body then does four things in the deliberate order §3.7 analyzed: create the parent directory
+if needed, take the exclusive process lock (so no other process can interfere with anything that follows),
+replay the existing log to rebuild memory, and finally open the log for appending. Locking before recovery
+matters: recovery truncates torn tails, and two processes recovering the same file at once would be a
+disaster.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 167–179 (destructor)</div>
+<pre>    KVStore::~KVStore() {
+        std::lock_guard&lt;std::mutex&gt; lock(wal_mutex_);
+        if (wal_fd_ &gt;= 0) {
+            ::fsync(wal_fd_);
+            ::close(wal_fd_);
+            wal_fd_ = -1;
+        }
+        if (lock_fd_ &gt;= 0) {
+            ::flock(lock_fd_, LOCK_UN);
+            ::close(lock_fd_);
+            lock_fd_ = -1;
+        }
+    }</pre>
+<p>
+Orderly shutdown. <code>std::lock_guard</code> is an <b>RAII</b> lock — it locks the mutex on creation and
+automatically unlocks when it goes out of scope, even if an exception flies through (RAII = &ldquo;Resource
+Acquisition Is Initialization&rdquo;, the C++ idiom of tying cleanup to object lifetime). Holding the WAL
+mutex guarantees no thread is mid-write while we close. The log is fsynced one final time and closed;
+then the process lock is released (<code>LOCK_UN</code> = unlock) and its descriptor closed, letting the
+next process open the store.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 181–192 (AcquireProcessLock)</div>
+<pre>    void KVStore::AcquireProcessLock() {
+        lock_fd_ = ::open(lock_path_.c_str(), O_RDWR | O_CREAT, 0644);
+        if (lock_fd_ &lt; 0) {
+            throw std::runtime_error("KVStore: failed to open lock file: " + lock_path_);
+        }
+        if (::flock(lock_fd_, LOCK_EX | LOCK_NB) != 0) {
+            ::close(lock_fd_);
+            lock_fd_ = -1;
+            throw std::runtime_error(
+                "KVStore: store at '" + path_ + "' is locked by another process");
+        }
+    }</pre>
+<p>
+The single-process guarantee from §2.16. It opens (creating if needed — <code>O_CREAT</code>, with
+permission mode <code>0644</code> = owner read/write, others read) the <code>.lock</code> file, then asks
+for an exclusive lock. <code>LOCK_NB</code> means non-blocking: instead of waiting for the other process
+to finish, fail immediately — so the user gets a prompt, clear error message rather than a mysterious
+hang. The lock is owned by the file descriptor, so the OS releases it automatically even if the process
+crashes without running the destructor. That is why a stale <code>.lock</code> file left behind by a
+crash is harmless.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 194–213 (shard routing and time helpers)</div>
+<pre>    std::size_t KVStore::ShardIndex(const std::string&amp; key) {
+        return std::hash&lt;std::string&gt;{}(key) % kNumShards;
+    }
+
+    Shard&amp; KVStore::ShardFor(const std::string&amp; key) {
+        return shards_[ShardIndex(key)];
+    }
+
+    const Shard&amp; KVStore::ShardFor(const std::string&amp; key) const {
+        return shards_[ShardIndex(key)];
+    }
+
+    std::int64_t KVStore::NowSeconds() {
+        using namespace std::chrono;
+        return duration_cast&lt;seconds&gt;(system_clock::now().time_since_epoch()).count();
+    }
+
+    bool KVStore::IsExpired(std::int64_t expires_at) {
+        return expires_at != kNoExpiry &amp;&amp; expires_at &lt;= NowSeconds();
+    }</pre>
+<p>
+<code>ShardIndex</code> hashes the key and takes the remainder mod 16, so every key has one stable home
+shard. <code>ShardFor</code> returns a reference to it — two overloads, plain and <code>const</code>, so
+both writers and read-only methods can call it. <code>NowSeconds</code> is the current Unix time (whole
+seconds since Jan 1, 1970). <code>IsExpired</code> is careful about the sentinel: a key is expired only if
+it <em>has</em> an expiry (<code>!= kNoExpiry</code>) and that moment has passed. TTL-less keys can never
+expire.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 215–235 (opening the log)</div>
+<pre>    void KVStore::OpenWalForAppend() {
+        std::lock_guard&lt;std::mutex&gt; lock(wal_mutex_);
+        if (!OpenWalLocked()) {
+            throw std::runtime_error("KVStore: failed to open WAL file: " + wal_path_);
+        }
+    }
+
+    bool KVStore::OpenWalLocked() {
+        if (wal_fd_ &gt;= 0) {
+            return true;
+        }
+        const bool existed = fs::exists(wal_path_);
+        wal_fd_ = ::open(wal_path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (wal_fd_ &lt; 0) {
+            return false;
+        }
+        if (!existed) {
+            SyncParentDir(wal_path_);
+        }
+        return true;
+    }</pre>
+<p>
+Two layers by design. <code>OpenWalLocked</code> is the reusable worker: if the descriptor is already open
+it does nothing; otherwise it opens the log with <code>O_APPEND</code> (the OS guarantees every write
+lands at the end atomically) and, if the file was just created, fsyncs the parent directory so the new
+file's name survives a crash. It returns true/false rather than throwing, because its callers differ: the
+constructor (via <code>OpenWalForAppend</code>) treats failure as fatal and throws, while
+<code>Compact</code> and the write path treat it as a recoverable error. This is the &ldquo;self-healing file
+descriptor&rdquo; mechanism — any failed open is simply retried on the next write.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 237–252 (Recover: setup)</div>
+<pre>    void KVStore::Recover() {
+        std::ifstream in(wal_path_, std::ios::binary);
+        if (!in.is_open()) {
+            return;  // nothing to recover
+        }
+
+        // read n bytes, false on a short read (torn tail)
+        const auto read_into = [&amp;in](std::string&amp; sink, std::size_t n) -&gt; bool {
+            const std::size_t old_size = sink.size();
+            sink.resize(old_size + n);
+            in.read(sink.data() + old_size, static_cast&lt;std::streamsize&gt;(n));
+            return in.gcount() == static_cast&lt;std::streamsize&gt;(n);
+        };
+
+        // offset just past the last fully-valid record
+        std::streamoff good_offset = 0;</pre>
+<p>
+Recovery begins. If the log does not exist, this is a brand-new store — nothing to do. The
+<code>read_into</code> lambda (a small function defined inline; <code>[&amp;in]</code> means it captures
+the stream by reference) appends exactly <code>n</code> bytes from the file onto a buffer and reports
+whether all <code>n</code> arrived — fewer means the file ended mid-record: a torn tail.
+<code>good_offset</code> will track the byte position just past the last record that passed every check;
+everything after it will be cut off at the end.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 254–276 (Recover: read &amp; validate the header)</div>
+<pre>        while (true) {
+            // buffer the whole record so we can check its crc
+            std::string record;
+
+            std::uint8_t type_raw = 0;
+            in.read(reinterpret_cast&lt;char*&gt;(&amp;type_raw), sizeof(type_raw));
+            if (in.gcount() != static_cast&lt;std::streamsize&gt;(sizeof(type_raw))) break;
+            AppendBytes(record, &amp;type_raw, sizeof(type_raw));
+
+            const RecordType type = static_cast&lt;RecordType&gt;(type_raw);
+            if (type != RecordType::kSet &amp;&amp; type != RecordType::kSetTtl &amp;&amp;
+                type != RecordType::kDelete) {
+                break;  // unknown type
+            }
+
+            if (!read_into(record, sizeof(std::uint32_t))) break;  // key_len
+            if (!read_into(record, sizeof(std::uint32_t))) break;  // value_len
+            const std::uint32_t key_len = LoadU32Le(record.data() + 1);
+            const std::uint32_t value_len =
+                LoadU32Le(record.data() + 1 + sizeof(std::uint32_t));
+            if (key_len &gt; kMaxKeyLen || value_len &gt; kMaxValueLen) break;  // corrupt header</pre>
+<p>
+The replay loop, part one. Each iteration reads one record, accumulating every byte into
+<code>record</code> so the CRC can be checked over the exact same bytes at the end. It reads the type byte
+(stopping cleanly at end-of-file), rejects unknown types, reads the two length fields, decodes them with
+<code>LoadU32Le</code> (matching how they were written), and applies the defensive bounds: a length larger
+than the caps cannot have been written by kvstore, so the header is corrupt and replay stops. This is the
+check that prevents one flipped bit from causing a gigabyte allocation.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 278–298 (Recover: payload + CRC check)</div>
+<pre>            const std::size_t key_off = record.size();
+            if (key_len &gt; 0 &amp;&amp; !read_into(record, key_len)) break;
+
+            std::size_t value_off = record.size();
+            if (type == RecordType::kSet || type == RecordType::kSetTtl) {
+                if (value_len &gt; 0 &amp;&amp; !read_into(record, value_len)) break;
+            }
+
+            std::int64_t expires_at = kNoExpiry;
+            if (type == RecordType::kSetTtl) {
+                const std::size_t exp_off = record.size();
+                if (!read_into(record, sizeof(expires_at))) break;
+                expires_at = LoadI64Le(record.data() + exp_off);
+            }
+
+            char crc_buf[sizeof(std::uint32_t)] = {};
+            in.read(crc_buf, sizeof(crc_buf));
+            if (in.gcount() != static_cast&lt;std::streamsize&gt;(sizeof(crc_buf))) break;
+            const std::uint32_t stored_crc = LoadU32Le(crc_buf);
+            if (Crc32(record.data(), record.size()) != stored_crc) break;  // bad crc</pre>
+<p>
+Part two: the key, the value (only Set-type records have one), and the expiry (only TTL records) are read,
+each remembering its offset within the buffer for later extraction, and each aborting on a short read.
+Finally the stored CRC is read (into a separate buffer — it is not part of the checksummed bytes) and
+compared against a freshly computed CRC over the whole accumulated record. Any mismatch — whether from a
+torn write or silent bit-rot — stops replay right here. Note the elegant uniformity: a clean end-of-file,
+a torn tail, an unknown type, an oversized length, and a bad checksum all take the same
+<code>break</code>, and everything before this point remains trusted.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 300–326 (Recover: apply the record)</div>
+<pre>            std::string key = record.substr(key_off, key_len);
+            switch (type) {
+                case RecordType::kSet: {
+                    std::string value = record.substr(value_off, value_len);
+                    Shard&amp; shard = ShardFor(key);
+                    std::unique_lock lock(shard.mutex);
+                    shard.data[key] = Entry{std::move(value), kNoExpiry};
+                    break;
+                }
+                case RecordType::kSetTtl: {
+                    std::string value = record.substr(value_off, value_len);
+                    Shard&amp; shard = ShardFor(key);
+                    std::unique_lock lock(shard.mutex);
+                    shard.data[key] = Entry{std::move(value), expires_at};
+                    break;
+                }
+                case RecordType::kDelete: {
+                    Shard&amp; shard = ShardFor(key);
+                    std::unique_lock lock(shard.mutex);
+                    shard.data.erase(key);
+                    break;
+                }
+            }
+            good_offset = in.tellg();  // record boundary, stream is still good here
+        }</pre>
+<p>
+A record that survived every check is applied to its shard: Set and SetTtl insert or overwrite the entry
+(with the appropriate expiry), Delete erases it. Because later records are applied after earlier ones,
+replay naturally reproduces &ldquo;last write wins&rdquo;. After applying, <code>in.tellg()</code> (the current
+read position) is saved as the new high-water mark of known-good data. The loop then continues with the
+next record until the file ends or a check fails.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 328–342 (Recover: truncate the torn tail)</div>
+<pre>        // drop any torn/corrupt tail so later appends aren't stranded past it
+        in.close();
+        std::error_code ec;
+        const std::uintmax_t size = fs::file_size(wal_path_, ec);
+        if (!ec &amp;&amp; good_offset &gt;= 0 &amp;&amp;
+            static_cast&lt;std::uintmax_t&gt;(good_offset) &lt; size) {
+            if (::truncate(wal_path_.c_str(), good_offset) == 0) {
+                const int fd = ::open(wal_path_.c_str(), O_WRONLY);
+                if (fd &gt;= 0) {
+                    ::fsync(fd);
+                    ::close(fd);
+                }
+            }
+        }
+    }</pre>
+<p>
+The final act of recovery. If the file is longer than the last good record — i.e. there is a torn or
+corrupt tail — <code>truncate</code> chops the file back to <code>good_offset</code>, and the truncation
+is fsynced. Why does this matter? Without it, new appends would land <em>after</em> the garbage bytes; on
+the next restart, replay would stop at the garbage and never reach them, silently losing acknowledged
+writes. Truncating keeps the invariant that the log is always a clean run of whole, valid records.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 344–378 (AppendRecordLocked — the durable write)</div>
+<pre>    bool KVStore::AppendRecordLocked(RecordType type, const std::string&amp; key,
+                                    const std::string&amp; value, std::int64_t expires_at) {
+        // reject oversized fields, recovery would treat them as corrupt
+        if (key.size() &gt; kMaxKeyLen) {
+            return false;
+        }
+        if (type != RecordType::kDelete &amp;&amp; value.size() &gt; kMaxValueLen) {
+            return false;
+        }
+
+        const std::string record = SerializeRecord(type, key, value, expires_at);
+
+        // reopen if a failed compaction left the fd closed
+        if (wal_fd_ &lt; 0 &amp;&amp; !OpenWalLocked()) {
+            return false;
+        }
+
+        // tail offset, for rollback on failure
+        const off_t before = ::lseek(wal_fd_, 0, SEEK_END);
+        if (before &lt; 0) {
+            return false;
+        }
+
+        if (!WriteFully(wal_fd_, record.data(), record.size())) {
+            if (::ftruncate(wal_fd_, before) != 0) {}  // roll back partial write
+            return false;
+        }
+
+        // fsync before the record is visible in memory
+        if (::fdatasync(wal_fd_) != 0) {
+            if (::ftruncate(wal_fd_, before) != 0) {}
+            return false;
+        }
+        return true;
+    }</pre>
+<p>
+The heart of durability, in five steps. <b>(1) Validate:</b> refuse keys/values larger than the caps —
+writing one would poison the log, because recovery would treat its header as corrupt and stop there.
+<b>(2) Self-heal:</b> if a previous failed compaction left the descriptor closed, try to reopen it now
+instead of failing forever. <b>(3) Bookmark:</b> <code>lseek(…, SEEK_END)</code> records the current end
+of the file. <b>(4) Write:</b> append the full record. <b>(5) Sync:</b> <code>fdatasync</code> forces it
+onto the physical disk. If step 4 or 5 fails, <code>ftruncate(fd, before)</code> rolls the file back to
+the bookmark, so a half-written record never remains, and the caller receives <code>false</code> with
+memory untouched. A write is acknowledged only when it is physically durable.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 380–407 (SetInternal, Set, SetWithTtl)</div>
+<pre>    bool KVStore::SetInternal(const std::string&amp; key, const std::string&amp; value,
+                                std::int64_t expires_at) {
+        RecordType type = (expires_at == kNoExpiry) ? RecordType::kSet : RecordType::kSetTtl;
+
+        // append + apply under one lock so log order matches memory
+        std::lock_guard&lt;std::mutex&gt; wal_lock(wal_mutex_);
+        if (!AppendRecordLocked(type, key, value, expires_at)) {
+            return false;
+        }
+
+        Shard&amp; shard = ShardFor(key);
+        std::unique_lock lock(shard.mutex);
+        shard.data[key] = Entry{value, expires_at};
+        return true;
+    }
+
+    bool KVStore::Set(const std::string&amp; key, const std::string&amp; value) {
+        return SetInternal(key, value, kNoExpiry);
+    }
+
+    bool KVStore::SetWithTtl(const std::string&amp; key, const std::string&amp; value,
+                            std::int64_t ttl_seconds) {
+        std::int64_t expires_at = NowSeconds() + ttl_seconds;
+        if (expires_at == kNoExpiry) {
+            expires_at += 1;  // avoid the no-expiry sentinel
+        }
+        return SetInternal(key, value, expires_at);
+    }</pre>
+<p>
+<code>SetInternal</code> is the golden rule in code: take the WAL mutex, append durably, and only on
+success update the shard — all before releasing the mutex. Holding the lock across both steps is what
+makes the operation indivisible: without it, two threads could write the log in one order but update
+memory in the opposite order (a lost update), or a write could slip between compaction's snapshot and its
+file swap and vanish. <code>Set</code> is a one-liner passing the sentinel. <code>SetWithTtl</code>
+converts the relative TTL into an absolute timestamp; the tiny <code>+= 1</code> guards the
+astronomically rare case where that timestamp lands exactly on the sentinel value 0.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 409–434 (Get and Delete)</div>
+<pre>    std::optional&lt;std::string&gt; KVStore::Get(const std::string&amp; key) const {
+        const Shard&amp; shard = ShardFor(key);
+        std::shared_lock lock(shard.mutex);
+        auto it = shard.data.find(key);
+        if (it == shard.data.end()) {
+            return std::nullopt;
+        }
+        // expired reads as absent, removed at compaction
+        if (IsExpired(it-&gt;second.expires_at)) {
+            return std::nullopt;
+        }
+        return it-&gt;second.value;
+    }
+
+    bool KVStore::Delete(const std::string&amp; key) {
+        // append + apply under one lock so log order matches memory
+        std::lock_guard&lt;std::mutex&gt; wal_lock(wal_mutex_);
+        if (!AppendRecordLocked(RecordType::kDelete, key, std::string(), kNoExpiry)) {
+            return false;
+        }
+
+        Shard&amp; shard = ShardFor(key);
+        std::unique_lock lock(shard.mutex);
+        shard.data.erase(key);
+        return true;
+    }</pre>
+<p>
+<code>Get</code> is the entire read path: one <code>std::shared_lock</code> (many readers at once), a hash
+lookup, the lazy-expiry check (an expired key answers &ldquo;not found&rdquo; even though it still occupies memory
+until compaction), and a copy of the value. No disk, no WAL mutex — this is why reads are fast and scale.
+<code>Delete</code> mirrors <code>SetInternal</code>: durable delete-record first, then erase from the
+shard, all under the WAL lock.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 436–476 (Size, Items, Range)</div>
+<pre>    std::size_t KVStore::Size() const {
+        std::size_t total = 0;
+        for (const auto&amp; shard : shards_) {
+            std::shared_lock lock(shard.mutex);
+            for (const auto&amp; [key, entry] : shard.data) {
+                if (!IsExpired(entry.expires_at)) {
+                    ++total;
+                }
+            }
+        }
+        return total;
+    }
+
+    std::vector&lt;KeyValue&gt; KVStore::Items() const {
+        return Range(std::string(), std::string());
+    }
+
+    std::vector&lt;KeyValue&gt; KVStore::Range(const std::string&amp; start, const std::string&amp; end) const {
+        std::vector&lt;KeyValue&gt; result;
+        for (const auto&amp; shard : shards_) {
+            std::shared_lock lock(shard.mutex);
+            for (const auto&amp; [key, entry] : shard.data) {
+                if (IsExpired(entry.expires_at)) {
+                    continue;
+                }
+                if (key &lt; start) {
+                    continue;
+                }
+                if (!end.empty() &amp;&amp; key &gt;= end) {
+                    continue;
+                }
+                result.push_back(KeyValue{key, entry.value});
+            }
+        }
+        std::sort(result.begin(), result.end(),
+                [](const KeyValue&amp; a, const KeyValue&amp; b) { return a.key &lt; b.key; });
+        return result;
+    }</pre>
+<p>
+The scanning trio. <code>Size</code> walks all shards under shared locks (one at a time, so other shards
+stay fully available) counting non-expired entries — the count always matches what <code>Get</code> would
+report. <code>Items</code> is just <code>Range</code> with empty bounds. <code>Range</code> collects
+entries that are live, at or after <code>start</code>, and before <code>end</code> (an empty
+<code>end</code> means unbounded — the half-open <code>[start, end)</code> convention used across
+computing). Hash maps store keys in no particular order, so the merged result is sorted at the end.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 478–490 (Compact: the guard)</div>
+<pre>    bool KVStore::Compact() {
+        bool expected = false;
+        if (!compaction_in_progress_.compare_exchange_strong(expected, true)) {
+            return false;  // already compacting
+        }
+        struct CompactionGuard {
+            std::atomic&lt;bool&gt;&amp; flag;
+            ~CompactionGuard() { flag.store(false); }
+        } guard{compaction_in_progress_};
+
+        // lock across the snapshot and swap so no write is lost
+        std::lock_guard&lt;std::mutex&gt; wal_lock(wal_mutex_);</pre>
+<p>
+<code>compare_exchange_strong</code> is an atomic instruction that checks and sets a flag in one
+indivisible CPU step: &ldquo;if the flag is <code>false</code>, set it <code>true</code> and tell me I won.&rdquo;
+If another thread already started compacting, this call loses and returns early — two simultaneous
+compactions would fight over the temp file. The little <code>CompactionGuard</code> struct is RAII again:
+its destructor resets the flag no matter how <code>Compact</code> exits (success, failure, or exception).
+Then the WAL mutex is taken <em>for the entire operation</em>, holding all writers still across the
+snapshot and swap.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 492–534 (Compact: snapshot to a temp file)</div>
+<pre>        // write live entries to a temp file
+        {
+            const int tmp_fd =
+                ::open(wal_tmp_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (tmp_fd &lt; 0) {
+                return false;
+            }
+            bool write_ok = true;
+            for (auto&amp; shard : shards_) {
+                std::shared_lock lock(shard.mutex);
+                for (const auto&amp; [key, entry] : shard.data) {
+                    if (IsExpired(entry.expires_at)) {  // drop expired
+                        continue;
+                    }
+                    const RecordType type = (entry.expires_at == kNoExpiry)
+                                                ? RecordType::kSet
+                                                : RecordType::kSetTtl;
+                    const std::string record =
+                        SerializeRecord(type, key, entry.value, entry.expires_at);
+                    if (!WriteFully(tmp_fd, record.data(), record.size())) {
+                        write_ok = false;
+                        break;
+                    }
+                }
+                if (!write_ok) {
+                    break;
+                }
+            }
+            // fsync before the rename
+            if (write_ok &amp;&amp; ::fdatasync(tmp_fd) != 0) {
+                write_ok = false;
+            }
+            ::close(tmp_fd);
+            if (!write_ok) {
+                std::error_code ec;
+                fs::remove(wal_tmp_path_, ec);
+                return false;
+            }
+        }</pre>
+<p>
+Phase one of compaction: build the replacement log. A temp file is opened with <code>O_TRUNC</code>
+(clearing any leftover from an earlier crash). Every shard is walked under a shared lock — readers keep
+working throughout — and every live, non-expired entry is written as a fresh record using the very same
+<code>SerializeRecord</code>, so the new log has correct CRCs and format by construction. Expired entries
+are simply skipped: this is where lazy expiry finally reclaims disk space. The temp file is fsynced before
+the swap — renaming an un-synced file into place would be durability theater. On any failure, the temp
+file is deleted and the original log remains untouched.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 536–560 (Compact: the atomic swap)</div>
+<pre>        // swap the temp file in
+        {
+            if (wal_fd_ &gt;= 0) {
+                ::fsync(wal_fd_);
+                ::close(wal_fd_);
+                wal_fd_ = -1;
+            }
+            std::error_code ec;
+            fs::rename(wal_tmp_path_, wal_path_, ec);
+            if (ec) {
+                // rename failed so keep the old log
+                std::error_code rm_ec;
+                fs::remove(wal_tmp_path_, rm_ec);
+                OpenWalLocked();
+                return false;
+            }
+            // persist the rename
+            SyncParentDir(wal_path_);
+            if (!OpenWalLocked()) {
+                return false;
+            }
+        }</pre>
+<p>
+Phase two: the swap. The old log is fsynced and closed, then <code>fs::rename</code> atomically replaces
+it with the compacted file — at every instant, the name <code>db.wal</code> points to one complete, valid
+log. <code>SyncParentDir</code> makes the rename itself durable. Note both failure paths call
+<code>OpenWalLocked()</code>: if the rename failed, it reopens the old log; if the post-rename open fails,
+the descriptor stays <code>-1</code> — and thanks to the self-heal check in
+<code>AppendRecordLocked</code>, the very next write will retry the open instead of the store staying
+broken forever. This retry loop is what turns a transient failure (say, a momentary out-of-descriptors
+condition) into a recoverable hiccup.
+</p>
+
+<div class="codelabel">kvstore.cpp · lines 562–575 (Compact: purge expired from memory)</div>
+<pre>        // drop expired from memory too
+        for (auto&amp; shard : shards_) {
+            std::unique_lock lock(shard.mutex);
+            for (auto it = shard.data.begin(); it != shard.data.end(); ) {
+                if (IsExpired(it-&gt;second.expires_at)) {
+                    it = shard.data.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        return true;
+    }</pre>
+<p>
+The epilogue: expired entries were dropped from the disk during the snapshot; now they are erased from
+memory too, so <code>Size()</code> and scans immediately reflect the compacted reality. Note the careful
+iterator dance — <code>erase</code> returns the next valid iterator, because erasing invalidates the
+current one; incrementing a just-erased iterator is a classic C++ bug this loop avoids.
+</p>
+
+<h2>5.3 cli.cpp — the interactive shell</h2>
+<p>
+A REPL (read–evaluate–print loop) that lets a human drive the store from a terminal — handy for poking at
+a database file by hand. Run it as <code>./kvstore_cli [path]</code>.
+</p>
+
+<div class="codelabel">cli.cpp · lines 11–20 (SplitArgs)</div>
+<pre>    // split a line on whitespace
+    std::vector&lt;std::string&gt; SplitArgs(const std::string&amp; line) {
+        std::vector&lt;std::string&gt; args;
+        std::istringstream iss(line);
+        std::string tok;
+        while (iss &gt;&gt; tok) {
+            args.push_back(tok);
+        }
+        return args;
+    }</pre>
+<p>
+Breaks a typed line into words: <code>std::istringstream</code> wraps the line as a stream, and
+<code>iss &gt;&gt; tok</code> extracts whitespace-separated tokens one at a time. Deliberately simple — no
+quoting rules.
+</p>
+
+<div class="codelabel">cli.cpp · lines 39–61 (setup and prompt loop)</div>
+<pre>int main(int argc, char** argv) {
+    std::string db_path = "data/kvstore_cli.db";
+    if (argc &gt; 1) {
+        db_path = argv[1];
+    }
+
+    std::unique_ptr&lt;kvstore::KVStore&gt; store;
+    try {
+        store = std::make_unique&lt;kvstore::KVStore&gt;(db_path);
+    } catch (const std::exception&amp; e) {
+        std::cerr &lt;&lt; "failed to open store at '" &lt;&lt; db_path &lt;&lt; "': " &lt;&lt; e.what() &lt;&lt; "\n";
+        return 1;
+    }
+
+    std::cout &lt;&lt; "kvstore cli - db: " &lt;&lt; db_path &lt;&lt; "\n";
+    std::cout &lt;&lt; "type 'help' for commands, 'exit' to quit.\n";
+
+    std::string line;
+    while (true) {
+        std::cout &lt;&lt; "&gt; ";
+        if (!std::getline(std::cin, line)) {
+            break; // eof on stdin
+        }</pre>
+<p>
+The database path comes from the first command-line argument (or a default). The store is created inside a
+<code>try</code> block because the constructor throws on real problems — including the &ldquo;locked by
+another process&rdquo; error, which prints cleanly here instead of crashing. The loop prints a prompt, reads a
+line (<code>getline</code> returns false on Ctrl-D, ending the session), and dispatches on the first word.
+The rest of the file is a chain of <code>else if</code> command handlers — each validates its argument
+count, calls the matching store method, and prints <code>OK</code>, a value, <code>(nil)</code>, or a
+usage hint. Commands: <code>set</code>, <code>setttl</code>, <code>get</code>, <code>del</code>,
+<code>size</code>, <code>keys</code>, <code>scan</code>, <code>compact</code>, <code>help</code>,
+<code>exit</code>. One nicety: <code>set</code> and <code>setttl</code> re-join every word after the key
+with spaces, so values can contain spaces.
+</p>
+
+<h2>5.4 main.cpp — the test harness (7 phases)</h2>
+<p>
+Not a normal program — an automated proof. It uses <code>assert</code> (which aborts the program loudly
+if its condition is false) to verify the store's promises under stress, simulated crashes, corruption, and
+restarts. If the binary prints <code>ALL TESTS PASSED</code>, every claim in this report was just
+demonstrated on your machine.
+</p>
+
+<div class="codelabel">main.cpp · lines 20–31 (test configuration)</div>
+<pre>    constexpr int kNumWorkers = 4;
+    constexpr int kKeysPerWorker = 500;
+    constexpr const char* kDbPath = "test_db/kvstore_test.db";
+
+    std::string MakeKey(int worker_id, int idx) {
+        return "key_" + std::to_string(worker_id) + "_" + std::to_string(idx);
+    }
+
+    std::string MakeValue(int worker_id, int idx, int version) {
+        return "val_w" + std::to_string(worker_id) + "_i" + std::to_string(idx) +
+            "_v" + std::to_string(version);
+    }</pre>
+<p>
+Four worker threads, 500 keys each. <code>MakeKey</code>/<code>MakeValue</code> build fully predictable
+strings, so any later check can compute exactly what value a key must hold — no bookkeeping needed.
+</p>
+
+<h3>Phase 1 — concurrent stress test</h3>
+<div class="codelabel">main.cpp · lines 55–70 (writers with deliberate contention)</div>
+<pre>        for (int w = 0; w &lt; kNumWorkers; ++w) {
+            writers.emplace_back([&amp;, w]() {
+                for (int i = 0; i &lt; kKeysPerWorker; ++i) {
+                    const std::string key = MakeKey(w, i);
+                    const std::string value = MakeValue(w, i, 1);
+                    [[maybe_unused]] bool ok = store-&gt;Set(key, value);
+                    assert(ok &amp;&amp; "Set should succeed");
+                    total_writes.fetch_add(1, std::memory_order_relaxed);
+
+                    // cross-shard contention
+                    int neighbor = (w + 1) % kNumWorkers;
+                    std::string shared_key = "shared_key_" + std::to_string(i % 50);
+                    store-&gt;Set(shared_key, MakeValue(neighbor, i, 1));
+                }
+            });
+        }</pre>
+<p>
+Four writer threads each write their own 500 keys plus a rotating set of 50 shared keys that all threads
+fight over — deliberately provoking the contention that would expose a race condition. Simultaneously (not
+shown), four reader threads hammer <code>Get</code> in a loop, and <code>Compact()</code> is run while the
+readers are still going — the hardest concurrency case. After everything joins, every key is verified
+against its computed expected value. <code>[[maybe_unused]]</code> silences the compiler warning when
+asserts are compiled out in release builds; <code>memory_order_relaxed</code> is the cheapest atomic mode
+(§2.9), fine for simple counters.
+</p>
+
+<h3>Phases 2 &amp; 3 — crash simulation and recovery</h3>
+<div class="codelabel">main.cpp · lines 139–147 (injecting a torn record)</div>
+<pre>    // append a torn (incomplete) record
+    {
+        std::ofstream raw(std::string(kDbPath) + ".wal",
+                          std::ios::binary | std::ios::app);
+        assert(raw.is_open());
+        const char garbage[] = {0x01, 0x02, 0x03}; // incomplete header
+        raw.write(garbage, sizeof(garbage));
+        raw.flush();
+    }</pre>
+<p>
+Phase 2 reopens the store (proving Phase 1's data recovered), adds 100 more keys, deletes 50 old ones, and
+&ldquo;crashes&rdquo; by simply dropping the store object. Then this block bypasses the store entirely and
+appends 3 junk bytes to the raw log file — exactly what a power cut mid-write leaves behind: byte
+<code>0x01</code> looks like a valid <code>kSet</code> type tag, but the record is cut off. Phase 3
+reopens the store and asserts the complete expected state: the deletes stayed deleted, all surviving keys
+are intact, the crash-phase writes are present — and the garbage tail was silently and safely discarded.
+</p>
+
+<h3>Phases 4, 5 &amp; 6 — compaction, TTL, and scans</h3>
+<p>
+Phase 4 writes 400 more keys from 4 threads, compacts, restarts, and verifies nothing live was lost —
+proving compaction never drops acknowledged data. Phase 5 stores a permanent key, a 1-second-TTL key, and
+a 1-hour-TTL key; sleeps 2 seconds; asserts the short key reads as gone while the others remain; then
+compacts, restarts, and asserts the expired key stayed gone (TTLs survive restarts because the absolute
+expiry timestamp is in the log). Phase 6 checks scan semantics: <code>Items()</code> excludes deleted and
+expired keys and returns sorted results; <code>Range("scan_a", "scan_d")</code> includes the start but
+excludes the end; an empty end means unbounded.
+</p>
+
+<h3>Phase 7 — CRC corruption detection</h3>
+<div class="codelabel">main.cpp · lines 345–361 (flipping one byte)</div>
+<pre>        // corrupt the last record's payload so its crc no longer matches
+        {
+            std::fstream f(crc_wal, std::ios::binary | std::ios::in | std::ios::out);
+            assert(f.is_open());
+            f.seekg(0, std::ios::end);
+            const std::streamoff size = f.tellg();
+            assert(size &gt; 5);
+            // byte just before the 4-byte crc
+            const std::streamoff pos = size - 5;
+            f.seekg(pos);
+            char b = 0;
+            f.read(&amp;b, 1);
+            b = static_cast&lt;char&gt;(b ^ 0xFF);
+            f.seekp(pos);
+            f.write(&amp;b, 1);
+            f.flush();
+        }</pre>
+<p>
+The newest test, added with the durability work. A fresh store writes two records; then this block opens
+the raw log and flips every bit of one payload byte (<code>b ^ 0xFF</code>) in the last record —
+simulating silent disk corruption. The record is still perfectly shaped (right lengths, right size), so
+only the CRC can catch it. The test then asserts three things: the corrupted record is rejected on
+recovery while the earlier record survives; the log file shrank (the corrupt tail was physically
+truncated, not just skipped); and a write made after recovery persists across yet another restart —
+proving new appends land on the clean boundary.
+</p>
+
+<h2>5.5 bench.cpp — the benchmark</h2>
+<div class="codelabel">bench.cpp · lines 18–25 (configuration)</div>
+<pre>// kept modest: every Set fdatasyncs, so writes are disk-bound and don't parallelize
+constexpr int kOpsPerThread = 500;
+constexpr int kKeyspaceSize = 1000;
+
+// keys overlap across threads so shards actually contend
+std::string MakeKey(int idx) {
+    return "bench_key_" + std::to_string(idx % kKeyspaceSize);
+}</pre>
+<p>
+The comment tells the honest story: because every acknowledged write waits for an <code>fdatasync</code>,
+write throughput is limited by the disk's flush latency, not the CPU — so the op counts are kept small
+enough that a benchmark run finishes quickly. The <code>% kKeyspaceSize</code> forces different threads
+onto overlapping keys, so lock contention is real rather than accidentally avoided.
+</p>
+
+<div class="codelabel">bench.cpp · lines 49–78 (the mixed workload, abridged)</div>
+<pre>double RunMixedBench(kvstore::KVStore&amp; store, int num_threads) {
+    ...
+            std::mt19937 rng(static_cast&lt;unsigned&gt;(t) + 1);
+            std::uniform_int_distribution&lt;int&gt; key_dist(0, kKeyspaceSize - 1);
+            std::uniform_int_distribution&lt;int&gt; op_dist(0, 9); // &lt; 8 means read
+
+            for (int i = 0; i &lt; kOpsPerThread; ++i) {
+                int key_idx = key_dist(rng);
+                if (op_dist(rng) &lt; 8) {
+                    (void)store.Get(MakeKey(key_idx));
+                } else {
+                    store.Set(MakeKey(key_idx), value);
+                }
+            }
+    ...
+}</pre>
+<p>
+Two workloads are measured at 1, 2, 4, and 8 threads, each on a fresh store for fairness: pure writes (all
+<code>Set</code>) and a realistic 80%-read/20%-write mix, where each thread rolls its own seeded random
+number generator (<code>std::mt19937</code>) to pick keys and operations. A final section times one
+<code>Compact()</code> on a populated store. Expected shape of the results: write throughput stays flat as
+threads grow (all writers serialize on the WAL mutex and the disk), while the mixed workload scales well —
+concurrent shared-lock reads are the payoff of the sharded design.
+</p>
+
+<!-- ============================== APPENDIX ============================== -->
+<h1>Appendix</h1>
+
+<h2>A.1 Concept-to-code map</h2>
+<table>
+<tr><th>Systems concept</th><th>Where it lives in the code</th></tr>
+<tr><td>Write-ahead logging (durability)</td><td><code>AppendRecordLocked</code>, <code>SetInternal</code>, <code>Delete</code></td></tr>
+<tr><td>Forced durability (fsync)</td><td><code>AppendRecordLocked</code> (<code>fdatasync</code>), <code>SyncParentDir</code>, destructor</td></tr>
+<tr><td>Integrity / checksums</td><td><code>Crc32</code>, <code>SerializeRecord</code>, <code>Recover</code></td></tr>
+<tr><td>Portable binary serialization</td><td><code>AppendU32Le</code>/<code>AppendI64Le</code>/<code>LoadU32Le</code>/<code>LoadI64Le</code>, <code>SerializeRecord</code>, <code>RecordType</code></td></tr>
+<tr><td>Failure rollback</td><td><code>ftruncate</code> in <code>AppendRecordLocked</code></td></tr>
+<tr><td>Crash recovery / torn writes</td><td><code>Recover</code> (including tail truncation)</td></tr>
+<tr><td>Defensive parsing bounds</td><td><code>kMaxKeyLen</code>/<code>kMaxValueLen</code> in both <code>Recover</code> and <code>AppendRecordLocked</code></td></tr>
+<tr><td>Sharded / striped locking</td><td><code>Shard</code>, <code>ShardFor</code>, <code>shards_</code></td></tr>
+<tr><td>Reader/writer concurrency</td><td><code>shared_lock</code> in <code>Get</code>/<code>Range</code>/<code>Size</code> vs. <code>unique_lock</code> in writes</td></tr>
+<tr><td>Compaction &amp; atomic swap</td><td><code>Compact</code> + <code>fs::rename</code> + <code>SyncParentDir</code></td></tr>
+<tr><td>Self-healing after failure</td><td><code>OpenWalLocked</code> + the retry in <code>AppendRecordLocked</code></td></tr>
+<tr><td>Single-process safety</td><td><code>AcquireProcessLock</code> (<code>flock</code>), released in the destructor</td></tr>
+<tr><td>TTL / lazy expiry</td><td><code>IsExpired</code>, <code>SetWithTtl</code>, read filtering, purge in <code>Compact</code></td></tr>
+<tr><td>Atomic coordination</td><td><code>compaction_in_progress_</code>, <code>wal_mutex_</code></td></tr>
+</table>
+
+<h2>A.2 Building and running</h2>
+<pre>cmake -S . -B build          # configure (C++20, warnings-as-strict)
+cmake --build build -j       # build the library + 3 executables
+./build/kvstore_test         # the 7-phase test suite -&gt; "ALL TESTS PASSED"
+./build/kvstore_cli mydb.db  # interactive shell
+./build/kvstore_bench        # throughput benchmark</pre>
+<p>
+The project is a static library (<code>kvstore</code>) plus three executables, defined in
+<code>CMakeLists.txt</code>. The only dependencies are a C++20 compiler, CMake 3.20+, and a POSIX system
+(Linux/macOS) for the durability syscalls — no third-party libraries at all.
+</p>
+
+<div class="footer-note">
+Generated from the kvstore source tree (second edition — includes the little-endian serialization layer,
+process locking, self-healing WAL descriptor, and the Phase-7 CRC corruption test). Every quoted code
+block is verbatim from the current kvstore.hpp, kvstore.cpp, cli.cpp, main.cpp, and bench.cpp.
+</div>
+
+</body>
+</html>
