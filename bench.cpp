@@ -19,6 +19,10 @@ namespace {
 constexpr int kOpsPerThread = 500;
 constexpr int kKeyspaceSize = 1000;
 
+// reads are in-memory and finish in microseconds; use enough of them per thread
+// that each run lasts long enough for stable timings (variance <2% across reps)
+constexpr int kReadsPerThread = 1'000'000;
+
 // keys overlap across threads so shards actually contend
 std::string MakeKey(int idx) {
     return "bench_key_" + std::to_string(idx % kKeyspaceSize);
@@ -77,6 +81,29 @@ double RunMixedBench(kvstore::KVStore& store, int num_threads) {
     return total_ops / seconds;
 }
 
+// read throughput: 100% Get on a pre-populated shared keyspace
+double RunReadBench(kvstore::KVStore& store, int num_threads) {
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(num_threads));
+
+    auto start = std::chrono::steady_clock::now();
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&store, t]() {
+            std::mt19937 rng(static_cast<unsigned>(t) + 1);
+            std::uniform_int_distribution<int> key_dist(0, kKeyspaceSize - 1);
+            for (int i = 0; i < kReadsPerThread; ++i) {
+                (void)store.Get(MakeKey(key_dist(rng)));
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    auto end = std::chrono::steady_clock::now();
+
+    double seconds = std::chrono::duration<double>(end - start).count();
+    double total_ops = static_cast<double>(num_threads) * kReadsPerThread;
+    return total_ops / seconds;
+}
+
 void PrintRow(const std::string& label, int threads, double ops_per_sec) {
     std::cout << std::left << std::setw(8) << label
               << "threads=" << std::setw(2) << threads << "  "
@@ -96,9 +123,23 @@ int main() {
     const std::string db_path = db_dir + "/bench.db";
 
     std::cout << "kvstore benchmark - " << kOpsPerThread << " ops/thread, "
-              << kKeyspaceSize << " distinct keys\n\n";
+              << kKeyspaceSize << " distinct keys, "
+              << kvstore::kNumShards << " shards\n\n";
 
-    const std::vector<int> thread_counts = {1, 2, 4, 8};
+    const std::vector<int> thread_counts = {1, 2, 4, 8, 16};
+
+    std::cout << "-- read throughput (Get only) --\n";
+    for (int n : thread_counts) {
+        ResetDb(db_dir);
+        kvstore::KVStore store(db_path);
+        std::string value(64, 'r');
+        for (int i = 0; i < kKeyspaceSize; ++i) {
+            store.Set(MakeKey(i), value);
+        }
+        double ops = RunReadBench(store, n);
+        PrintRow("read", n, ops);
+    }
+    std::cout << "\n";
 
     std::cout << "-- write throughput (Set only) --\n";
     for (int n : thread_counts) {

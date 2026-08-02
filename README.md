@@ -132,11 +132,45 @@ Other commands: `size`, `help`.
 
 ## Benchmark
 
-`kvstore_bench` reports write, mixed read/write, and compaction throughput:
+`kvstore_bench` reports read, write, mixed read/write, and compaction
+throughput:
 
 ```bash
 ./kvstore_bench
 ```
+
+Results on a 13th-gen Intel i9-13900H (20 hardware threads), Kingston NVMe SSD,
+ext4, Linux, GCC 14 `-O3` (Release). Reads are 1M `Get`s per thread over a
+shared 1,000-key space (run-to-run variance <2%). The baseline column is the
+same binary rebuilt with `kNumShards = 1` in `kvstore.hpp`, which collapses the
+sharded index into a single global reader-writer lock.
+
+| threads | reads, 1 shard (global lock) | reads, 16 shards |
+|--------:|-----------------------------:|-----------------:|
+|       1 |                 9.2M ops/sec |     8.1M ops/sec |
+|       2 |                 8.1M ops/sec |    13.7M ops/sec |
+|       4 |                 8.0M ops/sec |    22.7M ops/sec |
+|       8 |                 7.5M ops/sec |    30.9M ops/sec |
+|      16 |                 7.6M ops/sec |    40.3M ops/sec |
+
+Three things worth noticing:
+
+- **Sharding is worth ~5x on contended reads** (7.6M -> 40.3M ops/sec at 16
+  threads) and costs nothing when uncontended — single-thread throughput is
+  the same either way.
+- **A single global `shared_mutex` scales negatively**: 16 threads read
+  *slower* than 1 (9.2M -> 7.6M ops/sec) because every reader bounces the same
+  lock word between cores. Sharding exists to fix exactly this.
+- **Writes don't scale, by design** (~235 ops/sec at any thread count, either
+  config): every acknowledged `Set` pays an `fdatasync` under `wal_mutex_`, so
+  write throughput is the disk's flush rate, not a CPU or lock number — see
+  the trade-offs section of `docs/kvstore_report_v2.html`. Group commit is the
+  standard fix.
+
+Mixed 80/20 throughput (~1,200 ops/sec, flat across threads and shard counts)
+is just the write ceiling divided by the write fraction: 235 / 0.2 ≈ 1,175 —
+the 20% of ops that fsync dominate everything else. Compacting 1,000 live keys
+takes ~11 ms.
 
 ## Sanitizers
 
