@@ -55,7 +55,9 @@ namespace kvstore {
     // key-value store backed by a write-ahead log
     class KVStore {
     public:
-        // opens or creates a store at path, replaying any existing log
+        // Opens or creates a store; throws on I/O errors or non-tail corruption.
+        // Relative paths bind to the current directory at construction.
+        // Empty paths and paths containing NUL bytes are rejected.
         explicit KVStore(std::string path);
 
         ~KVStore();
@@ -63,9 +65,12 @@ namespace kvstore {
         KVStore(const KVStore&) = delete;
         KVStore& operator=(const KVStore&) = delete;
 
+        // I/O failures return false. An uncertain failure requires close/reopen;
+        // subsequent writes/compaction return false and reads throw runtime_error.
+        // Allocation errors can throw, including after the WAL becomes durable.
         bool Set(const std::string& key, const std::string& value);
 
-        // like Set, but the key expires after ttl_seconds
+        // Like Set; nonpositive TTL expires immediately, overflow returns false.
         bool SetWithTtl(const std::string& key, const std::string& value,
                         std::int64_t ttl_seconds);
 
@@ -77,6 +82,7 @@ namespace kvstore {
         // rewrite the log with only live keys, swapped in atomically
         bool Compact();
 
+        // Aggregate reads are rolling views across shards, not atomic snapshots.
         std::size_t Size() const;
 
         std::vector<KeyValue> Items() const;
@@ -98,6 +104,7 @@ namespace kvstore {
         bool AppendRecordLocked(RecordType type, const std::string& key,
                                 const std::string& value, std::int64_t expires_at);
 
+        static bool SyncParentDir(const std::string& path);
         void Recover();
         void OpenWalForAppend();
 
@@ -115,12 +122,28 @@ namespace kvstore {
         std::string wal_tmp_path_;
         std::string lock_path_;
 
-        int lock_fd_ = -1;
+        // Owning descriptors also clean up when construction throws.
+        struct FileDescriptor {
+            int value = -1;
+            explicit FileDescriptor(int fd = -1) : value(fd) {}
+            ~FileDescriptor();
+            FileDescriptor(const FileDescriptor&) = delete;
+            FileDescriptor& operator=(const FileDescriptor&) = delete;
+            operator int() const { return value; }
+            void Reset(int fd = -1);
+            int Release();
+        };
+
+        void CheckReadable() const;
+        FileDescriptor lock_fd_;
 
         std::array<Shard, kNumShards> shards_;
 
         mutable std::mutex wal_mutex_;
-        int wal_fd_ = -1;
+        FileDescriptor wal_fd_;
+
+        // An uncertain WAL or failed post-WAL memory update requires reopen.
+        std::atomic<bool> failed_{false};
 
         std::atomic<bool> compaction_in_progress_{false};
     };

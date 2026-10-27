@@ -3,6 +3,7 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -65,90 +66,96 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        const std::string& cmd = args[0];
+        try {
+            const std::string& cmd = args[0];
 
-        if (cmd == "exit" || cmd == "quit") {
-            break;
-        } else if (cmd == "help") {
-            PrintHelp();
-        } else if (cmd == "set") {
-            if (args.size() < 3) {
-                std::cout << "usage: set <key> <value>\n";
-                continue;
-            }
-            // join the rest as the value
-            std::string value;
-            for (std::size_t i = 2; i < args.size(); ++i) {
-                if (i > 2) value += ' ';
-                value += args[i];
-            }
-            bool ok = store->Set(args[1], value);
-            std::cout << (ok ? "OK\n" : "ERROR: write failed\n");
-        } else if (cmd == "setttl") {
-            if (args.size() < 4) {
-                std::cout << "usage: setttl <key> <ttl_seconds> <value>\n";
-                continue;
-            }
-            std::int64_t ttl = 0;
-            try {
-                ttl = std::stoll(args[2]);
-            } catch (const std::exception&) {
-                std::cout << "ERROR: ttl must be an integer number of seconds\n";
-                continue;
-            }
-            std::string value;
-            for (std::size_t i = 3; i < args.size(); ++i) {
-                if (i > 3) value += ' ';
-                value += args[i];
-            }
-            bool ok = store->SetWithTtl(args[1], value, ttl);
-            std::cout << (ok ? "OK\n" : "ERROR: write failed\n");
-        } else if (cmd == "get") {
-            if (args.size() != 2) {
-                std::cout << "usage: get <key>\n";
-                continue;
-            }
-            auto val = store->Get(args[1]);
-            if (val.has_value()) {
-                std::cout << *val << "\n";
+            if (cmd == "exit" || cmd == "quit") {
+                break;
+            } else if (cmd == "help") {
+                PrintHelp();
+            } else if (cmd == "set") {
+                if (args.size() < 3) {
+                    std::cout << "usage: set <key> <value>\n";
+                    continue;
+                }
+                // join the rest as the value
+                std::string value;
+                for (std::size_t i = 2; i < args.size(); ++i) {
+                    if (i > 2) value += ' ';
+                    value += args[i];
+                }
+                bool ok = store->Set(args[1], value);
+                std::cout << (ok ? "OK\n" : "ERROR: write failed\n");
+            } else if (cmd == "setttl") {
+                if (args.size() < 4) {
+                    std::cout << "usage: setttl <key> <ttl_seconds> <value>\n";
+                    continue;
+                }
+                std::int64_t ttl = 0;
+                try {
+                    std::size_t parsed = 0;
+                    ttl = std::stoll(args[2], &parsed);
+                    if (parsed != args[2].size()) throw std::invalid_argument("trailing TTL characters");
+                } catch (const std::exception&) {
+                    std::cout << "ERROR: ttl must be an integer number of seconds\n";
+                    continue;
+                }
+                std::string value;
+                for (std::size_t i = 3; i < args.size(); ++i) {
+                    if (i > 3) value += ' ';
+                    value += args[i];
+                }
+                bool ok = store->SetWithTtl(args[1], value, ttl);
+                std::cout << (ok ? "OK\n" : "ERROR: write failed\n");
+            } else if (cmd == "get") {
+                if (args.size() != 2) {
+                    std::cout << "usage: get <key>\n";
+                    continue;
+                }
+                auto val = store->Get(args[1]);
+                if (val.has_value()) {
+                    std::cout << *val << "\n";
+                } else {
+                    std::cout << "(nil)\n";
+                }
+            } else if (cmd == "del") {
+                if (args.size() != 2) {
+                    std::cout << "usage: del <key>\n";
+                    continue;
+                }
+                bool ok = store->Delete(args[1]);
+                std::cout << (ok ? "OK\n" : "ERROR: write failed\n");
+            } else if (cmd == "size") {
+                std::cout << store->Size() << "\n";
+            } else if (cmd == "keys") {
+                auto items = store->Items();
+                if (items.empty()) {
+                    std::cout << "(empty)\n";
+                }
+                for (const auto& kv : items) {
+                    std::cout << kv.key << "\n";
+                }
+            } else if (cmd == "scan") {
+                if (args.size() < 2 || args.size() > 3) {
+                    std::cout << "usage: scan <start> [end]\n";
+                    continue;
+                }
+                std::string end = (args.size() == 3) ? args[2] : std::string();
+                auto items = store->Range(args[1], end);
+                if (items.empty()) {
+                    std::cout << "(empty)\n";
+                }
+                for (const auto& kv : items) {
+                    std::cout << kv.key << " = " << kv.value << "\n";
+                }
+            } else if (cmd == "compact") {
+                bool ok = store->Compact();
+                std::cout << (ok ? "OK\n" : "ERROR: compaction failed\n");
             } else {
-                std::cout << "(nil)\n";
+                std::cout << "unknown command '" << cmd << "', try 'help'\n";
             }
-        } else if (cmd == "del") {
-            if (args.size() != 2) {
-                std::cout << "usage: del <key>\n";
-                continue;
-            }
-            bool ok = store->Delete(args[1]);
-            std::cout << (ok ? "OK\n" : "ERROR: write failed\n");
-        } else if (cmd == "size") {
-            std::cout << store->Size() << "\n";
-        } else if (cmd == "keys") {
-            auto items = store->Items();
-            if (items.empty()) {
-                std::cout << "(empty)\n";
-            }
-            for (const auto& kv : items) {
-                std::cout << kv.key << "\n";
-            }
-        } else if (cmd == "scan") {
-            if (args.size() < 2 || args.size() > 3) {
-                std::cout << "usage: scan <start> [end]\n";
-                continue;
-            }
-            std::string end = (args.size() == 3) ? args[2] : std::string();
-            auto items = store->Range(args[1], end);
-            if (items.empty()) {
-                std::cout << "(empty)\n";
-            }
-            for (const auto& kv : items) {
-                std::cout << kv.key << " = " << kv.value << "\n";
-            }
-        } else if (cmd == "compact") {
-            bool ok = store->Compact();
-            std::cout << (ok ? "OK\n" : "ERROR: compaction failed\n");
-        } else {
-            std::cout << "unknown command '" << cmd << "', try 'help'\n";
+        } catch (const std::exception& e) {
+            std::cout << "ERROR: " << e.what() << "\n";
         }
     }
 

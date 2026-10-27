@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 
 namespace kvstore {
@@ -16,6 +18,14 @@ namespace kvstore {
     namespace fs = std::filesystem;
 
     namespace {
+
+        std::string AbsoluteStorePath(const std::string& path) {
+            if (path.empty() || path.find('\0') != std::string::npos) {
+                throw std::invalid_argument("KVStore: path must be nonempty and contain no NUL bytes");
+            }
+            // Resolve once so later chdir calls cannot redirect compaction.
+            return fs::absolute(fs::path(path)).string();
+        }
 
         // precomputed crc32 table
         struct Crc32Table {
@@ -132,60 +142,86 @@ namespace kvstore {
             return true;
         }
 
-        // fsync the parent dir so a create/rename survives a crash
-        void SyncParentDir(const std::string& path) {
-            fs::path p(path);
-            const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
-            const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
-            if (dfd >= 0) {
-                ::fsync(dfd);
-                ::close(dfd);
+        bool SyncFile(int fd, bool data_only = false) {
+            int result;
+            do {
+                result = data_only ? ::fdatasync(fd) : ::fsync(fd);
+            } while (result != 0 && errno == EINTR);
+            return result == 0;
+        }
+
+        bool TruncateFile(int fd, off_t length) {
+            int result;
+            do {
+                result = ::ftruncate(fd, length);
+            } while (result != 0 && errno == EINTR);
+            return result == 0;
+        }
+
+        // Read errors must never be mistaken for a torn tail.
+        bool ReadFully(int fd, char* data, std::size_t length) {
+            std::size_t done = 0;
+            while (done < length) {
+                const ssize_t n = ::read(fd, data + done, length - done);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    throw std::runtime_error("KVStore: WAL read failed");
+                }
+                if (n == 0) return false;
+                done += static_cast<std::size_t>(n);
             }
+            return true;
         }
 
     }  // namespace
 
+    KVStore::FileDescriptor::~FileDescriptor() { Reset(); }
+
+    void KVStore::FileDescriptor::Reset(int fd) {
+        if (value >= 0) ::close(value);
+        value = fd;
+    }
+
+    int KVStore::FileDescriptor::Release() {
+        const int fd = value;
+        value = -1;
+        return fd;
+    }
+
+    // A member so the directory fd uses the same RAII ownership as the WAL.
+    bool KVStore::SyncParentDir(const std::string& path) {
+        const fs::path p(path);
+        const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
+        FileDescriptor fd(::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        return fd >= 0 && SyncFile(fd);
+    }
+
     KVStore::KVStore(std::string path)
-        : path_(std::move(path)),
-        wal_path_(path_ + ".wal"),
-        wal_tmp_path_(path_ + ".wal.tmp"),
-        lock_path_(path_ + ".lock") {
-        // ensure the db directory exists
-        fs::path p(path_);
-        if (p.has_parent_path()) {
-            std::error_code ec;
-            fs::create_directories(p.parent_path(), ec);
+        : path_(AbsoluteStorePath(path)),
+          wal_path_(path_ + ".wal"),
+          wal_tmp_path_(path_ + ".wal.tmp"),
+          lock_path_(path_ + ".lock") {
+        const fs::path parent = fs::absolute(fs::path(path_)).parent_path();
+        fs::create_directories(parent);
+        // Persist newly created directory entries, including nested ancestors.
+        for (fs::path dir = parent; dir != dir.root_path(); dir = dir.parent_path()) {
+            if (!SyncParentDir(dir.string())) {
+                throw std::runtime_error("KVStore: failed to sync database directory");
+            }
         }
-
-        // lock out other processes before touching the wal
         AcquireProcessLock();
-
         Recover();
         OpenWalForAppend();
     }
 
-    KVStore::~KVStore() {
-        std::lock_guard<std::mutex> lock(wal_mutex_);
-        if (wal_fd_ >= 0) {
-            ::fsync(wal_fd_);
-            ::close(wal_fd_);
-            wal_fd_ = -1;
-        }
-        if (lock_fd_ >= 0) {
-            ::flock(lock_fd_, LOCK_UN);
-            ::close(lock_fd_);
-            lock_fd_ = -1;
-        }
-    }
+    KVStore::~KVStore() = default;
 
     void KVStore::AcquireProcessLock() {
-        lock_fd_ = ::open(lock_path_.c_str(), O_RDWR | O_CREAT, 0644);
+        lock_fd_.Reset(::open(lock_path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644));
         if (lock_fd_ < 0) {
             throw std::runtime_error("KVStore: failed to open lock file: " + lock_path_);
         }
         if (::flock(lock_fd_, LOCK_EX | LOCK_NB) != 0) {
-            ::close(lock_fd_);
-            lock_fd_ = -1;
             throw std::runtime_error(
                 "KVStore: store at '" + path_ + "' is locked by another process");
         }
@@ -220,129 +256,84 @@ namespace kvstore {
     }
 
     bool KVStore::OpenWalLocked() {
-        if (wal_fd_ >= 0) {
-            return true;
-        }
-        const bool existed = fs::exists(wal_path_);
-        wal_fd_ = ::open(wal_path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (wal_fd_ < 0) {
-            return false;
-        }
-        if (!existed) {
-            SyncParentDir(wal_path_);
-        }
+        if (wal_fd_ >= 0) return true;
+        FileDescriptor fd(::open(wal_path_.c_str(),
+                                 O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644));
+        if (fd < 0) return false;
+        // Sync even on reopen: an earlier failed create may have left the name behind.
+        if (!SyncFile(fd, true) || !SyncParentDir(wal_path_)) return false;
+        wal_fd_.Reset(fd.Release());
         return true;
     }
 
     void KVStore::Recover() {
-        std::ifstream in(wal_path_, std::ios::binary);
-        if (!in.is_open()) {
-            return;  // nothing to recover
+        FileDescriptor fd(::open(wal_path_.c_str(), O_RDWR | O_CLOEXEC));
+        if (fd < 0) {
+            if (errno == ENOENT) return;
+            throw std::runtime_error("KVStore: failed to open WAL for recovery");
         }
-
-        // read n bytes, false on a short read (torn tail)
-        const auto read_into = [&in](std::string& sink, std::size_t n) -> bool {
-            const std::size_t old_size = sink.size();
-            sink.resize(old_size + n);
-            in.read(sink.data() + old_size, static_cast<std::streamsize>(n));
-            return in.gcount() == static_cast<std::streamsize>(n);
-        };
-
-        // offset just past the last fully-valid record
-        std::streamoff good_offset = 0;
-
-        while (true) {
-            // buffer the whole record so we can check its crc
-            std::string record;
-
-            std::uint8_t type_raw = 0;
-            in.read(reinterpret_cast<char*>(&type_raw), sizeof(type_raw));
-            if (in.gcount() != static_cast<std::streamsize>(sizeof(type_raw))) break;
-            AppendBytes(record, &type_raw, sizeof(type_raw));
-
-            const RecordType type = static_cast<RecordType>(type_raw);
-            if (type != RecordType::kSet && type != RecordType::kSetTtl &&
-                type != RecordType::kDelete) {
-                break;  // unknown type
-            }
-
-            if (!read_into(record, sizeof(std::uint32_t))) break;  // key_len
-            if (!read_into(record, sizeof(std::uint32_t))) break;  // value_len
-
-            const std::uint32_t key_len = LoadU32Le(record.data() + 1);
-            const std::uint32_t value_len =
-                LoadU32Le(record.data() + 1 + sizeof(std::uint32_t));
-
-            if (key_len > kMaxKeyLen || value_len > kMaxValueLen) break;  // corrupt header
-
-            const std::size_t key_off = record.size();
-            if (key_len > 0 && !read_into(record, key_len)) break;
-
-            std::size_t value_off = record.size();
-            if (type == RecordType::kSet || type == RecordType::kSetTtl) {
-                if (value_len > 0 && !read_into(record, value_len)) break;
-            }
-
-            std::int64_t expires_at = kNoExpiry;
-            if (type == RecordType::kSetTtl) {
-                const std::size_t exp_off = record.size();
-                if (!read_into(record, sizeof(expires_at))) break;
-                expires_at = LoadI64Le(record.data() + exp_off);
-            }
-
-            char crc_buf[sizeof(std::uint32_t)] = {};
-            in.read(crc_buf, sizeof(crc_buf));
-            if (in.gcount() != static_cast<std::streamsize>(sizeof(crc_buf))) break;
-            const std::uint32_t stored_crc = LoadU32Le(crc_buf);
-
-            if (Crc32(record.data(), record.size()) != stored_crc) break;  // bad crc
-
-            std::string key = record.substr(key_off, key_len);
-
-            switch (type) {
-                case RecordType::kSet: {
-                    std::string value = record.substr(value_off, value_len);
-                    Shard& shard = ShardFor(key);
-                    std::unique_lock lock(shard.mutex);
-                    shard.data[key] = Entry{std::move(value), kNoExpiry};
-                    break;
-                }
-                case RecordType::kSetTtl: {
-                    std::string value = record.substr(value_off, value_len);
-                    Shard& shard = ShardFor(key);
-                    std::unique_lock lock(shard.mutex);
-                    shard.data[key] = Entry{std::move(value), expires_at};
-                    break;
-                }
-                case RecordType::kDelete: {
-                    Shard& shard = ShardFor(key);
-                    std::unique_lock lock(shard.mutex);
-                    shard.data.erase(key);
-                    break;
-                }
-            }
-
-            good_offset = in.tellg();  // record boundary, stream is still good here
+        struct stat info {};
+        if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0) {
+            throw std::runtime_error("KVStore: WAL must be a readable regular file");
         }
-
-        // drop any torn/corrupt tail so later appends aren't stranded past it
-        in.close();
-        std::error_code ec;
-        const std::uintmax_t size = fs::file_size(wal_path_, ec);
-        if (!ec && good_offset >= 0 &&
-            static_cast<std::uintmax_t>(good_offset) < size) {
-            if (::truncate(wal_path_.c_str(), good_offset) == 0) {
-                const int fd = ::open(wal_path_.c_str(), O_WRONLY);
-                if (fd >= 0) {
-                    ::fsync(fd);
-                    ::close(fd);
-                }
+        const auto size = static_cast<std::uint64_t>(info.st_size);
+        std::uint64_t good_offset = 0;
+        while (good_offset < size) {
+            constexpr std::size_t header_size = 9;
+            if (size - good_offset < header_size) break;
+            char header[header_size];
+            if (!ReadFully(fd, header, header_size)) {
+                throw std::runtime_error("KVStore: WAL changed during recovery");
             }
+            const auto type = static_cast<RecordType>(static_cast<std::uint8_t>(header[0]));
+            const std::uint32_t key_len = LoadU32Le(header + 1);
+            const std::uint32_t value_len = LoadU32Le(header + 5);
+            if ((type != RecordType::kSet && type != RecordType::kSetTtl &&
+                 type != RecordType::kDelete) || key_len > kMaxKeyLen ||
+                value_len > kMaxValueLen || (type == RecordType::kDelete && value_len != 0)) {
+                throw std::runtime_error("KVStore: corrupt WAL header; file preserved");
+            }
+            const std::uint64_t payload_size = static_cast<std::uint64_t>(key_len) +
+                value_len + (type == RecordType::kSetTtl ? 8u : 0u);
+            const std::uint64_t record_size = header_size + payload_size + 4;
+            if (record_size > size - good_offset) break; // incomplete final record
+            std::string record(header, header_size);
+            record.resize(static_cast<std::size_t>(header_size + payload_size));
+            if (!ReadFully(fd, record.data() + header_size,
+                           static_cast<std::size_t>(payload_size))) {
+                throw std::runtime_error("KVStore: WAL changed during recovery");
+            }
+            char checksum[4];
+            if (!ReadFully(fd, checksum, sizeof(checksum))) {
+                throw std::runtime_error("KVStore: WAL changed during recovery");
+            }
+            if (Crc32(record.data(), record.size()) != LoadU32Le(checksum)) {
+                if (good_offset + record_size != size) {
+                    throw std::runtime_error("KVStore: non-tail WAL corruption; file preserved");
+                }
+                break; // retain compatibility with recovery of a bad final CRC
+            }
+            std::string key = record.substr(header_size, key_len);
+            auto& data = ShardFor(key).data; // construction is single-threaded
+            if (type == RecordType::kDelete) {
+                data.erase(key);
+            } else {
+                const auto expiry = type == RecordType::kSetTtl
+                    ? LoadI64Le(record.data() + header_size + key_len + value_len)
+                    : kNoExpiry;
+                data[key] = Entry{record.substr(header_size + key_len, value_len), expiry};
+            }
+            good_offset += record_size;
+        }
+        if (good_offset < size &&
+            (!TruncateFile(fd, static_cast<off_t>(good_offset)) || !SyncFile(fd))) {
+            throw std::runtime_error("KVStore: failed to durably repair WAL tail");
         }
     }
 
     bool KVStore::AppendRecordLocked(RecordType type, const std::string& key,
                                     const std::string& value, std::int64_t expires_at) {
+        if (failed_.load()) return false;
         // reject oversized fields, recovery would treat them as corrupt
         if (key.size() > kMaxKeyLen) {
             return false;
@@ -353,25 +344,17 @@ namespace kvstore {
 
         const std::string record = SerializeRecord(type, key, value, expires_at);
 
-        // reopen if a failed compaction left the fd closed
-        if (wal_fd_ < 0 && !OpenWalLocked()) {
-            return false;
-        }
-
         // tail offset, for rollback on failure
         const off_t before = ::lseek(wal_fd_, 0, SEEK_END);
         if (before < 0) {
             return false;
         }
 
-        if (!WriteFully(wal_fd_, record.data(), record.size())) {
-            if (::ftruncate(wal_fd_, before) != 0) {}  // roll back partial write
-            return false;
-        }
-
-        // fsync before the record is visible in memory
-        if (::fdatasync(wal_fd_) != 0) {
-            if (::ftruncate(wal_fd_, before) != 0) {}
+        if (!WriteFully(wal_fd_, record.data(), record.size()) || !SyncFile(wal_fd_, true)) {
+            // Both rollback and its durability must be established before continuing.
+            if (!TruncateFile(wal_fd_, before) || !SyncFile(wal_fd_, true)) {
+                failed_.store(true);
+            }
             return false;
         }
         return true;
@@ -388,8 +371,15 @@ namespace kvstore {
         }
 
         Shard& shard = ShardFor(key);
-        std::unique_lock lock(shard.mutex);
-        shard.data[key] = Entry{value, expires_at};
+        std::unique_lock lock(shard.mutex, std::defer_lock);
+        try {
+            lock.lock();
+            shard.data[key] = Entry{value, expires_at};
+        } catch (...) {
+            // WAL may already be durable. Do not serve a divergent memory view.
+            failed_.store(true);
+            throw;
+        }
         return true;
     }
 
@@ -399,16 +389,28 @@ namespace kvstore {
 
     bool KVStore::SetWithTtl(const std::string& key, const std::string& value,
                             std::int64_t ttl_seconds) {
-        std::int64_t expires_at = NowSeconds() + ttl_seconds;
+        const auto now = NowSeconds();
+        if ((ttl_seconds > 0 && now > std::numeric_limits<std::int64_t>::max() - ttl_seconds) ||
+            (ttl_seconds < 0 && now < std::numeric_limits<std::int64_t>::min() - ttl_seconds)) {
+            return false;
+        }
+        std::int64_t expires_at = now + ttl_seconds;
         if (expires_at == kNoExpiry) {
             expires_at += 1;  // avoid the no-expiry sentinel
         }
         return SetInternal(key, value, expires_at);
     }
 
+    void KVStore::CheckReadable() const {
+        if (failed_.load()) {
+            throw std::runtime_error("KVStore: store requires close and reopen after failure");
+        }
+    }
+
     std::optional<std::string> KVStore::Get(const std::string& key) const {
         const Shard& shard = ShardFor(key);
         std::shared_lock lock(shard.mutex);
+        CheckReadable();
         auto it = shard.data.find(key);
         if (it == shard.data.end()) {
             return std::nullopt;
@@ -428,21 +430,30 @@ namespace kvstore {
         }
 
         Shard& shard = ShardFor(key);
-        std::unique_lock lock(shard.mutex);
-        shard.data.erase(key);
+        std::unique_lock lock(shard.mutex, std::defer_lock);
+        try {
+            lock.lock();
+            shard.data.erase(key);
+        } catch (...) {
+            failed_.store(true);
+            throw;
+        }
         return true;
     }
 
     std::size_t KVStore::Size() const {
+        CheckReadable();
         std::size_t total = 0;
         for (const auto& shard : shards_) {
             std::shared_lock lock(shard.mutex);
+            CheckReadable();
             for (const auto& [key, entry] : shard.data) {
                 if (!IsExpired(entry.expires_at)) {
                     ++total;
                 }
             }
         }
+        CheckReadable();
         return total;
     }
 
@@ -451,10 +462,12 @@ namespace kvstore {
     }
 
     std::vector<KeyValue> KVStore::Range(const std::string& start, const std::string& end) const {
+        CheckReadable();
         std::vector<KeyValue> result;
 
         for (const auto& shard : shards_) {
             std::shared_lock lock(shard.mutex);
+            CheckReadable();
             for (const auto& [key, entry] : shard.data) {
                 if (IsExpired(entry.expires_at)) {
                     continue;
@@ -472,6 +485,7 @@ namespace kvstore {
         std::sort(result.begin(), result.end(),
                 [](const KeyValue& a, const KeyValue& b) { return a.key < b.key; });
 
+        CheckReadable();
         return result;
     }
 
@@ -489,75 +503,40 @@ namespace kvstore {
         // lock across the snapshot and swap so no write is lost
         std::lock_guard<std::mutex> wal_lock(wal_mutex_);
 
-        // write live entries to a temp file
-        {
-            const int tmp_fd =
-                ::open(wal_tmp_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (tmp_fd < 0) {
-                return false;
-            }
+        if (failed_.load()) return false;
+        FileDescriptor tmp_fd(::open(wal_tmp_path_.c_str(),
+            O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0644));
+        if (tmp_fd < 0) return false;
+        struct TempCleanup {
+            const std::string& path;
+            ~TempCleanup() { ::unlink(path.c_str()); }
+        } cleanup{wal_tmp_path_};
 
-            bool write_ok = true;
-            for (auto& shard : shards_) {
-                std::shared_lock lock(shard.mutex);
-                for (const auto& [key, entry] : shard.data) {
-                    if (IsExpired(entry.expires_at)) {  // drop expired
-                        continue;
-                    }
-
-                    const RecordType type = (entry.expires_at == kNoExpiry)
-                                                ? RecordType::kSet
-                                                : RecordType::kSetTtl;
-                    const std::string record =
-                        SerializeRecord(type, key, entry.value, entry.expires_at);
-                    if (!WriteFully(tmp_fd, record.data(), record.size())) {
-                        write_ok = false;
-                        break;
-                    }
-                }
-                if (!write_ok) {
-                    break;
-                }
-            }
-
-            // fsync before the rename
-            if (write_ok && ::fdatasync(tmp_fd) != 0) {
-                write_ok = false;
-            }
-            ::close(tmp_fd);
-
-            if (!write_ok) {
-                std::error_code ec;
-                fs::remove(wal_tmp_path_, ec);
-                return false;
+        for (auto& shard : shards_) {
+            std::shared_lock lock(shard.mutex);
+            CheckReadable();
+            for (const auto& [key, entry] : shard.data) {
+                if (IsExpired(entry.expires_at)) continue;
+                const auto type = entry.expires_at == kNoExpiry
+                    ? RecordType::kSet : RecordType::kSetTtl;
+                const auto record = SerializeRecord(type, key, entry.value, entry.expires_at);
+                if (!WriteFully(tmp_fd, record.data(), record.size())) return false;
             }
         }
-
-        // swap the temp file in
-        {
-            if (wal_fd_ >= 0) {
-                ::fsync(wal_fd_);
-                ::close(wal_fd_);
-                wal_fd_ = -1;
-            }
-
-            std::error_code ec;
-            fs::rename(wal_tmp_path_, wal_path_, ec);
-            if (ec) {
-                // rename failed so keep the old log
-                std::error_code rm_ec;
-                fs::remove(wal_tmp_path_, rm_ec);
-                OpenWalLocked();
+        if (!SyncFile(tmp_fd, true)) return false;
+        // Keep the old fd intact until replacement is durable. The temp fd already
+        // has O_APPEND, avoiding an additional fallible reopen after the rename.
+        if (::rename(wal_tmp_path_.c_str(), wal_path_.c_str()) != 0) return false;
+        try {
+            if (!SyncParentDir(wal_path_)) {
+                failed_.store(true);
                 return false;
             }
-
-            // persist the rename
-            SyncParentDir(wal_path_);
-
-            if (!OpenWalLocked()) {
-                return false;
-            }
+        } catch (...) {
+            failed_.store(true);
+            throw;
         }
+        wal_fd_.Reset(tmp_fd.Release());
 
         // drop expired from memory too
         for (auto& shard : shards_) {
