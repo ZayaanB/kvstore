@@ -4,8 +4,9 @@ An embedded key-value store in C++20. Writes go to a binary write-ahead log and
 are `fsync`ed to disk before memory changes, so acknowledged writes survive both
 process crashes and power loss. Every record carries a CRC32 so recovery rejects
 torn or corrupted data instead of trusting it. The index is split into 16 shards
-for concurrency, and a compaction step reclaims dead log space without blocking
-readers. No dependencies beyond the standard library (POSIX for `fsync`).
+for concurrency, and a compaction step reclaims dead log space while allowing
+reads during the rewrite. No dependencies beyond the standard library (POSIX
+for `fsync`).
 
 ## Design
 
@@ -25,17 +26,17 @@ readers. No dependencies beyond the standard library (POSIX for `fsync`).
 ```
 
 - **Sharded index** — each shard has its own `shared_mutex`, so reads run in
-  parallel and writes only lock one shard. No global lock.
+  parallel and each write updates one shard. A global WAL mutex serializes writes.
 - **Write-ahead log** — each `Set`/`Delete` is a binary record (type, key len,
   value len, payload, trailing CRC32) written to `db.wal` and `fdatasync`ed
-  before the in-memory map changes. A failed or partial write is truncated back
-  to the last record boundary so the tail stays valid.
+  before the in-memory map changes. Failed writes trigger a checked, synced
+  rollback; an uncertain rollback disables the store until recovery.
 - **Recovery** — on startup the log is replayed; each record's CRC32 is checked,
   so a torn or corrupted record stops replay cleanly instead of loading garbage.
 - **Compaction** — `Compact()` holds the WAL mutex while it writes live keys to a
   temp file, `fdatasync`s it, and atomically renames it into place (syncing the
-  directory), so no acknowledged write is lost even across power loss. Readers
-  never touch the WAL mutex and keep running.
+  directory). All writes wait for compaction. Readers share shard locks during
+  the rewrite; the final expired-entry cleanup briefly takes exclusive shard locks.
 
 ```cpp
 kvstore::KVStore store("data/mydb.db"); // opens (or creates) and recovers
@@ -61,26 +62,57 @@ The WAL is a flat sequence of self-describing records. Each record is:
 - **`type`** — `1` set, `2` delete, `3` set-with-ttl. A delete has no `value`.
 - **`expires_at`** — Unix seconds; present only for `type == 3` (`*`).
 - **`crc32`** — IEEE CRC32 over every preceding byte of the record.
-- Integers are written in host byte order, so a WAL is single-host, not portable
-  across architectures.
+- Integers use fixed little-endian encoding, independent of host byte order.
 
 `Get`/`Set`/`Delete` are `O(1)` on one shard; `Range`/`Items`/`Size` scan all
 shards and cost `O(n)` (plus an `O(n log n)` sort for ordered results).
 
 ## Durability
 
-`SetInternal`/`Delete` hold `wal_mutex_` across the whole append-then-apply so the
-log order and the visible in-memory state can never diverge. The write path is:
+`SetInternal`/`Delete` hold `wal_mutex_` across the whole append-then-apply so
+successful writes follow the same WAL and in-memory order. The write path is:
 
 1. serialize the record (with its CRC) and `write()` it to the WAL;
 2. `fdatasync()` the WAL so the bytes are on physical media;
 3. only then mutate the shard's map and return success.
 
-If the `write` or `fdatasync` fails, the WAL is `ftruncate`d back to the previous
-record boundary and the call returns `false` without touching memory, so the tail
-is always a run of whole, valid records. On startup `Recover()` replays records
-and stops at the first one whose CRC fails or whose header/payload is short — a
-torn tail from a crash — instead of loading garbage.
+If `write` or `fdatasync` fails, the store attempts to truncate back to the
+previous record boundary **and sync that rollback**. The call returns `false`.
+If either rollback step fails, the store enters a failed state: writes and
+compaction return `false`, and reads throw `std::runtime_error`. Close and reopen
+the store to recover before continuing. A failed operation with an uncertain
+rollback may appear after recovery; it was never acknowledged as successful.
+
+Directory sync failures are checked for WAL creation and compaction replacement.
+Startup also persists the parent entries of database directories. A directory
+sync failure after compaction's rename leaves the store in the same failed state.
+Durability assumes a filesystem and storage stack that honor successful syncs.
+
+Recovery distinguishes read/open errors from EOF and fails startup on I/O errors
+or unsuccessful tail repair. Incomplete final records and a bad CRC on the final
+record are truncated and synced. A CRC mismatch before later records, an invalid
+record type, or an invalid length header fails startup and preserves the WAL for
+inspection. Without independently protected record framing, damaged lengths can
+misidentify boundaries and make some middle corruption look like a damaged final
+record or an incomplete tail.
+
+Memory allocation can throw, including after a WAL record has become durable.
+If applying that record to memory throws, the store enters the failed state and
+rethrows; recovery determines the operation's outcome. Descriptor ownership is
+RAII-based, including during constructor and compaction exceptions.
+
+Database paths are resolved to an absolute location when the store is constructed,
+so later changes to the process working directory cannot redirect compaction.
+Empty paths and paths containing embedded NUL characters are rejected.
+
+Instances require normal C++ lifetime coordination: join callers before destroying
+the store. Do not reuse an inherited instance after `fork()`; its mutexes and
+in-memory index are process-local. Do not externally replace or edit database files
+while the store is open.
+
+`Size`, `Items`, and `Range` provide rolling views across individually locked
+shards, not atomic snapshots. TTLs use wall-clock Unix seconds: zero or negative
+TTLs expire immediately, and TTL arithmetic overflow is rejected with `false`.
 
 > **Format note:** records now end with a CRC32. WAL files written by an earlier
 > version (no CRC) will not replay and should be recreated.
@@ -93,13 +125,17 @@ Needs a C++20 compiler (GCC 11+ / Clang 14+) and CMake 3.20+ on Linux or macOS.
 mkdir build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 cmake --build . -j
-./kvstore_test
+ctest --output-on-failure
 ```
 
 `kvstore_test` runs the stress and crash-recovery suite: concurrent
 writes/reads, a compaction while readers are active, a simulated crash with a
 torn WAL record, and a restart that re-validates everything. It ends with
-`=== ALL TESTS PASSED ===`.
+`=== ALL TESTS PASSED ===`. Its assertions remain enabled in Release builds.
+On Linux, CTest also runs `kvstore_failure_test`: deterministic POSIX failure
+injection, every truncation boundary in a TTL record, concurrent writes with
+compaction, allocation failures, and subprocess exits at WAL/compaction crash
+boundaries. These process-crash tests do not simulate actual power loss.
 
 ## CLI
 
@@ -156,8 +192,7 @@ sharded index into a single global reader-writer lock.
 Three things worth noticing:
 
 - **Sharding is worth ~5x on contended reads** (7.6M -> 40.3M ops/sec at 16
-  threads) and costs nothing when uncontended — single-thread throughput is
-  the same either way.
+  threads). The single-thread results show some overhead (9.2M -> 8.1M ops/sec).
 - **A single global `shared_mutex` scales negatively**: 16 threads read
   *slower* than 1 (9.2M -> 7.6M ops/sec) because every reader bounces the same
   lock word between cores. Sharding exists to fix exactly this.

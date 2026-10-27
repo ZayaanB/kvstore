@@ -11,3 +11,5 @@ compile_commands.json
 .idea/
 *.out
 docs/kvstore_report.pdf
+docs/learning-journal.md
+docs/learning-interview-guide.md

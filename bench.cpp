@@ -7,6 +7,7 @@
 #include <iostream>
 #include <memory>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -23,6 +24,10 @@ constexpr int kKeyspaceSize = 1000;
 // that each run lasts long enough for stable timings (variance <2% across reps)
 constexpr int kReadsPerThread = 1'000'000;
 
+void RequireSuccess(bool success) {
+    if (!success) throw std::runtime_error("benchmark storage operation failed");
+}
+
 // keys overlap across threads so shards actually contend
 std::string MakeKey(int idx) {
     return "bench_key_" + std::to_string(idx % kKeyspaceSize);
@@ -38,7 +43,7 @@ double RunWriteBench(kvstore::KVStore& store, int num_threads) {
         threads.emplace_back([&store, t]() {
             std::string value(64, 'x');
             for (int i = 0; i < kOpsPerThread; ++i) {
-                store.Set(MakeKey(t * kOpsPerThread + i), value);
+                RequireSuccess(store.Set(MakeKey(t * kOpsPerThread + i), value));
             }
         });
     }
@@ -68,7 +73,7 @@ double RunMixedBench(kvstore::KVStore& store, int num_threads) {
                 if (op_dist(rng) < 8) {
                     (void)store.Get(MakeKey(key_idx));
                 } else {
-                    store.Set(MakeKey(key_idx), value);
+                    RequireSuccess(store.Set(MakeKey(key_idx), value));
                 }
             }
         });
@@ -134,7 +139,7 @@ int main() {
         kvstore::KVStore store(db_path);
         std::string value(64, 'r');
         for (int i = 0; i < kKeyspaceSize; ++i) {
-            store.Set(MakeKey(i), value);
+            RequireSuccess(store.Set(MakeKey(i), value));
         }
         double ops = RunReadBench(store, n);
         PrintRow("read", n, ops);
@@ -157,7 +162,7 @@ int main() {
         // pre-populate so reads hit
         std::string value(64, 'z');
         for (int i = 0; i < kKeyspaceSize; ++i) {
-            store.Set(MakeKey(i), value);
+            RequireSuccess(store.Set(MakeKey(i), value));
         }
         double ops = RunMixedBench(store, n);
         PrintRow("mixed", n, ops);
@@ -169,10 +174,10 @@ int main() {
         kvstore::KVStore store(db_path);
         std::string value(64, 'w');
         for (int i = 0; i < kKeyspaceSize; ++i) {
-            store.Set(MakeKey(i), value);
+            RequireSuccess(store.Set(MakeKey(i), value));
         }
         auto start = std::chrono::steady_clock::now();
-        store.Compact();
+        RequireSuccess(store.Compact());
         auto end = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(end - start).count();
         std::cout << "compact(): " << std::fixed << std::setprecision(2) << ms
