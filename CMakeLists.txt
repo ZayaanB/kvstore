@@ -83,7 +83,7 @@ if(BUILD_TESTING)
         target_link_options(kvstore_failure_test PRIVATE
             -Wl,--wrap=open -Wl,--wrap=write -Wl,--wrap=read
             -Wl,--wrap=ftruncate -Wl,--wrap=fdatasync -Wl,--wrap=fsync
-            -Wl,--wrap=rename)
+            -Wl,--wrap=rename -Wl,--wrap=unlink)
         add_test(NAME kvstore_failures COMMAND kvstore_failure_test)
         set_tests_properties(kvstore_failures PROPERTIES TIMEOUT 120)
     endif()

@@ -7,6 +7,7 @@
 #include <charconv>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <latch>
@@ -326,8 +327,7 @@ Trial RunTrial(const Options& options, Workload workload) {
 #endif
         }
         std::error_code error;
-        const auto bytes = fs::file_size(path + ".wal", error);
-        if (!error) trial.wal_bytes = bytes;
+        if (store) trial.wal_bytes = store->WalBytes();
         const auto space = fs::space(db.directory, error);
         if (!error) trial.filesystem_available_bytes = space.available;
         if (trial.errors.empty()) {
