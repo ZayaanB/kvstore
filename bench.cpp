@@ -13,6 +13,7 @@
 #include <latch>
 #include <memory>
 #include <random>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -33,11 +34,12 @@ using Clock = std::chrono::steady_clock;
 using bench::Counts;
 using bench::Rate;
 
-enum Operation { Read, Write, Compact, Reopen, OperationCount };
-constexpr std::array kOperations{"get", "set", "compact", "reopen"};
+enum Operation { Read, Write, Compact, Reopen, BatchWrite, OperationCount };
+constexpr std::array kOperations{"get", "set", "compact", "reopen", "set_batch"};
 constexpr std::array<std::string_view, 5> kWorkloads{"read", "write", "mixed", "compaction", "reopen"};
 constexpr int kKeyBytes = 16;
 constexpr int kValueBytes = 64;
+constexpr unsigned kHotSelectionPercent = 90;
 
 struct Options {
     bool latency = false;
@@ -45,11 +47,15 @@ struct Options {
     unsigned trials = 3;
     unsigned seed = 1;
     unsigned keys = 1000;
+    unsigned hot_keys = 4;
+    unsigned read_percent = 80;
+    unsigned batch_size = 0;
     unsigned ops = 500;
     unsigned read_ops = 1'000'000;
     unsigned warmup = 1000;
     std::vector<unsigned> threads{1, 2, 4, 8, 16};
     std::string workload;
+    std::string distribution;
     std::string json;
     fs::path temp_root = fs::temp_directory_path();
 };
@@ -120,19 +126,23 @@ struct Request {
     bool miss;
 };
 
-Request Next(std::mt19937& rng, const Options& options, Workload workload, std::uint64_t index) {
+Request Next(std::mt19937& rng, const Options& options, Workload workload, std::uint64_t index,
+             std::span<const unsigned> write_keys = {}) {
     const auto selector = rng();
     const auto sample = rng();
-    const auto keyspace = workload.hot && selector % 10 < 9
-        ? std::max(1u, options.keys / 100) : options.keys;
+    const auto write_percent = workload.name == "mixed" ? 100 - options.read_percent : 20;
+    const bool write = workload.name == "write" ||
+        (workload.name != "read" && (index + 1) * write_percent / 100 != index * write_percent / 100);
+    if (write && !write_keys.empty()) return {Write, write_keys[sample % write_keys.size()], false};
+    const auto keyspace = workload.hot && selector % 10 < kHotSelectionPercent / 10
+        ? std::min(options.hot_keys, options.keys) : options.keys;
     const unsigned key = static_cast<unsigned>(sample % keyspace);
-    const bool write = workload.name == "write" || (workload.name != "read" && index % 5 == 4);
     const bool miss = !write && (selector / 10) % 16 == 0;
     return {write ? Write : Read, key, miss};
 }
 
 template <class Action>
-void Measure(Worker& worker, Operation operation, bool latency, Action action) {
+Outcome Measure(Worker& worker, Operation operation, bool latency, Action action) {
     auto& counts = worker.operations[operation];
     Clock::time_point start;
     Clock::time_point end;
@@ -158,6 +168,16 @@ void Measure(Worker& worker, Operation operation, bool latency, Action action) {
         const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
         counts.latency.Add(static_cast<std::uint64_t>(ns));
     }
+    return outcome;
+}
+
+void SubmitBatch(kvstore::KVStore& store, Worker& worker, bool latency, std::vector<kvstore::KeyValue>& batch) {
+    const auto result = Measure(worker, BatchWrite, latency, [&] {
+        return store.SetBatch(batch) ? Outcome::Ok : Outcome::Error;
+    });
+    auto& writes = worker.operations[Write];
+    (result == Outcome::Ok ? writes.ok : writes.errors) += batch.size();
+    batch.clear();
 }
 
 unsigned OpsPerWorker(const Options& options, Workload workload) {
@@ -187,6 +207,24 @@ void RunWorkers(kvstore::KVStore& store, const Options& options, Workload worklo
     std::latch compaction_start(workers + 1);
     bool cancelled = false; // published by start_gate
     std::vector<Worker> results(workload.threads + static_cast<unsigned>(compact));
+    std::array<std::vector<unsigned>, kvstore::kNumShards> keys_by_shard;
+    std::vector<std::span<const unsigned>> shard_keys;
+    if (options.batch_size != 0) {
+        std::array<bool, kvstore::kNumShards> hot_shards{};
+        for (unsigned key = 0; key < options.keys; ++key) {
+            const auto shard = store.ShardForKey(keys[key]);
+            keys_by_shard[shard].push_back(key);
+            if (key < options.hot_keys) hot_shards[shard] = true;
+        }
+        for (std::size_t shard = 0; shard < keys_by_shard.size(); ++shard) {
+            if (!keys_by_shard[shard].empty() && (!workload.hot || hot_shards[shard])) {
+                shard_keys.emplace_back(keys_by_shard[shard]);
+            }
+        }
+    }
+    const auto write_keys = [&](unsigned worker) {
+        return shard_keys.empty() ? std::span<const unsigned>{} : shard_keys[worker % shard_keys.size()];
+    };
     std::vector<std::jthread> threads;
     threads.reserve(results.size());
     const auto wait_for_start = [&] {
@@ -199,11 +237,23 @@ void RunWorkers(kvstore::KVStore& store, const Options& options, Workload worklo
             threads.emplace_back([&, id] {
                 auto& result = results[id];
                 std::mt19937 rng(options.seed + id);
+                std::vector<kvstore::KeyValue> batch;
                 if (!wait_for_start()) return;
+                const auto shard = write_keys(id);
                 for (; result.iterations < minimum_ops; ++result.iterations) {
                     // Release the compactor and the first timed writes together.
                     if (compact && result.iterations == 4) compaction_start.arrive_and_wait();
-                    const auto request = Next(rng, options, workload, result.iterations);
+                    const auto request = Next(rng, options, workload, result.iterations, shard);
+                    if (request.operation == Write && options.batch_size > 1) {
+                        try {
+                            batch.push_back({keys[request.key], value});
+                        } catch (const std::exception& error) {
+                            result.error = error.what();
+                            break;
+                        }
+                        if (batch.size() == options.batch_size) SubmitBatch(store, result, options.latency, batch);
+                        continue;
+                    }
                     Measure(result, request.operation, options.latency, [&] {
                         if (request.operation == Write) {
                             return store.Set(keys[request.key], value) ? Outcome::Ok : Outcome::Error;
@@ -213,6 +263,7 @@ void RunWorkers(kvstore::KVStore& store, const Options& options, Workload worklo
                         return read ? Outcome::Ok : Outcome::Error;
                     });
                 }
+                if (!batch.empty()) SubmitBatch(store, result, options.latency, batch);
                 result.end = Clock::now();
             });
         }
@@ -256,7 +307,7 @@ void RunWorkers(kvstore::KVStore& store, const Options& options, Workload worklo
         for (unsigned id = 0; id < workload.threads; ++id) {
             std::mt19937 rng(options.seed + id);
             for (std::uint64_t i = 0; i < results[id].iterations; ++i) {
-                const auto request = Next(rng, options, workload, i);
+                const auto request = Next(rng, options, workload, i, write_keys(id));
                 if (request.operation == Write) written[request.key] = true;
             }
         }
@@ -274,13 +325,24 @@ Trial RunTrial(const Options& options, Workload workload) {
         keys.reserve(options.keys + 1);
         const std::string initial(kValueBytes, 'a');
         const std::string updated(kValueBytes, 'b');
+        std::array<std::vector<kvstore::KeyValue>, kvstore::kNumShards> seed_batches;
+        const auto seed_batch = [&](std::vector<kvstore::KeyValue>& batch) {
+            if (!batch.empty() && !store->SetBatch(batch)) throw std::runtime_error("failed to populate database");
+            batch.clear();
+        };
         for (unsigned i = 0; i <= options.keys; ++i) {
             const auto digits = std::to_string(i);
             keys.push_back(std::string(kKeyBytes - digits.size(), '0') + digits);
-            if (i < options.keys && !store->Set(keys.back(), initial)) {
-                throw std::runtime_error("failed to populate database");
+            if (i == options.keys) break;
+            if (options.batch_size == 0) {
+                if (!store->Set(keys.back(), initial)) throw std::runtime_error("failed to populate database");
+            } else {
+                auto& batch = seed_batches[store->ShardForKey(keys.back())];
+                batch.push_back({keys.back(), initial});
+                if (batch.size() == 1'000) seed_batch(batch);
             }
         }
+        for (auto& batch : seed_batches) seed_batch(batch);
         std::vector<bool> written(options.keys);
         std::mt19937 rng(options.seed);
         for (unsigned i = 0; i < options.warmup; ++i) {
@@ -445,12 +507,23 @@ void TrialJson(std::ostream& out, const Trial& trial, unsigned number) {
 void ParametersJson(std::ostream& out, const Options& options, Workload workload) {
     const bool reopen = workload.name == "reopen";
     const bool compact = workload.name == "compaction";
-    const int get = reopen || workload.name == "write" ? 0 : workload.name == "read" ? 100 : 80;
-    const int set = reopen ? 0 : 100 - get;
+    const unsigned get = reopen || workload.name == "write" ? 0 :
+        workload.name == "read" ? 100 : workload.name == "mixed" ? options.read_percent : 80;
+    const unsigned set = reopen ? 0 : 100 - get;
     out << "\"workload\":";
     Quote(out, workload.name);
     out << ",\"distribution\":";
     Quote(out, reopen ? "n/a" : workload.hot ? "hot" : "uniform");
+    if (workload.hot) {
+        out << ",\"hot_keys\":" << std::min(options.hot_keys, options.keys)
+            << ",\"hot_selection_percent\":" << kHotSelectionPercent;
+    }
+    if (options.batch_size != 0) {
+        out << ",\"write_batch_size\":" << options.batch_size
+            << ",\"write_key_distribution\":";
+        Quote(out, workload.hot ? "one-hot-shard-per-worker" : "one-shard-per-worker");
+        if (workload.hot) out << ",\"hot_reads_only\":true";
+    }
     out << ",\"threads\":" << workload.threads << ",\"compaction_threads\":" << (compact ? 1 : 0)
         << ",\"seed\":" << options.seed << ",\"keys\":" << options.keys
         << ",\"key_bytes\":" << kKeyBytes << ",\"value_bytes\":" << kValueBytes
@@ -462,7 +535,8 @@ void ParametersJson(std::ostream& out, const Options& options, Workload workload
         << ",\"cache_conditions\":";
     Quote(out, reopen ? "reopen after population; no OS cache eviction"
                       : "prepopulated store; no OS cache eviction");
-    out << ",\"load_model\":\"closed-loop\",\"durability\":\"fdatasync-per-write\"";
+    out << ",\"load_model\":\"closed-loop\",\"durability\":";
+    Quote(out, options.batch_size > 1 ? "fdatasync-per-batch" : "fdatasync-per-write");
 }
 
 void EnvironmentJson(std::ostream& out, const fs::path& root) {
@@ -615,7 +689,15 @@ Options Parse(int argc, char** argv) {
         else if (flag == "--trials") options.trials = Number(value, 1, 1000);
         else if (flag == "--seed") options.seed = Number(value, 0, UINT32_MAX);
         else if (flag == "--keys") options.keys = Number(value, 1, 10'000'000);
-        else if (flag == "--ops") options.ops = Number(value, 1, UINT32_MAX);
+        else if (flag == "--hot-keys") options.hot_keys = Number(value, 1, 10'000'000);
+        else if (flag == "--read-percent") options.read_percent = Number(value, 1, 99);
+        else if (flag == "--batch-size") options.batch_size = Number(value, 1, 1'000);
+        else if (flag == "--distribution") {
+            if (value != "uniform" && value != "hot" && value != "both") {
+                throw std::invalid_argument("unknown key distribution");
+            }
+            options.distribution = value == "both" ? "" : std::string(value);
+        } else if (flag == "--ops") options.ops = Number(value, 1, UINT32_MAX);
         else if (flag == "--read-ops") options.read_ops = Number(value, 1, UINT32_MAX);
         else if (flag == "--warmup") options.warmup = Number(value, 0, UINT32_MAX);
         else if (flag == "--workload") {
@@ -637,6 +719,13 @@ Options Parse(int argc, char** argv) {
                 remaining.remove_prefix(comma + 1);
             }
         } else throw std::invalid_argument("unknown option: " + std::string(flag));
+    }
+    if (options.batch_size != 0 && options.workload != "mixed") {
+        throw std::invalid_argument("--batch-size requires --workload mixed");
+    }
+    const bool includes_mixed = options.workload.empty() || options.workload == "mixed";
+    if (includes_mixed && static_cast<std::uint64_t>(options.ops) * (100 - options.read_percent) < 100) {
+        throw std::invalid_argument("--ops is too small to include a write at the selected read percentage");
     }
     return options;
 }
@@ -670,8 +759,9 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: kvstore_bench [--smoke] [--mode throughput|latency] [--json PATH|-]\n"
                      "       [--engine-metrics on|off] [--trials N] [--threads N[,N...]] [--seed N] [--keys N]\n"
-                     "       [--ops N] [--read-ops N] [--warmup N] [--temp-root DIR]\n"
-                     "       [--workload read|write|mixed|compaction|reopen]\n";
+                     "       [--hot-keys N] [--ops N] [--read-ops N] [--warmup N] [--temp-root DIR]\n"
+                     "       [--workload read|write|mixed|compaction|reopen] [--distribution uniform|hot|both]\n"
+                     "       [--read-percent N] [--batch-size N (mixed only)]\n";
         return 0;
     }
     if (argc == 2 && std::string_view(argv[1]) == "--self-test") {
@@ -715,6 +805,7 @@ int main(int argc, char** argv) {
                 continue;
             }
             for (const bool hot : {false, true}) {
+                if (!options.distribution.empty() && options.distribution != (hot ? "hot" : "uniform")) continue;
                 for (const unsigned threads : options.threads) run({workload, hot, threads});
             }
         }

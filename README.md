@@ -4,8 +4,8 @@ An embedded C++20 key-value store with durable writes and disk-backed point read
 Each of 16 shards has a WAL, a bounded ordered memtable, and immutable sorted
 tables. The engine uses POSIX I/O and has no external library dependencies.
 
-See [Architecture](docs/architecture.md) for the engine, batch runner, lakehouse
-demo, monitoring stack, and current integration boundaries.
+See [Architecture](docs/architecture.md) for the storage engine, local MapReduce
+runner, Spark-to-Iceberg pipeline, and benchmark results.
 
 ```cpp
 kvstore::KVStore store("data/mydb.db");  // Opens or creates a database directory.
@@ -17,16 +17,12 @@ store.Compact();                       // Flush writes and merge sorted files.
 
 ## Storage and recovery
 
-Version 1 stores the shard count, hash identifier, and memory budget in
-`METADATA`. A shard is one of 16 groups of keys. New databases use rendezvous
-consistent hashing. The engine gives each shard a repeatable score for a key
-and picks the highest score. Existing databases keep their recorded routing.
-The shard's checksummed `MANIFEST` lists the newest
-committed generation and last flushed sequence. After compaction, it can also
-select a merged base table. If the newest generation is `n`, the active WAL is
-`(n+1).wal`. The current engine reads databases created before merged tables
-were introduced. Older binaries cannot open shards whose manifests select a
-merged base or databases that use rendezvous hashing.
+The checksummed `METADATA` records the format version, shard count, routing
+algorithm, and memory budget. New databases group keys into 16 shards using
+rendezvous consistent hashing. Each key goes to the shard with the highest
+score for that key. The shard's checksummed `MANIFEST` records the committed
+table generation, last flushed sequence, and any merged base table. For
+generation `n`, the active write-ahead log (WAL) is `(n+1).wal`.
 
 WAL and table records use little-endian sequence (8 bytes), operation (1 byte),
 key and value lengths (4 bytes each), and absolute expiry in Unix seconds
@@ -37,7 +33,12 @@ CRC32 over the preceding bytes. Operation IDs are 1 for Set, 2 for Delete, and
 expired values mask older values. Nonpositive TTLs expire immediately.
 
 Each write appends and syncs its shard WAL before applying the mutation to
-memory. A flush syncs the sorted table and next WAL, syncs their directory
+memory. Use `ShardForKey()` to group updates and `SetBatch()` to submit a
+batch for one shard with a single append sync. A multi-entry batch must fit
+that shard's write buffer. A crash before the call returns can leave some
+or all of the records recoverable.
+
+A flush syncs the sorted table and next WAL, syncs their directory
 entries, and publishes the manifest with a rename and directory sync. Only
 then can it unlink the covered WAL. Startup validates committed tables and
 ignores unpublished tables and retired WALs. It repairs an incomplete active
@@ -55,15 +56,16 @@ caps ordinary WAL replay per shard. A single record above its shard allowance
 uses temporary memory and flushes synchronously. Point reads check the memtable
 and then sorted tables, probing on-disk key ranges and a sparse index. `Size`,
 `Items`, and `Range` read each shard in turn. The vector APIs allocate memory
-for returned results. `Compact()` flushes pending writes, merges multiple sorted
-files in each shard, and removes older versions. The merge publishes its
-replacement before removing the old files.
+for returned results. Once a shard has eight sorted files, its next write
+automatically attempts to merge them. `Compact()` flushes pending writes and
+merges files on demand. The merge publishes its replacement before removing the
+old files.
 
-Use `WalPaths()` in place of `WalPath()`. It returns the current WALs in shard
-order. A flush can change those paths. Use `WalBytes()` for aggregate active WAL size and `DatabasePath()` for
-the database directory. A sibling `<db_path>.lock` prevents concurrent opens.
-Join callers before destroying an instance and reopen the database in any
-child process that uses it after `fork()`.
+`WalPaths()` returns the active paths in shard order, `WalBytes()` reports their
+aggregate size, and `DatabasePath()` returns the database directory. A sibling
+`<db_path>.lock` prevents concurrent opens. Join callers before destroying
+an instance and reopen the database in any child process that uses it after
+`fork()`.
 
 ### Shard recovery and backups
 
@@ -84,51 +86,45 @@ restore command. A checkpoint is a consistent, verified copy of all shards.
 Store it on separate storage to protect against device failure. Restoring shard
 3 replaces that shard with the copy from the checkpoint and leaves other shards
 alone. The previous files stay on disk for diagnosis. Writes to shard 3 made
-after the checkpoint are lost when you restore it.
+after the checkpoint are lost when you restore it. A restored database
+requires a binary that supports its shard pointer and recorded format.
 
-For manual failover after a host loss, take the original service out of service
-so it cannot also accept writes. Copy the verified checkpoint to the replacement
-host, use `--checkpoint` to make a working copy if you want to keep the backup
-unchanged, and point the application at the replacement. Automatic failover
-and live replication between hosts require additional coordination.
+To recover after host loss, ensure the original process can no longer accept
+writes. Copy the checkpoint to the replacement host and point the application
+at a working copy. Recovery reaches the checkpoint's capture point.
 
 ## Offline migration
 
-Close the legacy process before running the migration. Supply the old database
-prefix, which has a sibling `<legacy_db_path>.wal`, and an unused destination.
+Close the source database before migrating and supply an unused destination.
+`--migrate` replays a legacy `<legacy_db_path>.wal` into a new disk-backed
+database. It preserves mutation order and expiration times, skips an
+incomplete trailing record, and rejects a complete record with a bad checksum.
 
 ```bash
 ./build/kvstore_cli --migrate data/legacy.db data/new.db
 ./build/kvstore_cli data/new.db
 ```
 
-For an existing disk-backed database that uses the earlier modulo hashing,
-use `--rehash` instead. It copies all live rows and their absolute expiration
-times into a new database with rendezvous hashing. The source stays available
-for rollback. Stop writes to the source before switching the application.
+`--rehash` copies live rows and their expiration times from a disk-backed
+database using modulo routing into a new database using rendezvous hashing.
 
 ```bash
 ./build/kvstore_cli --rehash data/old-disk-store data/rendezvous-store
 ```
 
-The command locks the source, streams its CRC-protected WAL in order, and
-reopens the staged database to validate it before publishing the destination.
-It ignores an incomplete source tail and rejects complete records with an
-invalid CRC. The source WAL remains available to the legacy engine. If a
-process is killed before publication, it can leave a hidden
-`.kvstore-stage-*` directory beside the destination. It can be removed after
-confirming the migration process has stopped. If switching back after accepting
-writes on the new database, reconcile those writes before using the old one.
+Both commands validate the destination before making it available and preserve
+the source. Stop writes to the source before switching the application.
+Reconcile writes made to the destination before switching back. An interrupted
+migration may leave a `.kvstore-stage-*` directory beside the destination.
 
 ## Build and run
 
 Needs a C++20 compiler (GCC 11+ / Clang 14+) and CMake 3.20+ on Linux or macOS.
 
 ```bash
-mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-cmake --build . -j
-ctest --output-on-failure
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
 ```
 
 `kvstore_test` runs the stress and crash-recovery suite: concurrent
@@ -145,7 +141,7 @@ WAL retirement, and offline migration.
 `kvstore_cli` is an interactive shell (optional db path argument):
 
 ```bash
-./kvstore_cli data/mydb.db
+./build/kvstore_cli data/mydb.db
 ```
 
 ```
@@ -184,11 +180,11 @@ for exporting live rows and querying versions of the resulting table.
 
 ## Benchmark
 
-`kvstore_bench` runs closed-loop point reads, durable writes, 80/20 mixed traffic,
-compaction under mixed traffic, and reopening a populated store. Data workloads
-run against uniform and hot-key distributions. Each trial creates and removes an
-isolated database and verifies the final data, including WAL recovery. Writes
-use the engine's normal `fdatasync` path.
+`kvstore_bench` measures point reads, durable writes, mixed traffic, compaction
+under mixed traffic, and reopening a populated store. Hot-key runs favor four
+keys by default. Use `--hot-keys N` to change that count. Each trial creates an
+isolated database and verifies the final data after reopening. Writes use the
+engine's normal `fdatasync` path.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -204,45 +200,41 @@ Use the same parameters when comparing revisions. Drop `--smoke` for the full
 suite, or use `--help` for workload, thread count, seed, trial count, and sample
 size controls. Select `--mode throughput` to omit per-operation latency sampling
 (the default). To measure the cost of sampling, use the same binary and workload
-settings for both modes and pass `--compare-modes` to the report script. Store
-each report with its two raw JSON files and commands. Keep designated baselines
-until replaced and retain other local runs for 30 days.
+settings for both modes and pass `--compare-modes` to the report script.
 
-### Historical sharding benchmark
-
-Results for the earlier in-memory engine on a 13th-gen Intel i9-13900H (20 hardware threads), Kingston NVMe SSD,
-ext4, Linux, GCC 14 `-O3` (Release). Reads are 1M `Get`s per thread over a
-shared 1,000-key space (run-to-run variance <2%). The baseline column is the
-same binary rebuilt with `kNumShards = 1` in `kvstore.hpp`, which collapses the
-sharded index into a single global reader-writer lock.
-
-| threads | reads, 1 shard (global lock) | reads, 16 shards |
-|--------:|-----------------------------:|-----------------:|
-|       1 |                 9.2M ops/sec |     8.1M ops/sec |
-|       2 |                 8.1M ops/sec |    13.7M ops/sec |
-|       4 |                 8.0M ops/sec |    22.7M ops/sec |
-|       8 |                 7.5M ops/sec |    30.9M ops/sec |
-|      16 |                 7.6M ops/sec |    40.3M ops/sec |
-
-Three things worth noticing:
-
-- **Sharding is worth ~5x on contended reads** (7.6M -> 40.3M ops/sec at 16
-  threads). The single-thread results show some overhead (9.2M -> 8.1M ops/sec).
-- **A single global `shared_mutex` scales negatively**: 16 threads read
-  *slower* than 1 (9.2M -> 7.6M ops/sec) because every reader bounces the same
-  lock word between cores. Sharding exists to fix exactly this.
-- **Writes don't scale, by design** (~235 ops/sec at any thread count, either
-  config): every acknowledged `Set` pays an `fdatasync` under `wal_mutex_`, so
-  write throughput is the disk's flush rate, not a CPU or lock number — see
-  the trade-offs section of `docs/kvstore_report_v2.html`. Group commit is the
-  standard fix.
-
-Mixed 80/20 throughput (~1,200 ops/sec, flat across threads and shard counts)
-is just the write ceiling divided by the write fraction: 235 / 0.2 ≈ 1,175 —
-the 20% of ops that fsync dominate everything else. Compacting 1,000 live keys
-takes ~11 ms.
+The mixed workload defaults to 80% reads. Use `--read-percent 95` for a 95/5
+mix. Use `--batch-size N` with `--workload mixed` to give each worker one shard
+for writes and collect up to N updates per call. Set `--batch-size 1` to
+benchmark individual writes with the same shard assignment. Add
+`--distribution hot` to direct the workers' writes to the shards that hold the
+hot read keys.
+See the [current 95/5 results](docs/architecture.md#benchmarks-and-monitoring)
+and [reproduction command](docs/architecture.md#reproduce-the-read-heavy-benchmark).
 
 ## Local monitoring
+
+Run `./monitor` from the repository root. It starts Prometheus and Grafana,
+then opens the [local launcher](http://127.0.0.1:3001/). Click **Start KVStore**
+to start the app with metrics enabled and run one minute of sample traffic
+against a separate demo database. The launcher automatically connects to a
+KVStore instance already serving metrics on port 9108. Click **Open Grafana**
+to see the live metrics after a few scrapes. The default Grafana login is
+`admin` / `admin`.
+
+The launcher uses Python 3, CMake, and local Prometheus and Grafana binaries.
+If the binaries are unpacked outside the system install locations, supply
+their distribution directories once. The launcher saves those paths for
+later runs.
+
+```bash
+PROMETHEUS_DIR=/path/to/prometheus-distribution GRAFANA_DIR=/path/to/grafana-distribution ./monitor
+```
+
+Use `./monitor --no-open` to print the URL without opening a browser. Ctrl-C
+stops the processes started by the launcher. The demo database, logs, and
+monitoring data are under `build/monitoring/local/`.
+
+### Manual setup and Docker Compose
 
 The CLI can attach an in-process recorder and expose Prometheus metrics on
 loopback. The embedded engine opens no listener. Keys, values and database
@@ -269,8 +261,8 @@ the initial credentials `admin` / `admin`. Use the time range, rate window
 and operation filter to drill into counts and mean, p50, p95 and p99 latency.
 The summary cards show totals across data operations. Expected lookup misses
 count toward throughput and have their own outcome. The dashboard shows WAL
-syncs, explicit compaction, automatic shard flushes, sorted-table writes,
-point lookups that reach sorted tables, and CLI resource use.
+syncs, manual and automatic compaction, automatic shard flushes, sorted-table
+writes, point lookups that reach sorted tables, and CLI resource use.
 
 The database footprint is a best-effort gauge. The exporter omits it when
 files change during the scan or the scan exceeds its entry or time budget.

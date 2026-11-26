@@ -151,15 +151,3 @@ exports, duplicate keys, stale sequences, and commit failure and recovery.
 With `--kvstore-cli`, the check also exports from a real database, publishes two
 versions, reads the older version after publication, and rejects a source with
 missing shard data.
-
-In the local check, the first export had 5 rows and 326 chunk bytes. The
-second had 4 rows and 238 chunk bytes. Fixture capture with sequence
-reservation took 0.076 s, and the first Spark SQL scan took 0.540 s. The
-separate publisher process returned the second export's original snapshot
-ID. The C++ Release build passed all five CTest checks:
-
-```bash
-cmake -S . -B /tmp/kvstore-lakehouse-build -DCMAKE_BUILD_TYPE=Release
-cmake --build /tmp/kvstore-lakehouse-build --parallel 4
-ctest --test-dir /tmp/kvstore-lakehouse-build --output-on-failure
-```

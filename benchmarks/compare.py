@@ -53,8 +53,17 @@ def spread(summary):
     return " / ".join(fmt(summary.get(f"{name}_ops_per_second")) for name in ("min", "median", "max"))
 
 
-def title(params):
-    return f"{params['workload']} · {params['distribution']} · {params['threads']} worker(s)"
+def title(params, include_threads=True):
+    parts = [params["workload"], params["distribution"]]
+    if "hot_keys" in params:
+        parts[-1] += f" ({params['hot_keys']} hot keys)"
+    if params["workload"] == "mixed":
+        parts.append(f"{params['mix_percent']['get']}% reads")
+    if "write_batch_size" in params:
+        parts.append(f"batch size {params['write_batch_size']}")
+    if include_threads:
+        parts.append(f"{params['threads']} worker(s)")
+    return " · ".join(parts)
 
 
 def trial_table(workload):
@@ -198,7 +207,7 @@ def compare(baseline, candidate, allow_mode_change, allow_engine_change):
         )
         # Group by all workload parameters other than thread count.
         series = json.dumps({k: v for k, v in params.items() if k != "threads"}, sort_keys=True)
-        series_label = f"{params['workload']} · {params['distribution']} · {params['keys']} keys"
+        series_label = f"{title(params, include_threads=False)} · {params['keys']} keys"
         if comparable:
             for run, summary in (("baseline", a), ("candidate", b)):
                 rate = summary["ops_per_second"]

@@ -51,6 +51,9 @@ with tempfile.TemporaryDirectory(prefix="kvstore-bench-test-") as root:
         assert len(data["workloads"]) == 17
         assert sum(t["misses"] for w in data["workloads"] for t in w["trials"]) > 0
         for workload in data["workloads"]:
+            params = workload["parameters"]
+            if params["distribution"] == "hot":
+                assert params["hot_keys"] == 4 and params["hot_selection_percent"] == 90
             trials = workload["trials"]
             summary = workload["summary"]
             assert summary["repetitions"] == summary["valid_trials"] == 2
@@ -59,7 +62,10 @@ with tempfile.TemporaryDirectory(prefix="kvstore-bench-test-") as root:
             for trial in trials:
                 assert trial["passed"]
                 check_trial(trial, mode == "latency")
-                if workload["parameters"]["workload"] == "compaction":
+                if params["workload"] == "mixed":
+                    assert trial["operations"]["get"]["attempted"] == 16 * params["threads"]
+                    assert trial["operations"]["set"]["attempted"] == 4 * params["threads"]
+                if params["workload"] == "compaction":
                     assert trial["operations"]["compact"]["ok"] == 1
                     assert trial["maintenance_seconds"] > 0
             for name, counts in summary["operations"].items():
@@ -87,9 +93,11 @@ with tempfile.TemporaryDirectory(prefix="kvstore-bench-test-") as root:
     assert "Build or shard configuration differs" in content and "<svg" not in content
 
     result, recorded = run(root, "--workload", "compaction", "--threads", "1", "--trials", "1",
-                           "--engine-metrics", "on")
+                           "--engine-metrics", "on", "--hot-keys", "3")
     assert result.returncode == 0 and recorded["engine_metrics"]
     for workload in recorded["workloads"]:
+        if workload["parameters"]["distribution"] == "hot":
+            assert workload["parameters"]["hot_keys"] == 3
         resources = workload["trials"][0]["resources"]
         # The 32 fixture keys land in 14 of the 16 shards.
         flushed_shards = 14
@@ -97,6 +105,40 @@ with tempfile.TemporaryDirectory(prefix="kvstore-bench-test-") as root:
         assert resources["wal_sync_latency"]["samples"] == 4 + flushed_shards
         assert resources["compaction_bytes_processed"] == 32 * 109 + flushed_shards * (8 + 52)
         assert resources["bytes_written"] == resources["compaction_bytes_processed"] + 4 * 109
+
+    mixed_args = ("--workload", "mixed", "--distribution", "hot", "--threads", "2",
+                  "--ops", "140", "--trials", "1", "--mode", "latency",
+                  "--read-percent", "95", "--engine-metrics", "on")
+    result, batched = run(root, *mixed_args, "--batch-size", "3")
+    assert result.returncode == 0 and len(batched["workloads"]) == 1, result.stderr
+    workload = batched["workloads"][0]
+    params, trial = workload["parameters"], workload["trials"][0]
+    assert params["mix_percent"] == {"get": 95, "set": 5, "reopen": 0}
+    assert params["write_batch_size"] == 3 and params["hot_reads_only"]
+    assert params["write_key_distribution"] == "one-hot-shard-per-worker"
+    assert trial["completed"] == 280
+    assert trial["operations"]["get"]["latency"]["samples"] == 266
+    assert trial["operations"]["set"]["ok"] == 14 and trial["operations"]["set"]["latency"]["samples"] == 0
+    assert trial["operations"]["set_batch"]["latency"]["samples"] == 6
+    assert trial["resources"]["wal_sync_count"] == 6
+
+    baseline = root / "single-writes.json"
+    candidate = root / "batched-writes.json"
+    candidate.write_text(result.stdout, encoding="utf-8")
+    single_writes, _ = run(root, *mixed_args, "--batch-size", "1")
+    assert single_writes.returncode == 0, single_writes.stderr
+    baseline.write_text(single_writes.stdout, encoding="utf-8")
+    subprocess.run([sys.executable, sys.argv[2], str(baseline), str(candidate), "--output", str(report)], check=True)
+    content = report.read_text(encoding="utf-8")
+    assert "95% reads · batch size 1" in content and "95% reads · batch size 3" in content
+    assert "Unmatched workload parameters" in content and "<svg" not in content
+
+    invalid_mix = subprocess.run(
+        [sys.argv[1], "--smoke", "--workload", "mixed", "--read-percent", "99", "--json", "-"],
+        capture_output=True, text=True, check=False,
+    )
+    assert invalid_mix.returncode != 0 and not invalid_mix.stdout
+    assert "too small to include a write" in invalid_mix.stderr
 
     result, failed = run(root, "--workload", "write", "--keys", "1", "--threads", "1",
                          "--trials", "1", "--mode", "latency", "--engine-metrics", "on", preexec_fn=limit_wal_size)

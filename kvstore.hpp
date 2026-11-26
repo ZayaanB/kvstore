@@ -4,8 +4,10 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace kvstore {
@@ -63,6 +65,11 @@ public:
     // I/O failures return false. Reads throw after an uncertain failure.
     // Degraded mode isolates the affected shard. Allocation errors can throw.
     bool Set(const std::string& key, const std::string& value);
+    // Groups ordinary Set records for one shard into one WAL append sync.
+    // A multi-entry batch must fit that shard's write-buffer budget.
+    // A crash before success can leave some or all records recoverable.
+    bool SetBatch(std::span<const KeyValue> entries);
+    std::size_t ShardForKey(std::string_view key) const noexcept;
     bool SetWithTtl(const std::string& key, const std::string& value, std::int64_t ttl_seconds);
     std::optional<std::string> Get(const std::string& key) const;
     bool Delete(const std::string& key);

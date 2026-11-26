@@ -4,8 +4,8 @@ groups:
       - alert: KVStoreErrorRateHigh
         expr: |
           (
-            sum by (job, instance) (rate(kvstore_operations_total{job="kvstore",operation=~"get|set|set_ttl|delete|size|range",outcome="error"}[1m]))
-            / sum by (job, instance) (rate(kvstore_operations_total{job="kvstore",operation=~"get|set|set_ttl|delete|size|range"}[1m]))
+            sum by (job, instance) (rate(kvstore_operations_total{job="kvstore",operation=~"get|set|set_batch|set_ttl|delete|size|range",outcome="error"}[1m]))
+            / sum by (job, instance) (rate(kvstore_operations_total{job="kvstore",operation=~"get|set|set_batch|set_ttl|delete|size|range"}[1m]))
             > 0.05
           ) and on(job,instance) (up{job="kvstore"} == 1)
         for: 1m

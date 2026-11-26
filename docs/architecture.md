@@ -1,6 +1,6 @@
-# KVStore architecture and audit
+# KVStore architecture
 
-**Keep the name `kvstore`.** The product is an embedded, disk-backed key-value engine. The batch runner, lakehouse publisher, benchmark tools, and monitoring stack are companion components. A more descriptive project subtitle is **Embedded key-value storage with local data processing and observability**. A name such as “lakehouse” or “distributed database” would imply that the project already provides shared analytical tables directly or serves data across hosts.
+Keep the repository name `kvstore`. Its main job is to store and retrieve values by key. It is **embedded**, which means the C++ library runs inside the application on one machine. Recent writes stay in memory for quick reads, and the engine keeps data on disk so the database can grow beyond the write buffer. A fixed view of the data also feeds local MapReduce jobs and Spark-to-Iceberg analytics.
 
 ## System at a glance
 
@@ -13,17 +13,17 @@ flowchart LR
     Engine --> Recorder["Optional metrics recorder"]
     Recorder --> Exporter["CLI /metrics endpoint"]
     Exporter --> Prometheus --> Grafana
+    Launcher["Local monitor launcher"] -.-> App
+    Launcher -.-> Grafana
     Bench --> Results["JSON benchmark runs"]
     Results --> Compare["HTML comparison"]
-    TSV["Fixture shard files"] --> MR["Local MapReduce runner"]
-    Snapshot --> MR
-    MR --> Output["Atomic result file"]
-    Fixture["Python snapshot fixture"] --> Manifest["JSONL chunks and manifest"]
-    Snapshot --> Manifest
+    Snapshot --> MR["Local MapReduce"]
+    MR --> Output["Result file"]
+    Snapshot --> Manifest["Export files and manifest"]
     Manifest --> Spark --> Iceberg["Iceberg table snapshots"]
 ```
 
-Both data-processing paths can stream a live database snapshot. A snapshot shows the data as it existed at one time. The fixtures remain available for testing each tool by itself. The engine, benchmark harness, CLI, and telemetry recorder run without Spark, Iceberg, or Grafana.
+Both data-processing paths stream a snapshot, a view of the database at a single point in time. The embedded engine, CLI, and benchmark harness have no runtime dependency on the analytics or monitoring services.
 
 | Component | Entry point | Present behavior |
 | --- | --- | --- |
@@ -32,119 +32,138 @@ Both data-processing paths can stream a live database snapshot. A snapshot shows
 | Batch computation | [mapreduce.hpp](../mapreduce.hpp), [word_count_main.cpp](../examples/word_count_main.cpp) | Single-worker mapper, disk-backed shuffle, and word count from a database or fixture |
 | Analytical publication | [lakehouse/export.py](../lakehouse/export.py), [lakehouse/publish.py](../lakehouse/publish.py) | Verified database snapshots published to a local Spark/Iceberg table |
 | Performance measurement | [bench.cpp](../bench.cpp), [benchmarks/compare.py](../benchmarks/compare.py) | Repeatable workload trials, latency distributions, JSON, and baseline comparison |
-| Observability | [metrics.cpp](../metrics.cpp), [monitoring/compose.yml](../monitoring/compose.yml) | Live Prometheus metrics, a Grafana dashboard, and local alerts |
+| Observability | [monitor](../monitor), [metrics.cpp](../metrics.cpp) | Browser-based status and app launcher, plus Prometheus metrics, Grafana panels, and alerts |
 
 ## Embedded storage engine
 
-The C++20 API maps a binary key to one binary value and optional absolute expiration. Keys can be up to 1 MiB and values up to 256 MiB. Applications define any schema inside those values. Operations are local to the process. The CLI adds a text interface, while the C++ API supports arbitrary bytes.
+Each key identifies one value, with an optional expiration time. The C++ API accepts arbitrary bytes, so the application decides whether a value contains text, a structured record, or other data. Keys can be up to 1 MiB and values up to 256 MiB. The command-line interface accepts text commands.
 
-Each shard is a group of keys stored in its own directory. New databases use **rendezvous consistent hashing**. The engine hashes the key bytes, computes a score for each of the 16 shard IDs, and picks the highest score. If a future system adds a shard, a key moves only when the new shard beats its current owner. If a shard is removed, only keys owned by that shard need to move. KVStore keeps the count fixed at 16 and has no live resharding. [Routing implementation](../routing.hpp)
+Each **shard** is a group of keys stored in its own directory. For new databases, **rendezvous consistent hashing** gives each of the 16 shards a repeatable score for a key and picks the highest score. In a routing test, adding a candidate moves only keys that pick it as their new winner. Removing a candidate moves only keys it used to own. The running database keeps all 16 shards fixed. Its `METADATA` file records the format, routing, shard count, and write buffer size. [Routing implementation](../routing.hpp)
 
-Checksummed `METADATA` records the format version, routing algorithm, shard count, and in-memory write budget. Older databases retain their FNV-1a modulo routing so existing keys stay where they were written. The offline `--rehash` command can copy their live rows and expiration times into a fresh database using the new routing.
+Each shard has three main parts.
 
-Each shard has a memtable, which is the in-memory write buffer, a write-ahead log (WAL), which records writes for crash recovery, and immutable sorted disk files called SSTables. The checksummed `MANIFEST` tells recovery which files are current. For newest generation `n`, the active WAL is `(n+1).wal`. If there is a merged base table, it replaces all earlier generations. The sibling advisory lock permits one open instance per database. Symlink aliases resolve to the same lock identity.
+- A **memtable** holds recent writes in an ordered in-memory buffer.
+- A **write-ahead log (WAL)** records changes on disk so the engine can replay them after a crash.
+- **Sorted tables (SSTables)** hold data flushed to disk. Keys are stored in order, and the files stay fixed once written. The shard's `MANIFEST` lists which files recovery should use.
+
+A lock file permits one open instance per database. Opening through a symbolic link uses the same lock.
 
 ### Write and read paths
 
-1. A write selects the shard under the global writer mutex and takes the shard's exclusive lock. If the new record would exceed the shard's remaining memory allowance, it flushes the existing buffer first.
-2. The engine appends the mutation with the next shard-local sequence, writes the lengths, type, expiry and CRC32, and calls `fdatasync`. It applies the change in memory only after that call succeeds. If an append fails, it attempts a synced rollback to the previous WAL boundary.
-3. The default 16 MiB memtable budget is divided across the shards. A record larger than its shard's allowance can be written and flushed synchronously. The budget accounts for retained write data and WAL replay. Total process memory also includes oversized records, results returned to callers, and other allocations.
-4. A point read looks in the memtable, then probes SSTables from newest to oldest using key ranges and an on-disk sparse index. The newest delete or expired record masks older versions. Returned values and selected on-disk records that suppress visibility are checksum-verified.
-5. Range scans visit shards in turn, resolve visible versions, and sort collected results by key. `Size()` counts without materializing the values. `Items()` and `Range()` return vectors that may grow with the result set. Concurrent writes can produce a rolling view across shards.
+1. **Make room.** The default write buffer is 16 MiB, split across 16 shards. If a write would overfill its shard's buffer, the engine first writes that buffer to a sorted disk file. A single oversized write can still take the normal write path and flush during the call.
+2. **Save the changes.** The engine appends an ordered record for each change to the WAL. Each record has a checksum, a value used to detect corruption. `Set()` requests one WAL sync per call. `SetBatch()` usually appends several records with one system call and one sync. A sync asks the operating system to make the log durable. The engine updates the buffer and reports success after the sync succeeds. If the append or sync fails, it tries to roll the WAL back to its prior size.
+3. **Group batch writes by shard.** Use `ShardForKey()` first. A multi-entry batch must fit within that shard's share of the write buffer. A batch that spans shards or exceeds the limit returns `false` before logging any updates. If a key appears more than once, its last update wins.
+4. **Read the newest copy.** A single-key lookup checks the write buffer first, then the disk tables from newest to oldest. The disk lookup uses each table's key range and an index that records where blocks start. A delete marker or expired entry hides older values. The engine checks the on-disk records it uses to decide whether to return the value.
 
-Memtable reads use per-shard shared locks. Writes and flushes serialize on the global writer mutex. Disk-backed lookups and scans also share a disk-read mutex, which limits concurrent disk work. The engine relies on the operating system's file cache. There is no engine-managed block cache.
+A global lock makes writes and flushes take turns. A write also holds its shard's lock so readers see a completed update or batch. Other shards can keep serving single-key reads. Disk lookups and scans share another lock, and the operating system can serve repeated disk reads from its cache.
 
-### Flush, restart, and migration
+`Size()` counts rows without loading every value. `Range()` and `Items()` gather and sort their results in memory. They visit shards in turn, so a scan can reflect writes from different moments. Use a snapshot when the entire scan must reflect one moment.
 
-A flush writes and syncs a new SSTable and the next WAL. It syncs their directory entries, publishes the new manifest by rename, and syncs the directory again before retiring the previous WAL. A failure before publication can leave files that the old manifest does not reference. A failure after rename but before the final directory sync leaves an uncertain outcome. The engine then requires a reopen, and a write that was never acknowledged may survive recovery.
+### Flush and restart
 
-Startup validates the metadata, manifests, committed table indexes, record order, and checksums. It replays the active WAL for each shard and can repair an incomplete trailing record. The existing format also truncates a complete final record with a CRC mismatch. This preserves the established torn-tail policy but can discard a previously acknowledged record if the final record was corrupted after its sync. Record lengths and sparse-index entries lack independent checksums, so some post-open corruption can escape a point lookup and a damaged length can obscure a WAL boundary. The crash tests cover process exits and injected errors. Durability during actual power loss depends on the filesystem and device honoring syncs.
+A **flush** turns a shard's write buffer into a sorted file. The engine syncs the new table and creates the next WAL, then saves those directory changes. It switches the manifest to the new files and syncs the directory again before removing the old WAL. If that last sync fails, the engine requires a reopen to learn which file set survived. An unacknowledged write can survive such a failure.
 
-The CLI's offline migration streams a legacy CRC-protected WAL into a staged version-1 database. It keeps both process locks, preserves mutation order and absolute TTLs, reopens the staged destination to validate it, and then publishes the directory. The legacy WAL remains available. The format and command are described in the [README](../README.md#offline-migration).
+On restart, the engine checks the active files and replays the WAL to rebuild recent writes. It can discard an incomplete final record or a final record with a bad checksum. Each batch uses the same record format as a single write, so an interrupted batch can leave some of its records on disk and recover partially. A bad final checksum can also discard an acknowledged record damaged after the sync. Length fields and block offsets have no separate checksums, so some corruption after startup can make a lookup miss a record or make recovery misread a record boundary. Crash durability depends on the filesystem and device honoring syncs.
 
 ### Compaction and snapshots
 
-`Compact()` first flushes pending writes, then merges multiple sorted files per shard. Compaction keeps the newest version for each key and drops deleted or expired entries when the merge covers all older files. It reads two sorted inputs at a time, syncs the merged output, publishes the new manifest, and only then retires the old files. Automatic flushes still create separate tables until compaction is run. Older binaries cannot read a manifest that selects a merged base.
+**Compaction** merges sorted files so reads have fewer files to check. When a shard has eight sorted files, its next write attempts a merge. The merge happens during the write and can delay other writes and reads on that shard. A recoverable merge failure leaves the current files in use. The next attempt follows another flush. `Compact()` also flushes and merges on demand. Both paths keep the newest value and can drop deleted or expired entries when every older copy is covered. The engine syncs the merged file and switches the manifest before removing the files it replaced.
 
-`OpenSnapshot()` holds the writer lock while streaming rows. That keeps all 16 shards at one point in time and gives every row the same expiration cutoff. It reads from memory and disk a row at a time, so memory does not grow with the number of results. Point reads can continue. Writers wait until the snapshot reaches its end or is destroyed. The same thread must open, consume, and close it.
+`OpenSnapshot()` streams rows one at a time so the entire result need not fit in memory. It holds the writer lock to keep all 16 shards and their expiration cutoff fixed at the capture time. Single-key reads can continue. Writes wait until streaming finishes or the snapshot is closed. Open, consume, and close it on the same thread.
 
 ### Shard isolation, restore, and failover
 
-In strict mode, a shard failure can stop the whole database. Optional degraded mode quarantines the affected shard, taking it out of service. Healthy shards can still serve point requests. Reads on a quarantined shard raise an error, and scans, counts, and snapshots fail rather than returning incomplete results.
+In the default strict mode, a shard failure can stop the whole database. In **degraded mode**, the engine takes the damaged shard out of service. The healthy shards can still read and write individual keys. Requests to read a damaged shard report an error. Whole-database scans, counts, and snapshots require every shard.
 
-A checkpoint is a consistent, validated copy of all the active database files. It can run through the embedded API while writes wait, or from the CLI once other processes have closed the database. To restore a shard, the operator selects a checkpoint with the same database identity and routing. The engine verifies the replacement and switches the shard's current-directory pointer atomically, leaving the earlier files available for diagnosis. Only the selected shard is rolled back.
+A **checkpoint** is a verified copy of the database at one point in time. It can be made through the C++ API while writes wait, or from the CLI after other processes close the database. To restore one shard, the engine verifies a replacement from a checkpoint of the same database and switches that shard to the replacement in one rename. Other shards keep their current data. The old shard files stay available for diagnosis. For databases using legacy routing, restore records the new format before switching the shard so an older binary refuses to open stale files.
 
-If the entire host is lost, the operator can bring up a copy of the checkpoint on another host. This is manual failover, meaning a human redirects the application after ensuring the original host cannot still accept writes. Recovery is limited to data in the checkpoint. Continuous replication and automatic failover would need a way for hosts to agree on which one can write.
+After host loss, an operator can bring up the latest checkpoint on another host and redirect the application once the original host can no longer accept writes. Recovery reaches the point captured by that checkpoint.
 
 ## Local MapReduce
 
-The runner consumes a caller-supplied `SnapshotCursor` one row at a time. A mapper can emit multiple intermediate pairs. Routing uses the emitted key so matching terms from different source files reach the same reducer group. The shuffle sorts bounded in-memory batches and spills runs to temporary disk. A bounded-fan-in merge creates ordered runs, and a reducer streams values from one group, so a large group need not fit in RAM.
+One local worker runs three steps against a live snapshot or sample files.
 
-The single worker runs partition by partition. The map buffer has a byte limit. As documented in [mapreduce.hpp](../mapreduce.hpp), merge memory can grow with fan-in because each reader holds a record, and caller callbacks own their allocations. The temporary disk budget includes shuffle runs, intermediate merge output, and the staged result. A successful job syncs the result, renames it over the destination, and syncs the parent directory. Failure before publication preserves the previous result. After rename, a directory sync failure is reported as uncertain publication.
+1. **Map.** Read one input row at a time and emit intermediate key-value pairs. In word count, the mapper emits `(word, 1)` for each word.
+2. **Shuffle.** Group pairs by the key the mapper produced. The worker sorts batches in memory and writes them to temporary files when the buffer fills. It merges a limited number of files at a time.
+3. **Reduce.** Read one group at a time and combine its values. Word count adds the ones to get a total for each word.
 
-The word-count example accepts immutable tab-delimited fixture files or `--database` for a real KVStore. It lowercases ASCII letters, emits `(word, 1)`, and adds counts with overflow checks. The shuffle groups terms by the key the mapper emits. This job partitioning is separate from the database's rendezvous hashing. The runner uses one local worker.
+The job's groups depend on the keys emitted by the mapper, so matching words end up together regardless of where their input rows were stored. A large group can stream from disk. Each open file reader still holds one record in memory, and callbacks manage their own memory. The temporary disk budget covers intermediate files and the staged result. The worker syncs the result before using a rename to replace the destination. [MapReduce API](../mapreduce.hpp)
 
 ## Spark and Iceberg publication
 
-The Python producer allocates a monotonically increasing capture sequence under a local coordinator lock and serializes a supplied frozen view. It preserves binary keys and values with base64, evaluates expiration at the capture timestamp, and writes bounded JSONL chunks. After the chunks are synced, it publishes a completion manifest with the export ID, schema version, capture time and sequence, row counts, sizes, and SHA-256 digests.
+KVStore handles individual key lookups. The lakehouse pipeline uses **Spark** to process rows and **Iceberg** to track a table's schema and versions over data files. SQL queries can read any retained version. The table has named columns for keys, values, and timestamps. Keys and values keep their original bytes. A query that needs fields inside a value must decode that value first.
 
-The publisher validates the manifest and listed chunks into a private input directory. Spark decodes the binary columns, checks row counts and key uniqueness, and writes a full replacement as Parquet through Iceberg. Each Iceberg snapshot records the export identity and sequence. A retry checks snapshot history for a matching commit, and an older capture cannot replace a newer current snapshot. Iceberg retains historical versions according to its snapshot retention settings. The [lakehouse runbook](../lakehouse/README.md) describes the local catalog and verification workflow.
-
-KVStore remains the point-read engine. Iceberg supplies analytical tables with version history. The Python exporter reads a binary stream from the CLI and writes the completion manifest only after the engine reaches the end of the snapshot and exits successfully. An incomplete or unreadable source therefore cannot reach Iceberg publication.
+The Python exporter streams the database at one capture time and gives the export a sequence number. It writes chunks of newline-delimited JSON and uses base64 to carry arbitrary bytes as text. Once the stream finishes successfully, it writes a manifest that lists the chunks, row counts, and checksums. The publisher verifies the manifest and chunks before Spark checks that keys are unique and writes a full replacement table as Parquet, a column-oriented file format. Each Iceberg commit records which export it came from. That lets a retry find a completed commit and prevents an older export from replacing a newer table. [Lakehouse runbook](../lakehouse/README.md)
 
 ## Benchmarks and monitoring
 
-`kvstore_bench` runs closed-loop reads, durable writes, mixed traffic, a flush co-scheduled with mixed traffic, and reopen trials. It uses seeded uniform and hot-key workloads, isolated directories, a synchronized start, a monotonic clock, and checks final data outside the timed interval. It reports completed ops/s, attempted ops/s, failure rates, and per-operation mean and p50/p95/p99 latency in latency mode. Expected misses count as completed reads. Across valid trials, the reported average divides total completed operations by total measured time. The report also shows the median, range, and sample counts.
+`kvstore_bench` measures reads, durable writes, mixed traffic, compaction during traffic, and reopen time. Each trial starts with a fresh store and checks the data after reopening. **Throughput** is the number of completed operations per second. Each key written in a batch counts as one operation. Looking up a key that was deliberately left absent also counts as a completed read. **p99 read latency** is the time within which roughly 99 out of 100 reads finished.
 
-The HTML comparison pairs matching workload parameters and suppresses deltas when the host, compiler, build type, shard count, or an unapproved telemetry setting differs. The artifact records revision and dirty state at configure time. Reconfigure after changing the revision, and keep compiler flags and environmental conditions matched separately. The smoke suite checks the harness and the report. It provides no statistically controlled performance comparison, cold-cache benchmark, or measurement of absolute memory usage beyond RAM.
+The 95% read and 5% write comparison used a Release build, four threads, and 1,000 preloaded keys. For reads that target existing keys, 90% of selections favor four hot keys and the other 10% use the full keyspace. Each worker writes to one of the shards holding those hot keys. Each batch size ran three trials totaling 456,000 reads and 24,000 writes.
 
-The live recorder keeps counters and bounded latency histograms, which group request times into buckets. The CLI optionally exposes `/metrics` over IPv4, defaulting to loopback. The exporter avoids the engine's storage locks, and metrics labels exclude keys, values, and database paths. Prometheus collects metrics and evaluates alerts. Grafana shows rolling throughput, latency, errors, WAL syncs, table writes, flush activity, disk lookups, and resource use. Alerts cover error rate, low disk space, missing telemetry, and quarantined shards.
+| Writes per call | Total ops/s | p99 read latency | p99 write call latency |
+| ---: | ---: | ---: | ---: |
+| 1 | 4,247 | 6.53 µs | 360.71 ms |
+| 100 | 313,943 | 2.56 µs | 14.16 ms |
+| 500 | 1,221,288 | 1.92 µs | 12.32 ms |
+| 1,000 | 1,907,559 | 1.47 µs | 13.63 ms |
+
+This run used an Intel i9-13900H. The 1,000 preloaded keys fit in memory. Workers collect writes during the read loop and submit them in bursts. Write call latency starts when the batch is submitted and includes time waiting for locks and syncing the WAL. Throughput also includes time spent collecting the batch. The largest batch size produced 24 timed write calls, so its p99 reflects the slowest calls in a small sample.
+
+### Reproduce the read-heavy benchmark
+
+Use a Release build and run the four configurations sequentially. Each uses the same hot keys, read/write ratio, and write-shard assignments.
+
+```bash
+mkdir -p build/benchmarks/read-heavy-hot-shards
+for size in 1 100 500 1000; do
+  ./build/kvstore_bench --workload mixed --distribution hot --read-percent 95 \
+    --hot-keys 4 --threads 4 --trials 3 --ops 40000 --batch-size "$size" --mode latency \
+    --json "build/benchmarks/read-heavy-hot-shards/batch-$size.json" || break
+done
+```
+
+The HTML report compares matching workload parameters and checks the host, compiler, build type, shard count, and telemetry settings before showing percentage changes. Benchmark JSON records the revision at configure time. Reconfigure after changing revisions and use matching compiler flags and test conditions.
+
+### Monitoring
+
+Run `./monitor` to start monitoring and open the browser launcher. The CLI can expose a local `/metrics` endpoint with operation counts and timing buckets. It omits keys, values, and database paths from metric labels and avoids taking storage locks. Prometheus collects the measurements and checks four alert conditions. Grafana shows how throughput, latency, errors, and storage activity change over time. Its live charts count each `SetBatch()` call as one request. The benchmark reports each key written as an operation. [Monitoring setup](../README.md#local-monitoring)
 
 ## Resume bullets and explanations
-
-Keep the repository name `kvstore`. On the resume, the project header can highlight disk-backed storage.
 
 **Embedded Key-Value Store (Disk-Backed)** | *C++20, Linux, Spark, Iceberg, Prometheus, Grafana*
 
 ### Recommended four
 
-- Benchmarked **25.9M read ops/s** at **1.09 µs p99 latency** across 48M in-memory lookups with 16 threads.
+- Measured **1.91M ops/s** at **1.47 µs p99 read latency** on a warm 95/5 workload with 1,000-write batches.
 
-  The benchmark ran three trials with 16 threads and 1,000 preloaded keys, choosing keys uniformly. The figures come from the same run with latency sampling enabled. Throughput is completed lookups per second. The p99 is the time within which about 99% of individual lookups completed. [Benchmark harness](../bench.cpp)
+  For every 100 operations, 95 were reads and five were writes. Four workers read mostly from a small set of frequently used keys and wrote in groups of 1,000, with one durable log sync per group. Each read or key update counted as one operation. About 99 out of 100 reads finished within 1.47 microseconds. [Benchmark setup and results](#benchmarks-and-monitoring)
 
-- Stored **12 MiB with a 1 MiB write buffer** by flushing writes to sorted disk files across **16 disk-backed shards**.
+- Stored **12 MiB with a 1 MiB write buffer** by flushing updates to sorted files across **16 shards**.
 
-  The check inserted 768 values of 16 KiB each, then overwrote and deleted some keys. After closing and reopening the store, it verified point and range reads. The 1 MiB budget applied to the write buffer, while total process memory also includes other allocations. [Write and read paths](#write-and-read-paths)
+  A local capacity check inserted 768 values of 16 KiB each. As the buffer filled, the engine moved data to disk. After updating and deleting some keys, the check reopened the store and verified single-key reads and a range scan. The 1 MiB figure is the configured limit for recent writes. Other parts of the process use memory too. [Write and read paths](#write-and-read-paths)
 
-- Kept **15 of 16 shards** readable during a simulated failure by isolating one shard and restoring it from backup.
+- Kept **15 of 16 shards** readable by isolating a failed shard, then restored it from backup.
 
-  The check removed one shard's data file, opened the store in degraded mode, and read one key from each healthy shard. It then restored the affected shard from a checkpoint and verified its value after reopening. A checkpoint is a verified copy of the database at one point in time. [Shard recovery tests](../tests/failure_tests.cpp)
+  A shard holds part of the database. The test made one shard's data file unavailable and read a known key from each of the 15 healthy shards. It then restored the damaged shard from a verified backup and checked the restored value after reopening. [Shard recovery tests](../tests/failure_tests.cpp)
 
-- Enabled historical SQL queries on **2 Iceberg table versions** by streaming consistent snapshots through Spark.
+- Enabled SQL queries on **2 Iceberg table versions** by publishing database snapshots with Spark.
 
-  The integration test published two snapshots from a real KVStore database. It verified that current queries saw the updates and deletes, while a query pinned to the first snapshot still returned the old values. The project implements the export and publication pipeline using Apache Spark and Apache Iceberg. [Live export verification](../lakehouse/verify.py)
+  The test exported the live database, changed and deleted keys, then exported it again. Spark published both exports into an Iceberg table. A query against the newest version saw the changes, and a query against the first version still saw the original data. KVStore supplies the snapshot and export pipeline. Spark and Iceberg provide the processing and versioned table. [Live export verification](../lakehouse/verify.py)
 
 ### Alternate bullets
 
-- Kept **15 of 16 shards** open to reads during a single-shard write by locking only the affected shard.
+- Kept **15 of 16 shards** open to reads during a single-shard write using per-shard read/write locks.
 
-  A write holds an exclusive lock on its target shard through the write-ahead log update, memory update, and any flush it triggers. Other shards can still serve point reads. The global writer lock serializes writes, and disk-backed reads also share a disk-read lock. [Locking and write path](#write-and-read-paths)
+  A write blocks reads on its own shard while it saves changes and updates memory. Readers can still look up keys on other shards. A separate lock makes all writers take turns. [Locking and write path](#write-and-read-paths)
 
 - Made writes durable across **16 shards** by syncing a checksummed log before updating the in-memory buffer.
 
-  The write-ahead log records each change before the engine updates the in-memory buffer. The disk sync makes acknowledged writes recoverable when storage honors the sync, and the checksum helps detect corrupted records during replay. [Flush and restart](#flush-restart-and-migration)
+  The write-ahead log records each change before the engine updates the in-memory buffer. The disk sync makes acknowledged writes recoverable when storage honors the sync, and the checksum helps detect corrupted records during replay. [Flush and restart](#flush-and-restart)
 
-- Averaged **28.9M read ops/s** across 3 trials by benchmarking 16 concurrent readers on 1,000 preloaded keys.
+- Reduced **8 sorted files to 1** in a storage test by triggering compaction automatically during writes.
 
-  This is the uniform read workload in throughput-only mode. Latency sampling was off for this measurement. [Benchmark harness](../bench.cpp)
-
-- Sustained **25.1M read ops/s at 1.95 µs p99** on a 16-thread workload concentrated on frequently accessed keys.
-
-  This is the hot-key workload, where most requests target a small subset of keys. Both figures came from the same latency-enabled benchmark across three trials. [Benchmark harness](../bench.cpp)
-
-- Reduced **3 disk files to 1** in a compaction test by merging sorted files and removing superseded records.
-
-  The test wrote two versions of one key and then deleted it. Compaction merged the three sorted data files into a single table and kept the key deleted after reopening. The count refers to those data files. [Compaction tests](../tests/failure_tests.cpp)
+  The test filled one shard with eight sorted files. The next write automatically merged them and left one active sorted file for that shard. The test reopened the database and checked that the latest write was still there. [Compaction tests](../tests/failure_tests.cpp)
 
 - Preserved deletes through **2 simulated compaction crashes** by publishing merged tables before removing old files.
 
@@ -158,29 +177,6 @@ Keep the repository name `kvstore`. On the resume, the project header can highli
 
   Prometheus checks the metrics exposed by the engine. A quarantined shard is one the engine has taken out of service after detecting a failure. Grafana shows the metrics and alert status. [Alert rules](../monitoring/alerts.yml)
 
-### Reproduce the read benchmarks
+## Verification
 
-Run these separately from an idle machine with a Release build. Both commands record the uniform and hot-key workloads. To report throughput and latency together, use both figures from the same latency-enabled result.
-
-```bash
-./build/kvstore_bench --workload read --threads 16 --trials 3 --mode throughput --json throughput.json
-./build/kvstore_bench --workload read --threads 16 --trials 3 --mode latency --json latency.json
-```
-
-## Current verification
-
-The test suite reopens databases after crashes during table merging and shard replacement, checks that a damaged shard leaves other shards usable in degraded mode, and verifies that a snapshot keeps a fixed view while a writer waits. Routing tests use binary keys, check how keys move when the candidate shard set changes, and verify migration from the older layout without changing expiration times.
-
-Command-line checks ran word count and the exporter against a real database, migrated a database written by the earlier binary, and opened a checkpoint copy as a replacement. The Spark/Iceberg test published two versions from a real database, queried the older version, and rejected a source with a missing shard file.
-
-## Earlier audit results
-
-The audit reviewed the C++ paths, Python tools, alert rules, dashboard, and build and test configuration through the live-monitoring branch. It corrected three observable issues.
-
-- A database symlink could open a second process lock for the same data. The lock regression checks both opening orders and recovery through the original path.
-- A damaged on-disk tombstone could silently suppress an older value. Lookup and range paths now validate selected tombstones and expired records before trusting their visibility, with a regression covering a corrupted tombstone.
-- Benchmark comparisons could show deltas across different build types, and cache metadata called a populated store an in-memory index. The report now flags build and shard differences, and benchmark metadata describes the actual setup. The stale status panel and comments that repeated the code were removed.
-
-Validation covered all five Release CTest suites, a disk-backed test that wrote 12 MiB with a 1 MiB memtable budget and verified overwrites, deletions, and range reads after reopen, the Spark/Iceberg fixture through commit retry and time travel, Prometheus configuration and rule tests, and a local KVStore/Prometheus/Grafana smoke test that exercised an outage and alert resolution. Compose configuration passed validation. The complete stack was exercised with local processes.
-
-All five CTest checks also passed with ThreadSanitizer and with AddressSanitizer/UndefinedBehaviorSanitizer across the full and targeted runs. Leak detection was enabled for the four non-benchmark-smoke checks outside the sandbox. The final benchmark smoke rerun disabled leak detection because the sandbox prevented LeakSanitizer from tracing its processes.
+CTest covers batch append and sync failures, automatic compaction, recovery after interrupted merges and shard restore, isolation of damaged shards, snapshot consistency, routing, MapReduce, and the benchmark harness. Separate integration checks exercise [the Spark/Iceberg publisher](../lakehouse/README.md#run-locally) and [the monitoring stack](../README.md#manual-setup-and-docker-compose).

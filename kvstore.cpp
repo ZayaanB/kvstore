@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
+#include <system_error>
 
 namespace kvstore {
 
@@ -210,7 +211,9 @@ namespace kvstore {
         public:
             explicit Stage(const fs::path& parent, const char* pattern = ".kvstore-stage-XXXXXX")
                 : path_((parent / pattern).string()) {
-                if (::mkdtemp(path_.data()) == nullptr) Invalid("could not create staging directory");
+                if (::mkdtemp(path_.data()) == nullptr) {
+                    throw std::system_error(errno, std::generic_category(), "could not create staging directory");
+                }
             }
             ~Stage() {
                 std::error_code error;
@@ -312,6 +315,7 @@ namespace kvstore {
         constexpr std::size_t kChecksumBytes = 4;
         // Allow for the ordered-map node, two string objects and allocator overhead.
         constexpr std::size_t kRecordOverhead = 192;
+        constexpr std::uint64_t kAutomaticCompactionTables = 8;
 
         struct Header {
             std::uint64_t sequence;
@@ -345,9 +349,8 @@ namespace kvstore {
             return h;
         }
 
-        bool WriteRecord(int fd, const Header& h, std::string_view key, std::string_view value,
-                         Metrics* metrics, WriteSource source) {
-            char header[kHeaderBytes];
+        void EncodeRecord(const Header& h, std::string_view key, std::string_view value,
+                          char (&header)[kHeaderBytes], char (&checksum)[kChecksumBytes]) {
             StoreLe(header, h.sequence);
             header[8] = static_cast<char>(h.type);
             StoreLe(header + 9, h.key_length);
@@ -357,8 +360,13 @@ namespace kvstore {
             crc.Add({header, sizeof(header)});
             crc.Add(key);
             crc.Add(value);
-            char checksum[kChecksumBytes];
             StoreLe(checksum, crc.Value());
+        }
+
+        bool WriteRecord(int fd, const Header& h, std::string_view key, std::string_view value,
+                         Metrics* metrics, WriteSource source) {
+            char header[kHeaderBytes], checksum[kChecksumBytes];
+            EncodeRecord(h, key, value, header, checksum);
             return WriteFully(fd, header, sizeof(header), metrics, source) &&
                    WriteFully(fd, key.data(), key.size(), metrics, source) &&
                    WriteFully(fd, value.data(), value.size(), metrics, source) &&
@@ -373,6 +381,7 @@ namespace kvstore {
 
         constexpr std::string_view kMetadataMagic = "KVDB0001";
         constexpr std::uint64_t kFormatVersion = 1;
+        constexpr std::uint64_t kShardPointerVersion = 2;
         constexpr std::string_view kManifestMagic = "KVMAN001";
         constexpr std::string_view kTableMagic = "KVSST001";
         constexpr std::string_view kIdentityMagic = "KVID0001";
@@ -682,6 +691,7 @@ namespace kvstore {
             std::size_t charged = 0;
             std::uint64_t base = 0;
             std::uint64_t tables = 0;
+            std::uint64_t last_auto_compaction = 0;
             std::uint64_t flushed = 0;
             std::uint64_t sequence = 0;
             Fd wal;
@@ -744,7 +754,7 @@ namespace kvstore {
             if (FileSize(meta) != kFieldsBytes<4>) Invalid("invalid database metadata length");
             const auto fields = ReadFields<4>(meta, 0, kMetadataMagic);
             routing = static_cast<Routing>(fields[2]);
-            if (fields[0] != kFormatVersion || fields[1] != kNumShards ||
+            if ((fields[0] != kFormatVersion && fields[0] != kShardPointerVersion) || fields[1] != kNumShards ||
                 (routing != Routing::Modulo && routing != Routing::Rendezvous)) {
                 Invalid("unsupported database format or routing");
             }
@@ -990,6 +1000,20 @@ namespace kvstore {
             return true;
         }
 
+        bool CommitAppend(Shard& shard, off_t before, std::uint64_t bytes, bool written) {
+            if (!written || !SyncWal(shard.wal, true, metrics.get(), WalSync::Append)) {
+                if (!TruncateFile(shard.wal, before) || !SyncWal(shard.wal, true, metrics.get(), WalSync::Rollback)) {
+                    MarkFailed(shard);
+                }
+                return false;
+            }
+            if (metrics) {
+                shard.committed_wal_bytes.store(static_cast<std::uint64_t>(before) + bytes,
+                                                std::memory_order_relaxed);
+            }
+            return true;
+        }
+
         template<class Key, class Value>
         bool Mutate(RecordType type, Key&& key, Value&& value, std::int64_t expiry) {
             if (key.size() > kMaxKeyLen || value.size() > kMaxValueLen) return false;
@@ -1003,19 +1027,11 @@ namespace kvstore {
             if (shard.charged != 0 && header.Charge() > shard_budget - shard.charged && !Flush(shard)) {
                 return false;
             }
+            if (!MaybeCompact(shard)) return false;
             const auto before = ::lseek(shard.wal, 0, SEEK_END);
             if (before < 0) return false;
-            if (!WriteRecord(shard.wal, header, key, value, metrics.get(), WriteSource::Wal) ||
-                !SyncWal(shard.wal, true, metrics.get(), WalSync::Append)) {
-                if (!TruncateFile(shard.wal, before) || !SyncWal(shard.wal, true, metrics.get(), WalSync::Rollback)) {
-                    MarkFailed(shard);
-                }
-                return false;
-            }
-            if (metrics) {
-                shard.committed_wal_bytes.store(static_cast<std::uint64_t>(before) + header.Bytes(),
-                                                std::memory_order_relaxed);
-            }
+            if (!CommitAppend(shard, before, header.Bytes(),
+                              WriteRecord(shard.wal, header, key, value, metrics.get(), WriteSource::Wal))) return false;
             try {
                 shard.pending.insert_or_assign(std::forward<Key>(key), Entry{header, std::forward<Value>(value)});
                 shard.sequence = header.sequence;
@@ -1027,6 +1043,66 @@ namespace kvstore {
                 MarkFailed(shard);
                 throw;
             }
+        }
+
+        static Header SetHeader(std::uint64_t sequence, const KeyValue& entry) {
+            return {sequence, RecordType::Set, static_cast<std::uint32_t>(entry.key.size()),
+                    static_cast<std::uint32_t>(entry.value.size()), kNoExpiry};
+        }
+
+        bool SetBatch(std::span<const KeyValue> entries) {
+            if (entries.empty()) return true;
+            if (entries.size() == 1) {
+                return Mutate(RecordType::Set, entries.front().key, entries.front().value, kNoExpiry);
+            }
+            const auto index = Index(entries.front().key);
+            std::size_t charge = 0;
+            std::size_t bytes = 0;
+            for (const auto& entry : entries) {
+                if (entry.key.size() > kMaxKeyLen || entry.value.size() > kMaxValueLen ||
+                    Index(entry.key) != index) return false;
+                const auto header = SetHeader(0, entry);
+                if (header.Charge() > shard_budget - charge) return false;
+                charge += header.Charge();
+                bytes += static_cast<std::size_t>(header.Bytes());
+            }
+
+            std::lock_guard writer(write_mutex);
+            auto& shard = shards[index];
+            std::unique_lock lock(shard.mutex);
+            const auto max_sequence = std::numeric_limits<std::uint64_t>::max() - 1;
+            if (failed.load() || shard.unavailable.load() || shard.sequence > max_sequence ||
+                entries.size() > max_sequence - shard.sequence) return false;
+            if (charge > shard_budget - shard.charged && !Flush(shard)) return false;
+            if (!MaybeCompact(shard)) return false;
+
+            Memtable staged;
+            std::string encoded;
+            encoded.reserve(bytes);
+            auto sequence = shard.sequence;
+            for (const auto& entry : entries) {
+                const auto header = SetHeader(++sequence, entry);
+                staged.insert_or_assign(entry.key, Entry{header, entry.value});
+                char prefix[kHeaderBytes], checksum[kChecksumBytes];
+                EncodeRecord(header, entry.key, entry.value, prefix, checksum);
+                encoded.append(prefix, sizeof(prefix)).append(entry.key).append(entry.value)
+                       .append(checksum, sizeof(checksum));
+            }
+            const auto before = ::lseek(shard.wal, 0, SEEK_END);
+            if (before < 0) return false;
+            const bool written = WriteFully(shard.wal, encoded.data(), encoded.size(), metrics.get(), WriteSource::Wal);
+            if (!CommitAppend(shard, before, encoded.size(), written)) return false;
+
+            // Transfer the staged map nodes without allocating after the WAL sync.
+            for (auto it = staged.begin(); it != staged.end();) {
+                auto node = staged.extract(it++);
+                const auto previous = shard.pending.find(node.key());
+                if (previous == shard.pending.end()) shard.pending.insert(std::move(node));
+                else previous->second = std::move(node.mapped());
+            }
+            shard.sequence = sequence;
+            shard.charged += charge;
+            return true;
         }
 
         bool FlushAll() {
@@ -1082,6 +1158,25 @@ namespace kvstore {
                 // The manifest already controls visibility. Startup retries cleanup.
             }
             return true;
+        }
+
+        bool MaybeCompact(Shard& shard) {
+            const auto first = shard.FirstTable();
+            if (shard.tables < first || shard.tables - first + 1 < kAutomaticCompactionTables ||
+                shard.tables == shard.last_auto_compaction) return true;
+
+            // Retry a failed maintenance attempt only after another table is flushed.
+            shard.last_auto_compaction = shard.tables;
+            OperationObservation observation(metrics.get(), Operation::AutoCompact);
+            try {
+                observation.Result(Merge(shard));
+            } catch (const StorageError&) {
+                MarkFailed(shard);
+                return false;
+            } catch (const std::system_error&) {
+                // Failure to create merge scratch space leaves the previous manifest usable.
+            }
+            return !failed.load() && !shard.unavailable.load();
         }
 
         bool Compact() {
@@ -1343,7 +1438,9 @@ namespace kvstore {
         const auto database_lock = AcquireLock(database);
         const auto checkpoint_lock = AcquireLock(checkpoint);
         Engine target(database), source(checkpoint);
-        if (target.ReadMetadata() != source.ReadMetadata() ||
+        auto target_metadata = target.ReadMetadata();
+        const auto source_metadata = source.ReadMetadata();
+        if (!std::equal(target_metadata.begin() + 1, target_metadata.end(), source_metadata.begin() + 1) ||
             Engine::ReadIdentity(database) != Engine::ReadIdentity(checkpoint)) {
             Invalid("checkpoint belongs to a different database");
         }
@@ -1357,6 +1454,16 @@ namespace kvstore {
         validated.directory = stage.Path();
         target.Recover(validated, index, false);
 
+        // Pre-restore binaries understood modulo routing but ignored shard pointers.
+        if (target.routing == Routing::Modulo && target_metadata[0] == kFormatVersion) {
+            target_metadata[0] = kShardPointerVersion;
+            const auto staged_metadata = stage.Path() + "/METADATA.tmp";
+            const Fd metadata(::open(staged_metadata.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644));
+            if (metadata < 0 || !WriteFields(metadata, kMetadataMagic, target_metadata) || !SyncFile(metadata) ||
+                ::rename(staged_metadata.c_str(), (database + "/METADATA").c_str()) != 0) {
+                Invalid("could not publish shard pointer format");
+            }
+        }
         const auto temporary = stage.Path() + "/.CURRENT.tmp";
         const auto name = fs::path(stage.Path()).filename().string();
         const auto pointer = Engine::ShardPointer(database, index);
@@ -1381,6 +1488,15 @@ namespace kvstore {
     bool KVStore::Set(const std::string& key, const std::string& value) {
         OperationObservation observation(engine_->metrics.get(), Operation::Set);
         return observation.Result(engine_->Mutate(RecordType::Set, key, value, kNoExpiry));
+    }
+
+    bool KVStore::SetBatch(std::span<const KeyValue> entries) {
+        OperationObservation observation(engine_->metrics.get(), Operation::SetBatch);
+        return observation.Result(engine_->SetBatch(entries));
+    }
+
+    std::size_t KVStore::ShardForKey(std::string_view key) const noexcept {
+        return engine_->Index(key);
     }
 
     bool KVStore::SetWithTtl(const std::string& key, const std::string& value, std::int64_t ttl_seconds) {
