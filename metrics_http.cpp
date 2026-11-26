@@ -1,4 +1,5 @@
 #include "metrics_http.hpp"
+#include "kvstore.hpp"
 #include "metrics.hpp"
 
 #include <arpa/inet.h>
@@ -50,7 +51,7 @@ bool Await(int fd, short events, Clock::time_point deadline) {
     }
 }
 
-std::string ResourceMetrics(const fs::path& wal) {
+std::string ResourceMetrics(const KVStore& store) {
     std::ostringstream out;
     out.imbue(std::locale::classic());
     rusage usage{};
@@ -74,21 +75,21 @@ std::string ResourceMetrics(const fs::path& wal) {
 #endif
     }
     std::error_code error;
-    const auto bytes = fs::file_size(wal, error);
+    const fs::path database(store.DatabasePath());
+    out << "# HELP kvstore_wal_file_bytes Combined logical length of active shard WALs in bytes.\n"
+           "# TYPE kvstore_wal_file_bytes gauge\nkvstore_wal_file_bytes " << store.WalBytes() << '\n';
+    auto total = fs::file_size(store.DatabasePath() + ".lock", error);
     if (!error) {
-        out << "# HELP kvstore_wal_file_bytes Logical length of the active WAL file in bytes.\n"
-               "# TYPE kvstore_wal_file_bytes gauge\nkvstore_wal_file_bytes " << bytes << '\n';
-        const auto lock = fs::file_size(wal.parent_path() / (wal.stem().string() + ".lock"), error);
+        for (fs::recursive_directory_iterator file(database, error), end;
+             !error && file != end; file.increment(error)) {
+            if (file->is_regular_file(error)) total += file->file_size(error);
+        }
         if (!error) {
-            const auto temporary = fs::file_size(wal.string() + ".tmp", error);
-            if (!error || error == std::errc::no_such_file_or_directory) {
-                out << "# HELP kvstore_database_file_bytes Combined logical length of database files in bytes.\n"
-                       "# TYPE kvstore_database_file_bytes gauge\nkvstore_database_file_bytes "
-                    << bytes + lock + (error ? 0 : temporary) << '\n';
-            }
+            out << "# HELP kvstore_database_file_bytes Combined logical length of database files in bytes.\n"
+                   "# TYPE kvstore_database_file_bytes gauge\nkvstore_database_file_bytes " << total << '\n';
         }
     }
-    const auto space = fs::space(wal.parent_path(), error);
+    const auto space = fs::space(database, error);
     if (!error) {
         out << "# HELP kvstore_filesystem_available_bytes Bytes available to the CLI on the database filesystem.\n"
                "# TYPE kvstore_filesystem_available_bytes gauge\nkvstore_filesystem_available_bytes " << space.available << '\n'
@@ -98,7 +99,7 @@ std::string ResourceMetrics(const fs::path& wal) {
     return out.str();
 }
 
-void Serve(int fd, const Metrics& metrics, const fs::path& wal) {
+void Serve(int fd, const Metrics& metrics, const KVStore& store) {
     using namespace std::chrono_literals;
     const auto deadline = Clock::now() + 500ms;
     std::array<char, 2048> input{};
@@ -118,7 +119,7 @@ void Serve(int fd, const Metrics& metrics, const fs::path& wal) {
     if (header.find("\r\n\r\n") == std::string_view::npos) return;
     const auto first_line = header.substr(0, header.find("\r\n"));
     const bool found = first_line == "GET /metrics HTTP/1.1" || first_line == "GET /metrics HTTP/1.0";
-    const auto body = found ? metrics.Prometheus() + ResourceMetrics(wal) : "Not found\n";
+    const auto body = found ? metrics.Prometheus() + ResourceMetrics(store) : "Not found\n";
     std::string response = found ? "HTTP/1.1 200 OK\r\n" : "HTTP/1.1 404 Not Found\r\n";
     response += "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\nConnection: close\r\nContent-Length: ";
     response += std::to_string(body.size()) + "\r\n\r\n" + body;
@@ -137,8 +138,8 @@ void Serve(int fd, const Metrics& metrics, const fs::path& wal) {
 } // namespace
 
 struct MetricsHttp::Server {
-    Server(const Metrics& recorder, std::string path, const std::string& address, std::uint16_t port)
-        : metrics(recorder), wal(std::move(path)), listener(::socket(AF_INET, SOCK_STREAM, 0)) {
+    Server(const Metrics& recorder, const KVStore& database, const std::string& address, std::uint16_t port)
+        : metrics(recorder), store(database), listener(::socket(AF_INET, SOCK_STREAM, 0)) {
         if (listener.fd < 0 || !ConfigureSocket(listener.fd)) SocketError("metrics socket");
         const int reuse = 1;
         if (::setsockopt(listener.fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0) {
@@ -171,7 +172,7 @@ struct MetricsHttp::Server {
                 }
                 if (!ConfigureSocket(client.fd)) continue;
                 try {
-                    Serve(client.fd, metrics, wal);
+                    Serve(client.fd, metrics, store);
                 } catch (const std::exception&) {
                     // A failed scrape must not terminate the host.
                 }
@@ -180,14 +181,14 @@ struct MetricsHttp::Server {
     }
 
     const Metrics& metrics;
-    const fs::path wal;
+    const KVStore& store;
     const Socket listener;
     std::uint16_t bound_port = 0;
     std::jthread thread;
 };
 
-MetricsHttp::MetricsHttp(const Metrics& metrics, std::string wal_path, const std::string& address, std::uint16_t port)
-    : server_(std::make_unique<Server>(metrics, std::move(wal_path), address, port)) {}
+MetricsHttp::MetricsHttp(const Metrics& metrics, const KVStore& store, const std::string& address, std::uint16_t port)
+    : server_(std::make_unique<Server>(metrics, store, address, port)) {}
 
 MetricsHttp::~MetricsHttp() = default;
 

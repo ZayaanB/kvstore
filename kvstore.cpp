@@ -7,6 +7,16 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
+#include <bit>
+#include <chrono>
+#include <charconv>
+#include <cstdlib>
+#include <map>
+#include <mutex>
+#include <shared_mutex>
+#include <string_view>
+#include <utility>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -53,12 +63,21 @@ namespace kvstore {
             int exceptions_ = 0;
         };
 
-        std::string AbsoluteStorePath(const std::string& path) {
+        fs::path AbsolutePath(const std::string& path) {
             if (path.empty() || path.find('\0') != std::string::npos) {
                 throw std::invalid_argument("KVStore: path must be nonempty and contain no NUL bytes");
             }
-            // Resolve once so later chdir calls cannot redirect compaction.
-            return fs::absolute(fs::path(path)).string();
+            return fs::absolute(fs::path(path));
+        }
+
+        std::string AbsoluteStorePath(const std::string& path) {
+            // Resolve once so later chdir calls cannot redirect database I/O.
+            auto absolute = AbsolutePath(path);
+            if (!absolute.has_filename()) absolute = absolute.parent_path();
+            if (!absolute.has_filename() || absolute.filename() == "." || absolute.filename() == "..") {
+                throw std::invalid_argument("KVStore: invalid database root");
+            }
+            return absolute.string();
         }
 
         // precomputed crc32 table
@@ -75,87 +94,6 @@ namespace kvstore {
             }
         };
         constexpr Crc32Table kCrc32Table{};
-
-        std::uint32_t Crc32(const void* data, std::size_t len) {
-            const auto* p = static_cast<const std::uint8_t*>(data);
-            std::uint32_t crc = 0xFFFFFFFFu;
-            for (std::size_t i = 0; i < len; ++i) {
-                crc = kCrc32Table.v[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
-            }
-            return ~crc;
-        }
-
-        void AppendBytes(std::string& buf, const void* data, std::size_t len) {
-            buf.append(static_cast<const char*>(data), len);
-        }
-
-        // fixed little-endian encoding so the wal is portable across architectures
-        void AppendU32Le(std::string& buf, std::uint32_t v) {
-            const char b[4] = {
-                static_cast<char>(v & 0xFFu),
-                static_cast<char>((v >> 8) & 0xFFu),
-                static_cast<char>((v >> 16) & 0xFFu),
-                static_cast<char>((v >> 24) & 0xFFu),
-            };
-            buf.append(b, sizeof(b));
-        }
-
-        void AppendI64Le(std::string& buf, std::int64_t v) {
-            const auto u = static_cast<std::uint64_t>(v);
-            char b[8];
-            for (int i = 0; i < 8; ++i) {
-                b[i] = static_cast<char>((u >> (8 * i)) & 0xFFu);
-            }
-            buf.append(b, sizeof(b));
-        }
-
-        std::uint32_t LoadU32Le(const char* p) {
-            const auto* u = reinterpret_cast<const unsigned char*>(p);
-            return static_cast<std::uint32_t>(u[0]) |
-                   (static_cast<std::uint32_t>(u[1]) << 8) |
-                   (static_cast<std::uint32_t>(u[2]) << 16) |
-                   (static_cast<std::uint32_t>(u[3]) << 24);
-        }
-
-        std::int64_t LoadI64Le(const char* p) {
-            const auto* u = reinterpret_cast<const unsigned char*>(p);
-            std::uint64_t v = 0;
-            for (int i = 0; i < 8; ++i) {
-                v |= static_cast<std::uint64_t>(u[i]) << (8 * i);
-            }
-            return static_cast<std::int64_t>(v);
-        }
-
-        // build a record with header, payload, then a crc over it all
-        std::string SerializeRecord(RecordType type, const std::string& key,
-                                    const std::string& value, std::int64_t expires_at) {
-            const auto key_len = static_cast<std::uint32_t>(key.size());
-            const std::uint32_t value_len =
-                (type == RecordType::kDelete) ? 0u
-                                              : static_cast<std::uint32_t>(value.size());
-            const auto type_raw = static_cast<std::uint8_t>(type);
-
-            std::string buf;
-            buf.reserve(sizeof(type_raw) + sizeof(key_len) + sizeof(value_len) +
-                        key.size() + value_len + sizeof(expires_at) + sizeof(std::uint32_t));
-
-            AppendBytes(buf, &type_raw, sizeof(type_raw));
-            AppendU32Le(buf, key_len);
-            AppendU32Le(buf, value_len);
-            if (!key.empty()) {
-                AppendBytes(buf, key.data(), key.size());
-            }
-            if (type != RecordType::kDelete && value_len > 0) {
-                AppendBytes(buf, value.data(), value_len);
-            }
-            if (type == RecordType::kSetTtl) {
-                AppendI64Le(buf, expires_at);
-            }
-
-            const std::uint32_t crc = Crc32(buf.data(), buf.size());
-            AppendU32Le(buf, crc);
-            return buf;
-        }
 
         // write every byte, retrying partial writes and EINTR
         bool WriteFully(int fd, const char* data, std::size_t len,
@@ -209,7 +147,7 @@ namespace kvstore {
                 const ssize_t n = ::read(fd, data + done, length - done);
                 if (n < 0) {
                     if (errno == EINTR) continue;
-                    throw std::runtime_error("KVStore: WAL read failed");
+                    throw std::runtime_error("KVStore: file read failed");
                 }
                 if (n == 0) return false;
                 done += static_cast<std::size_t>(n);
@@ -217,396 +155,869 @@ namespace kvstore {
             return true;
         }
 
-    }  // namespace
+        [[noreturn]] void Invalid(const char* reason) {
+            throw std::runtime_error(std::string("KVStore: ") + reason);
+        }
 
-    KVStore::FileDescriptor::~FileDescriptor() { Reset(); }
+        class Fd {
+        public:
+            explicit Fd(int fd = -1) : fd_(fd) {}
+            ~Fd() { if (fd_ >= 0) ::close(fd_); }
+            Fd(Fd&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+            Fd& operator=(Fd&& other) noexcept {
+                std::swap(fd_, other.fd_);
+                return *this;
+            }
+            operator int() const { return fd_; }
+        private:
+            int fd_;
+        };
 
-    void KVStore::FileDescriptor::Reset(int fd) {
-        if (value >= 0) ::close(value);
-        value = fd;
-    }
+        Fd AcquireLock(const std::string& path) {
+            Fd fd(::open((path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644));
+            if (fd < 0 || ::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+                throw std::runtime_error("KVStore: cannot lock database at '" + path + "'");
+            }
+            return fd;
+        }
 
-    int KVStore::FileDescriptor::Release() {
-        const int fd = value;
-        value = -1;
-        return fd;
-    }
+        bool SyncDirectory(const char* path) {
+            const Fd fd(::open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+            return fd >= 0 && SyncFile(fd);
+        }
 
-    // A member so the directory fd uses the same RAII ownership as the WAL.
-    bool KVStore::SyncParentDir(const std::string& path) {
-        const fs::path p(path);
-        const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
-        FileDescriptor fd(::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-        return fd >= 0 && SyncFile(fd);
-    }
-
-    KVStore::KVStore(std::string path, std::shared_ptr<Metrics> metrics)
-        : metrics_(std::move(metrics)),
-          path_(AbsoluteStorePath(path)),
-          wal_path_(path_ + ".wal"),
-          wal_tmp_path_(path_ + ".wal.tmp"),
-          lock_path_(path_ + ".lock") {
-        OperationObservation observation(metrics_.get(), Operation::Recovery);
-        const fs::path parent = fs::absolute(fs::path(path_)).parent_path();
-        fs::create_directories(parent);
-        // Persist newly created directory entries, including nested ancestors.
-        for (fs::path dir = parent; dir != dir.root_path(); dir = dir.parent_path()) {
-            if (!SyncParentDir(dir.string())) {
-                throw std::runtime_error("KVStore: failed to sync database directory");
+        void PrepareParent(const fs::path& path) {
+            fs::create_directories(path);
+            for (auto dir = path; dir != dir.root_path(); dir = dir.parent_path()) {
+                if (!SyncDirectory(dir.parent_path().c_str())) Invalid("could not sync database ancestors");
             }
         }
-        AcquireProcessLock();
-        Recover();
-        OpenWalForAppend();
+
+        bool Exists(const fs::path& path) {
+            return fs::exists(fs::symlink_status(path));
+        }
+
+        class Stage {
+        public:
+            explicit Stage(const fs::path& parent)
+                : path_((parent / ".kvstore-stage-XXXXXX").string()) {
+                if (::mkdtemp(path_.data()) == nullptr) Invalid("could not create staging directory");
+            }
+            ~Stage() {
+                std::error_code error;
+                if (!path_.empty()) fs::remove_all(path_, error);
+            }
+            const std::string& Path() const { return path_; }
+            void Publish(const std::string& destination) {
+                const auto parent = fs::path(destination).parent_path();
+                if (Exists(destination) || ::rename(path_.c_str(), destination.c_str()) != 0) {
+                    Invalid("could not publish database directory");
+                }
+                path_.clear();
+                if (!SyncDirectory(parent.c_str())) {
+                    Invalid("database directory was renamed, but publication sync failed; reopen destination to verify");
+                }
+            }
+        private:
+            std::string path_;
+        };
+
+        std::uint64_t FileSize(int fd) {
+            struct stat info {};
+            if (fd < 0 || ::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0) {
+                Invalid("expected a readable regular file");
+            }
+            return static_cast<std::uint64_t>(info.st_size);
+        }
+
+        void ReadAt(int fd, std::uint64_t offset, char* data, std::size_t length) {
+            while (length != 0) {
+                const auto n = ::pread(fd, data, length, static_cast<off_t>(offset));
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) Invalid("short or failed positional read");
+                const auto bytes = static_cast<std::size_t>(n);
+                offset += bytes;
+                data += bytes;
+                length -= bytes;
+            }
+        }
+
+        template<class Integer>
+        void StoreLe(char* dest, Integer value) {
+            for (std::size_t i = 0; i < sizeof(value); ++i) {
+                dest[i] = static_cast<char>((value >> (i * 8)) & 0xffu);
+            }
+        }
+
+        template<class Integer>
+        Integer LoadLe(const char* source) {
+            Integer value = 0;
+            for (std::size_t i = 0; i < sizeof(value); ++i) {
+                value |= static_cast<Integer>(static_cast<unsigned char>(source[i])) << (i * 8);
+            }
+            return value;
+        }
+
+        class Checksum {
+        public:
+            void Add(std::string_view bytes) {
+                for (const auto byte : bytes) {
+                    crc_ = kCrc32Table.v[(crc_ ^ static_cast<unsigned char>(byte)) & 0xffu] ^ (crc_ >> 8);
+                }
+            }
+            std::uint32_t Value() const { return ~crc_; }
+        private:
+            std::uint32_t crc_ = 0xffffffffu;
+        };
+
+        std::uint32_t Crc(std::string_view bytes) {
+            Checksum crc;
+            crc.Add(bytes);
+            return crc.Value();
+        }
+
+        // FNV-1a over unsigned key bytes, modulo the versioned shard count.
+        std::size_t ShardIndex(std::string_view key) {
+            std::uint64_t hash = 14695981039346656037ull;
+            for (const auto byte : key) {
+                hash ^= static_cast<unsigned char>(byte);
+                hash *= 1099511628211ull;
+            }
+            return hash % kNumShards;
+        }
+
+        std::int64_t NowSeconds() {
+            using namespace std::chrono;
+            return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
+        }
+
+        enum class RecordType : unsigned char { Set = 1, Delete = 2, SetTtl = 3 };
+        constexpr std::size_t kHeaderBytes = 25;
+        constexpr std::size_t kChecksumBytes = 4;
+        // Allow for the ordered-map node, two string objects and allocator overhead.
+        constexpr std::size_t kRecordOverhead = 192;
+
+        struct Header {
+            std::uint64_t sequence;
+            RecordType type;
+            std::uint32_t key_length;
+            std::uint32_t value_length;
+            std::int64_t expiry;
+
+            std::uint64_t Bytes() const {
+                return kHeaderBytes + kChecksumBytes + key_length + value_length;
+            }
+            std::size_t Charge() const { return kRecordOverhead + key_length + value_length; }
+            bool Live(std::int64_t now) const {
+                return type != RecordType::Delete && (expiry == kNoExpiry || expiry > now);
+            }
+        };
+
+        bool ValidLengths(RecordType type, std::uint32_t key, std::uint32_t value) {
+            return (type == RecordType::Set || type == RecordType::SetTtl || type == RecordType::Delete) &&
+                   key <= kMaxKeyLen && value <= kMaxValueLen && (type != RecordType::Delete || value == 0);
+        }
+
+        Header DecodeHeader(const char* bytes) {
+            const Header h{LoadLe<std::uint64_t>(bytes), static_cast<RecordType>(bytes[8]),
+                           LoadLe<std::uint32_t>(bytes + 9), LoadLe<std::uint32_t>(bytes + 13),
+                           std::bit_cast<std::int64_t>(LoadLe<std::uint64_t>(bytes + 17))};
+            if (h.sequence == 0 || !ValidLengths(h.type, h.key_length, h.value_length) ||
+                (h.type != RecordType::SetTtl && h.expiry != kNoExpiry)) {
+                Invalid("invalid record header");
+            }
+            return h;
+        }
+
+        bool WriteRecord(int fd, const Header& h, std::string_view key, std::string_view value,
+                         Metrics* metrics, WriteSource source) {
+            char header[kHeaderBytes];
+            StoreLe(header, h.sequence);
+            header[8] = static_cast<char>(h.type);
+            StoreLe(header + 9, h.key_length);
+            StoreLe(header + 13, h.value_length);
+            StoreLe(header + 17, static_cast<std::uint64_t>(h.expiry));
+            Checksum crc;
+            crc.Add({header, sizeof(header)});
+            crc.Add(key);
+            crc.Add(value);
+            char checksum[kChecksumBytes];
+            StoreLe(checksum, crc.Value());
+            return WriteFully(fd, header, sizeof(header), metrics, source) &&
+                   WriteFully(fd, key.data(), key.size(), metrics, source) &&
+                   WriteFully(fd, value.data(), value.size(), metrics, source) &&
+                   WriteFully(fd, checksum, sizeof(checksum), metrics, source);
+        }
+
+        struct Entry {
+            Header header;
+            std::string value;
+        };
+        using Memtable = std::map<std::string, Entry, std::less<>>;
+
+        constexpr std::string_view kMetadataMagic = "KVDB0001";
+        constexpr std::uint64_t kFormatVersion = 1;
+        constexpr std::uint64_t kFnv1a64 = 1;
+        constexpr std::string_view kManifestMagic = "KVMAN001";
+        constexpr std::string_view kTableMagic = "KVSST001";
+        constexpr std::size_t kBlockRecords = 16;
+
+        // Fixed-size metadata is little endian and checksummed, including its magic.
+        template<std::size_t N>
+        using Fields = std::array<std::uint64_t, N>;
+
+        template<std::size_t N>
+        constexpr std::size_t kFieldsBytes = 8 + N * 8 + kChecksumBytes;
+
+        template<std::size_t N>
+        bool WriteFields(int fd, std::string_view magic, const Fields<N>& fields, Metrics* metrics = nullptr) {
+            std::array<char, kFieldsBytes<N>> bytes{};
+            std::copy(magic.begin(), magic.end(), bytes.begin());
+            for (std::size_t i = 0; i < N; ++i) StoreLe(bytes.data() + 8 + i * 8, fields[i]);
+            StoreLe(bytes.data() + bytes.size() - kChecksumBytes, Crc({bytes.data(), bytes.size() - kChecksumBytes}));
+            return WriteFully(fd, bytes.data(), bytes.size(), metrics, WriteSource::Compaction);
+        }
+
+        template<std::size_t N>
+        Fields<N> ReadFields(int fd, std::uint64_t offset, std::string_view magic) {
+            std::array<char, kFieldsBytes<N>> bytes{};
+            ReadAt(fd, offset, bytes.data(), bytes.size());
+            if (std::string_view(bytes.data(), 8) != magic ||
+                Crc({bytes.data(), bytes.size() - kChecksumBytes}) !=
+                    LoadLe<std::uint32_t>(bytes.data() + bytes.size() - kChecksumBytes)) {
+                Invalid("invalid on-disk metadata checksum or format");
+            }
+            Fields<N> fields{};
+            for (std::size_t i = 0; i < N; ++i) fields[i] = LoadLe<std::uint64_t>(bytes.data() + 8 + i * 8);
+            return fields;
+        }
+
+        class Table {
+        public:
+            struct Record {
+                std::uint64_t offset;
+                Header header;
+                std::string key;
+                Checksum prefix;
+            };
+
+            explicit Table(const std::string& path) : fd_(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW)) {
+                const auto size = FileSize(fd_);
+                if (size < kFieldsBytes<5>) Invalid("short sorted table");
+                const auto fields = ReadFields<5>(fd_, size - kFieldsBytes<5>, kTableMagic);
+                index_ = fields[0];
+                count_ = fields[1];
+                last_ = fields[2];
+                high_ = fields[3];
+                low_ = fields[4];
+                blocks_ = count_ == 0 ? 0 : (count_ - 1) / kBlockRecords + 1;
+                const auto payload = size - kFieldsBytes<5>;
+                if (count_ == 0 || count_ > index_ / (kHeaderBytes + kChecksumBytes) || last_ >= index_ ||
+                    index_ > payload || (payload - index_) % 8 != 0 || (payload - index_) / 8 != blocks_ ||
+                    low_ == 0 || low_ > high_ || count_ - 1 > high_ - low_) Invalid("invalid sorted table footer");
+            }
+
+            std::uint64_t End() const { return index_; }
+            std::uint64_t High() const { return high_; }
+
+            Record Read(std::uint64_t offset) const {
+                if (offset >= index_ || index_ - offset < kHeaderBytes) Invalid("invalid sorted table offset");
+                char bytes[kHeaderBytes];
+                ReadAt(fd_, offset, bytes, sizeof(bytes));
+                const auto header = DecodeHeader(bytes);
+                if (header.Bytes() > index_ - offset) Invalid("truncated sorted table record");
+                Record record{offset, header, std::string(header.key_length, '\0'), {}};
+                ReadAt(fd_, offset + kHeaderBytes, record.key.data(), record.key.size());
+                record.prefix.Add({bytes, sizeof(bytes)});
+                record.prefix.Add(record.key);
+                return record;
+            }
+
+            std::optional<Record> Find(std::string_view key) const {
+                if (key < Read(0).key || key > Read(last_).key) return std::nullopt;
+                const auto block = SearchBlock(key);
+                const auto end = block + 1 == blocks_ ? index_ : BlockOffset(block + 1);
+                for (auto offset = BlockOffset(block); offset < end;) {
+                    auto record = Read(offset);
+                    if (record.key == key) return record;
+                    if (record.key > key) break;
+                    offset += record.header.Bytes();
+                }
+                return std::nullopt;
+            }
+
+            std::uint64_t StartOffset(std::string_view key) const {
+                if (key.empty()) return 0;
+                if (key > Read(last_).key) return index_;
+                return BlockOffset(SearchBlock(key));
+            }
+
+            std::string Value(const Record& record) const {
+                std::string value(record.header.value_length, '\0');
+                const auto offset = record.offset + kHeaderBytes + record.key.size();
+                ReadAt(fd_, offset, value.data(), value.size());
+                auto crc = record.prefix;
+                crc.Add(value);
+                VerifyChecksum(offset + value.size(), crc);
+                return value;
+            }
+
+            void Validate(std::size_t shard, std::uint64_t previous) const {
+                if (low_ - 1 != previous) Invalid("nonconsecutive sorted table sequence range");
+                std::uint64_t offset = 0;
+                std::uint64_t largest = 0;
+                std::string previous_key;
+                std::array<char, 64 * 1024> buffer;
+                for (std::uint64_t i = 0; i < count_; ++i) {
+                    if ((i % kBlockRecords == 0 && BlockOffset(i / kBlockRecords) != offset) ||
+                        (i == count_ - 1 && last_ != offset)) Invalid("invalid sorted table index");
+                    auto record = Read(offset);
+                    if (ShardIndex(record.key) != shard || (i != 0 && record.key <= previous_key) ||
+                        record.header.sequence < low_ || record.header.sequence > high_) {
+                        Invalid("invalid sorted table record order or shard");
+                    }
+                    auto value_offset = offset + kHeaderBytes + record.key.size();
+                    auto remaining = static_cast<std::size_t>(record.header.value_length);
+                    while (remaining != 0) {
+                        const auto bytes = std::min(buffer.size(), remaining);
+                        ReadAt(fd_, value_offset, buffer.data(), bytes);
+                        record.prefix.Add({buffer.data(), bytes});
+                        value_offset += bytes;
+                        remaining -= bytes;
+                    }
+                    VerifyChecksum(value_offset, record.prefix);
+                    largest = std::max(largest, record.header.sequence);
+                    previous_key = std::move(record.key);
+                    offset += record.header.Bytes();
+                }
+                if (offset != index_ || largest != high_) Invalid("invalid sorted table extent");
+            }
+
+        private:
+            std::uint64_t SearchBlock(std::string_view key) const {
+                std::uint64_t low = 0;
+                std::uint64_t high = blocks_;
+                while (high - low > 1) {
+                    const auto mid = low + (high - low) / 2;
+                    if (key < Read(BlockOffset(mid)).key) high = mid;
+                    else low = mid;
+                }
+                return low;
+            }
+
+            std::uint64_t BlockOffset(std::uint64_t block) const {
+                char bytes[8];
+                ReadAt(fd_, index_ + block * sizeof(bytes), bytes, sizeof(bytes));
+                return LoadLe<std::uint64_t>(bytes);
+            }
+            void VerifyChecksum(std::uint64_t offset, const Checksum& crc) const {
+                char bytes[kChecksumBytes];
+                ReadAt(fd_, offset, bytes, sizeof(bytes));
+                if (LoadLe<std::uint32_t>(bytes) != crc.Value()) Invalid("sorted table checksum mismatch");
+            }
+
+            Fd fd_;
+            std::uint64_t index_, count_, last_, high_, low_, blocks_;
+        };
+
+        // Sequential reader shared by the legacy migration and the active shard WAL.
+        template<class Apply>
+        void Replay(int fd, bool legacy, Apply apply, Metrics* metrics = nullptr) {
+            const auto size = FileSize(fd);
+            std::uint64_t offset = 0;
+            const std::size_t header_bytes = legacy ? 9 : kHeaderBytes;
+            const auto read = [&](char* bytes, std::size_t length) {
+                if (!ReadFully(fd, bytes, length)) Invalid("WAL changed during replay");
+            };
+            while (size - offset >= header_bytes) {
+                char bytes[kHeaderBytes];
+                read(bytes, header_bytes);
+                Header header{};
+                std::size_t expiry_bytes = 0;
+                if (legacy) {
+                    header.type = static_cast<RecordType>(bytes[0]);
+                    header.key_length = LoadLe<std::uint32_t>(bytes + 1);
+                    header.value_length = LoadLe<std::uint32_t>(bytes + 5);
+                    if (!ValidLengths(header.type, header.key_length, header.value_length)) {
+                        Invalid("invalid legacy WAL header");
+                    }
+                    if (header.type == RecordType::SetTtl) expiry_bytes = 8;
+                } else {
+                    header = DecodeHeader(bytes);
+                }
+                const auto record_bytes = header_bytes + header.key_length + header.value_length +
+                                          expiry_bytes + kChecksumBytes;
+                if (record_bytes > size - offset) break;
+                std::string key(header.key_length, '\0');
+                std::string value(header.value_length, '\0');
+                read(key.data(), key.size());
+                read(value.data(), value.size());
+                Checksum crc;
+                crc.Add({bytes, header_bytes});
+                crc.Add(key);
+                crc.Add(value);
+                if (expiry_bytes != 0) {
+                    read(bytes, expiry_bytes);
+                    crc.Add({bytes, expiry_bytes});
+                    header.expiry = std::bit_cast<std::int64_t>(LoadLe<std::uint64_t>(bytes));
+                }
+                read(bytes, kChecksumBytes);
+                if (crc.Value() != LoadLe<std::uint32_t>(bytes)) {
+                    if (!legacy && record_bytes == size - offset) break;
+                    Invalid("WAL checksum mismatch");
+                }
+                apply(header, std::move(key), std::move(value));
+                offset += record_bytes;
+            }
+            // Incomplete legacy tails are ignored without touching the source.
+            if (!legacy && offset != size &&
+                (!TruncateFile(fd, static_cast<off_t>(offset)) ||
+                 !SyncWal(fd, false, metrics, WalSync::Recovery))) {
+                Invalid("could not durably repair WAL tail");
+            }
+        }
+    }
+
+    struct KVStore::Engine {
+        struct Shard {
+            std::string directory;
+            mutable std::shared_mutex mutex;
+            Memtable pending;
+            std::size_t charged = 0;
+            std::uint64_t tables = 0;
+            std::uint64_t flushed = 0;
+            std::uint64_t sequence = 0;
+            Fd wal;
+
+            std::string WalPath(std::uint64_t generation) const {
+                return directory + "/" + std::to_string(generation) + ".wal";
+            }
+            std::string TablePath(std::uint64_t generation) const {
+                return directory + "/" + std::to_string(generation) + ".sst";
+            }
+        };
+
+        explicit Engine(std::string directory, std::shared_ptr<Metrics> recorder = {})
+            : path(std::move(directory)), metrics(std::move(recorder)) {}
+
+        static void ValidateBudget(std::uint64_t budget) {
+            if (budget < kNumShards * kRecordOverhead || budget > std::numeric_limits<std::size_t>::max()) {
+                throw std::invalid_argument("KVStore: invalid memtable budget");
+            }
+        }
+
+        static std::string ShardDirectory(const std::string& directory, std::size_t i) {
+            return directory + "/shard-" + std::to_string(i);
+        }
+
+        static void Initialize(const std::string& directory, std::size_t budget, Metrics* metrics) {
+            ValidateBudget(budget);
+            for (std::size_t i = 0; i < kNumShards; ++i) {
+                Shard shard;
+                shard.directory = ShardDirectory(directory, i);
+                fs::create_directory(shard.directory);
+                const Fd wal(::open(shard.WalPath(1).c_str(),
+                                    O_WRONLY | O_CREAT | O_EXCL | O_APPEND | O_CLOEXEC, 0644));
+                const Fd manifest(::open((shard.directory + "/MANIFEST").c_str(),
+                                         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644));
+                if (wal < 0 || manifest < 0 || !SyncWal(wal, true, metrics, WalSync::Open) ||
+                    !WriteFields(manifest, kManifestMagic, Fields<2>{0, 0}) ||
+                    !SyncFile(manifest) || !SyncDirectory(shard.directory.c_str())) {
+                    Invalid("could not initialize shard");
+                }
+            }
+            const Fd meta(::open((directory + "/METADATA").c_str(),
+                                 O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644));
+            if (meta < 0 || !WriteFields(meta, kMetadataMagic, Fields<4>{kFormatVersion, kNumShards, kFnv1a64, budget}) ||
+                !SyncFile(meta) || !SyncDirectory(directory.c_str())) {
+                Invalid("could not initialize database metadata");
+            }
+        }
+
+        void Open(std::optional<std::size_t> requested_budget) {
+            const Fd meta(::open((path + "/METADATA").c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW));
+            if (FileSize(meta) != kFieldsBytes<4>) Invalid("invalid database metadata length");
+            const auto fields = ReadFields<4>(meta, 0, kMetadataMagic);
+            if (fields[0] != kFormatVersion || fields[1] != kNumShards || fields[2] != kFnv1a64) {
+                Invalid("unsupported database format or routing");
+            }
+            ValidateBudget(fields[3]);
+            if (requested_budget && *requested_budget != fields[3]) Invalid("memtable budget differs from database metadata");
+            shard_budget = static_cast<std::size_t>(fields[3]) / kNumShards;
+            for (std::size_t i = 0; i < shards.size(); ++i) Recover(shards[i], i);
+        }
+
+        void OpenOrCreate(std::optional<std::size_t> budget) {
+            const auto parent = fs::path(path).parent_path();
+            PrepareParent(parent);
+            process_lock = AcquireLock(path);
+            if (Exists(path + ".wal")) Invalid("legacy WAL requires offline migration to a new path");
+            if (!Exists(path)) {
+                Stage stage(parent);
+                Initialize(stage.Path(), budget.value_or(kDefaultMemtableBudget), metrics.get());
+                stage.Publish(path);
+            }
+            Open(budget);
+        }
+
+        static void RemoveUncommittedFiles(const Shard& shard) {
+            bool removed = false;
+            for (const auto& file : fs::directory_iterator(shard.directory)) {
+                const auto name = file.path().filename();
+                const auto extension = name.extension();
+                const auto stem = name.stem().string();
+                std::uint64_t generation = 0;
+                const auto [end, error] = std::from_chars(stem.data(), stem.data() + stem.size(), generation);
+                const bool numbered = error == std::errc{} && end == stem.data() + stem.size();
+                if (name == "MANIFEST.tmp" ||
+                    (numbered && ((extension == ".wal" && generation != shard.tables + 1) ||
+                                  (extension == ".sst" && generation > shard.tables)))) {
+                    if (::unlink(file.path().c_str()) == 0) removed = true;
+                }
+            }
+            if (removed) (void)SyncDirectory(shard.directory.c_str());
+        }
+
+        void Recover(Shard& shard, std::size_t index) {
+            shard.directory = ShardDirectory(path, index);
+            const Fd manifest(::open((shard.directory + "/MANIFEST").c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW));
+            if (FileSize(manifest) != kFieldsBytes<2>) Invalid("invalid shard manifest length");
+            const auto fields = ReadFields<2>(manifest, 0, kManifestMagic);
+            shard.tables = fields[0];
+            shard.flushed = fields[1];
+            if (shard.tables > shard.flushed || shard.tables == std::numeric_limits<std::uint64_t>::max()) {
+                Invalid("invalid shard manifest sequence");
+            }
+
+            std::uint64_t previous = 0;
+            for (std::uint64_t generation = 1; generation <= shard.tables; ++generation) {
+                const Table table(shard.TablePath(generation));
+                table.Validate(index, previous);
+                previous = table.High();
+            }
+            if (previous != shard.flushed) Invalid("sorted table sequence does not match manifest");
+
+            shard.wal = Fd(::open(shard.WalPath(shard.tables + 1).c_str(), O_RDWR | O_APPEND | O_CLOEXEC | O_NOFOLLOW));
+            shard.sequence = shard.flushed;
+            Replay(shard.wal, false, [&](const Header& header, std::string key, std::string value) {
+                if (header.sequence <= shard.sequence || header.sequence - shard.sequence != 1 ||
+                    ShardIndex(key) != index || shard.charged >= shard_budget ||
+                    (shard.charged != 0 && header.Charge() > shard_budget - shard.charged)) {
+                    Invalid("unexpected shard WAL sequence, routing or budget");
+                }
+                shard.sequence = header.sequence;
+                shard.charged += header.Charge();
+                shard.pending.insert_or_assign(std::move(key), Entry{header, std::move(value)});
+            }, metrics.get());
+
+            // The manifest rename may have survived a process crash before its fsync.
+            // Make its observed state durable before removing any obsolete names.
+            if (!SyncDirectory(shard.directory.c_str())) Invalid("could not sync recovered shard");
+            RemoveUncommittedFiles(shard);
+            if (shard.charged >= shard_budget && !Flush(shard)) Invalid("could not flush recovered WAL");
+        }
+
+        bool WriteTable(int fd, const Shard& shard) {
+            std::uint64_t offset = 0;
+            std::uint64_t last = 0;
+            for (const auto& [key, entry] : shard.pending) {
+                if (!WriteRecord(fd, entry.header, key, entry.value, metrics.get(), WriteSource::Compaction)) return false;
+                last = offset;
+                offset += entry.header.Bytes();
+            }
+            const auto index = offset;
+            offset = 0;
+            std::size_t row = 0;
+            for (const auto& [key, entry] : shard.pending) {
+                if (row++ % kBlockRecords == 0) {
+                    char bytes[8];
+                    StoreLe(bytes, offset);
+                    if (!WriteFully(fd, bytes, sizeof(bytes), metrics.get(), WriteSource::Compaction)) return false;
+                }
+                offset += entry.header.Bytes();
+            }
+            return WriteFields(fd, kTableMagic, Fields<5>{index, shard.pending.size(), last,
+                                                        shard.sequence, shard.flushed + 1}, metrics.get());
+        }
+
+        bool Flush(Shard& shard) {
+            if (shard.pending.empty()) return true;
+            const auto generation = shard.tables + 1;
+            const auto retired = shard.WalPath(generation);
+            const auto manifest_path = shard.directory + "/MANIFEST";
+            const auto manifest_tmp = manifest_path + ".tmp";
+
+            // Future generation names are invisible until a durable manifest selects them.
+            const Fd table(::open(shard.TablePath(generation).c_str(),
+                                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW, 0644));
+            if (table < 0 || !WriteTable(table, shard) || !SyncWal(table, true, metrics.get(), WalSync::Compact)) {
+                return false;
+            }
+            Fd next_wal(::open(shard.WalPath(generation + 1).c_str(),
+                               O_RDWR | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0644));
+            const Fd manifest(::open(manifest_tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW, 0644));
+            if (next_wal < 0 || manifest < 0 || !SyncWal(next_wal, true, metrics.get(), WalSync::Open) ||
+                !WriteFields(manifest, kManifestMagic, Fields<2>{generation, shard.sequence}) ||
+                !SyncFile(manifest) || !SyncDirectory(shard.directory.c_str()) ||
+                ::rename(manifest_tmp.c_str(), manifest_path.c_str()) != 0) {
+                return false;
+            }
+            if (!SyncDirectory(shard.directory.c_str())) {
+                failed.store(true);
+                return false;
+            }
+
+            shard.wal = std::move(next_wal);
+            shard.tables = generation;
+            shard.flushed = shard.sequence;
+            shard.pending.clear();
+            shard.charged = 0;
+
+            // Retirement is housekeeping after commit. A failed unlink or sync
+            // can only leave an obsolete WAL, which recovery ignores and retries.
+            if (::unlink(retired.c_str()) == 0) (void)SyncDirectory(shard.directory.c_str());
+            return true;
+        }
+
+        template<class Key, class Value>
+        bool Mutate(RecordType type, Key&& key, Value&& value, std::int64_t expiry) {
+            if (key.size() > kMaxKeyLen || value.size() > kMaxValueLen) return false;
+            std::lock_guard writer(write_mutex);
+            auto& shard = shards[ShardIndex(key)];
+            std::unique_lock lock(shard.mutex);
+            if (failed.load() || shard.sequence >= std::numeric_limits<std::uint64_t>::max() - 1) return false;
+            const Header header{shard.sequence + 1, type, static_cast<std::uint32_t>(key.size()),
+                                static_cast<std::uint32_t>(value.size()), expiry};
+            if (shard.charged != 0 && header.Charge() > shard_budget - shard.charged && !Flush(shard)) {
+                return false;
+            }
+            const auto before = ::lseek(shard.wal, 0, SEEK_END);
+            if (before < 0) return false;
+            if (!WriteRecord(shard.wal, header, key, value, metrics.get(), WriteSource::Wal) ||
+                !SyncWal(shard.wal, true, metrics.get(), WalSync::Append)) {
+                if (!TruncateFile(shard.wal, before) || !SyncWal(shard.wal, true, metrics.get(), WalSync::Rollback)) {
+                    failed.store(true);
+                }
+                return false;
+            }
+            try {
+                shard.pending.insert_or_assign(std::forward<Key>(key), Entry{header, std::forward<Value>(value)});
+                shard.sequence = header.sequence;
+                shard.charged += header.Charge();
+                if (shard.charged < shard_budget || Flush(shard)) return true;
+                failed.store(true);
+                return false;
+            } catch (...) {
+                failed.store(true);
+                throw;
+            }
+        }
+
+        bool FlushAll() {
+            std::lock_guard writer(write_mutex);
+            if (failed.load()) return false;
+            for (auto& shard : shards) {
+                std::unique_lock lock(shard.mutex);
+                if (!Flush(shard)) return false;
+            }
+            return true;
+        }
+
+        void CheckReadable() const {
+            if (failed.load()) Invalid("store requires close and reopen after failure");
+        }
+
+        std::optional<std::string> Get(const std::string& key) const {
+            if (key.size() > kMaxKeyLen) return std::nullopt;
+            const auto& shard = shards[ShardIndex(key)];
+            std::shared_lock lock(shard.mutex);
+            CheckReadable();
+            if (const auto entry = shard.pending.find(key); entry != shard.pending.end()) {
+                if (entry->second.header.Live(NowSeconds())) return entry->second.value;
+                return std::nullopt;
+            }
+            std::lock_guard reader(disk_read_mutex);
+            for (auto i = shard.tables; i != 0; --i) {
+                const Table table(shard.TablePath(i));
+                if (const auto record = table.Find(key)) {
+                    if (record->header.Live(NowSeconds())) return table.Value(*record);
+                    return std::nullopt;
+                }
+            }
+            return std::nullopt;
+        }
+
+        static bool Shadowed(const Shard& shard, std::uint64_t generation, const std::string& key) {
+            if (shard.pending.contains(key)) return true;
+            for (auto newer = shard.tables; newer > generation; --newer) {
+                if (Table(shard.TablePath(newer)).Find(key)) return true;
+            }
+            return false;
+        }
+
+        // Visit only visible versions. Memory is independent of disk file count.
+        // The existing vector API collects and sorts its results outside this loop.
+        template<class Visit>
+        void Scan(std::string_view start, std::string_view end, Visit visit) const {
+            if (!end.empty() && end <= start) return;
+            const auto now = NowSeconds();
+            for (const auto& shard : shards) {
+                std::shared_lock lock(shard.mutex);
+                CheckReadable();
+                for (auto it = shard.pending.lower_bound(start); it != shard.pending.end(); ++it) {
+                    const auto& [key, entry] = *it;
+                    if (!end.empty() && key >= end) break;
+                    if (entry.header.Live(now)) visit(key, [&]() { return entry.value; });
+                }
+                std::lock_guard reader(disk_read_mutex);
+                for (auto i = shard.tables; i != 0; --i) {
+                    const Table table(shard.TablePath(i));
+                    for (auto offset = table.StartOffset(start); offset < table.End();) {
+                        const auto record = table.Read(offset);
+                        if (!end.empty() && record.key >= end) break;
+                        if (record.key >= start && record.header.Live(now) && !Shadowed(shard, i, record.key)) {
+                            visit(record.key, [&]() { return table.Value(record); });
+                        }
+                        offset += record.header.Bytes();
+                    }
+                }
+            }
+        }
+
+        std::string path;
+        std::shared_ptr<Metrics> metrics;
+        Fd process_lock;
+        std::array<Shard, kNumShards> shards;
+        std::size_t shard_budget = 0;
+        std::mutex write_mutex;
+        mutable std::mutex disk_read_mutex;
+        std::atomic<bool> failed{false};
+    };
+
+    KVStore::KVStore(std::string path, std::shared_ptr<Metrics> metrics,
+                     std::optional<std::size_t> memtable_budget)
+        : engine_(std::make_unique<Engine>(AbsoluteStorePath(path), std::move(metrics))) {
+        OperationObservation observation(engine_->metrics.get(), Operation::Recovery);
+        engine_->OpenOrCreate(memtable_budget);
         observation.Success();
     }
 
     KVStore::~KVStore() = default;
 
-    void KVStore::AcquireProcessLock() {
-        lock_fd_.Reset(::open(lock_path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644));
-        if (lock_fd_ < 0) {
-            throw std::runtime_error("KVStore: failed to open lock file: " + lock_path_);
-        }
-        if (::flock(lock_fd_, LOCK_EX | LOCK_NB) != 0) {
-            throw std::runtime_error(
-                "KVStore: store at '" + path_ + "' is locked by another process");
-        }
-    }
-
-    std::size_t KVStore::ShardIndex(const std::string& key) {
-        return std::hash<std::string>{}(key) % kNumShards;
-    }
-
-    Shard& KVStore::ShardFor(const std::string& key) {
-        return shards_[ShardIndex(key)];
-    }
-
-    const Shard& KVStore::ShardFor(const std::string& key) const {
-        return shards_[ShardIndex(key)];
-    }
-
-    std::int64_t KVStore::NowSeconds() {
-        using namespace std::chrono;
-        return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
-    }
-
-    bool KVStore::IsExpired(std::int64_t expires_at) {
-        return expires_at != kNoExpiry && expires_at <= NowSeconds();
-    }
-
-    void KVStore::OpenWalForAppend() {
-        std::lock_guard<std::mutex> lock(wal_mutex_);
-        if (!OpenWalLocked()) {
-            throw std::runtime_error("KVStore: failed to open WAL file: " + wal_path_);
-        }
-    }
-
-    bool KVStore::OpenWalLocked() {
-        if (wal_fd_ >= 0) return true;
-        FileDescriptor fd(::open(wal_path_.c_str(),
-                                 O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644));
-        if (fd < 0) return false;
-        // Sync even on reopen: an earlier failed create may have left the name behind.
-        if (!SyncWal(fd, true, metrics_.get(), WalSync::Open) || !SyncParentDir(wal_path_)) return false;
-        wal_fd_.Reset(fd.Release());
-        return true;
-    }
-
-    void KVStore::Recover() {
-        FileDescriptor fd(::open(wal_path_.c_str(), O_RDWR | O_CLOEXEC));
-        if (fd < 0) {
-            if (errno == ENOENT) return;
-            throw std::runtime_error("KVStore: failed to open WAL for recovery");
-        }
-        struct stat info {};
-        if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0) {
-            throw std::runtime_error("KVStore: WAL must be a readable regular file");
-        }
-        const auto size = static_cast<std::uint64_t>(info.st_size);
-        std::uint64_t good_offset = 0;
-        while (good_offset < size) {
-            constexpr std::size_t header_size = 9;
-            if (size - good_offset < header_size) break;
-            char header[header_size];
-            if (!ReadFully(fd, header, header_size)) {
-                throw std::runtime_error("KVStore: WAL changed during recovery");
-            }
-            const auto type = static_cast<RecordType>(static_cast<std::uint8_t>(header[0]));
-            const std::uint32_t key_len = LoadU32Le(header + 1);
-            const std::uint32_t value_len = LoadU32Le(header + 5);
-            if ((type != RecordType::kSet && type != RecordType::kSetTtl &&
-                 type != RecordType::kDelete) || key_len > kMaxKeyLen ||
-                value_len > kMaxValueLen || (type == RecordType::kDelete && value_len != 0)) {
-                throw std::runtime_error("KVStore: corrupt WAL header; file preserved");
-            }
-            const std::uint64_t payload_size = static_cast<std::uint64_t>(key_len) +
-                value_len + (type == RecordType::kSetTtl ? 8u : 0u);
-            const std::uint64_t record_size = header_size + payload_size + 4;
-            if (record_size > size - good_offset) break; // incomplete final record
-            std::string record(header, header_size);
-            record.resize(static_cast<std::size_t>(header_size + payload_size));
-            if (!ReadFully(fd, record.data() + header_size,
-                           static_cast<std::size_t>(payload_size))) {
-                throw std::runtime_error("KVStore: WAL changed during recovery");
-            }
-            char checksum[4];
-            if (!ReadFully(fd, checksum, sizeof(checksum))) {
-                throw std::runtime_error("KVStore: WAL changed during recovery");
-            }
-            if (Crc32(record.data(), record.size()) != LoadU32Le(checksum)) {
-                if (good_offset + record_size != size) {
-                    throw std::runtime_error("KVStore: non-tail WAL corruption; file preserved");
-                }
-                break; // retain compatibility with recovery of a bad final CRC
-            }
-            std::string key = record.substr(header_size, key_len);
-            auto& data = ShardFor(key).data; // construction is single-threaded
-            if (type == RecordType::kDelete) {
-                data.erase(key);
-            } else {
-                const auto expiry = type == RecordType::kSetTtl
-                    ? LoadI64Le(record.data() + header_size + key_len + value_len)
-                    : kNoExpiry;
-                data[key] = Entry{record.substr(header_size + key_len, value_len), expiry};
-            }
-            good_offset += record_size;
-        }
-        if (good_offset < size &&
-            (!TruncateFile(fd, static_cast<off_t>(good_offset)) || !SyncWal(fd, false, metrics_.get(), WalSync::Recovery))) {
-            throw std::runtime_error("KVStore: failed to durably repair WAL tail");
-        }
-    }
-
-    bool KVStore::AppendRecordLocked(RecordType type, const std::string& key,
-                                    const std::string& value, std::int64_t expires_at) {
-        if (failed_.load()) return false;
-        // reject oversized fields, recovery would treat them as corrupt
-        if (key.size() > kMaxKeyLen) {
-            return false;
-        }
-        if (type != RecordType::kDelete && value.size() > kMaxValueLen) {
-            return false;
-        }
-
-        const std::string record = SerializeRecord(type, key, value, expires_at);
-
-        // tail offset, for rollback on failure
-        const off_t before = ::lseek(wal_fd_, 0, SEEK_END);
-        if (before < 0) {
-            return false;
-        }
-
-        if (!WriteFully(wal_fd_, record.data(), record.size(), metrics_.get(), WriteSource::Wal) ||
-            !SyncWal(wal_fd_, true, metrics_.get(), WalSync::Append)) {
-            // Both rollback and its durability must be established before continuing.
-            if (!TruncateFile(wal_fd_, before) || !SyncWal(wal_fd_, true, metrics_.get(), WalSync::Rollback)) {
-                failed_.store(true);
-            }
-            return false;
-        }
-        return true;
-    }
-
-    bool KVStore::SetInternal(const std::string& key, const std::string& value,
-                                std::int64_t expires_at) {
-        RecordType type = (expires_at == kNoExpiry) ? RecordType::kSet : RecordType::kSetTtl;
-
-        // append + apply under one lock so log order matches memory
-        std::lock_guard<std::mutex> wal_lock(wal_mutex_);
-        if (!AppendRecordLocked(type, key, value, expires_at)) {
-            return false;
-        }
-
-        Shard& shard = ShardFor(key);
-        std::unique_lock lock(shard.mutex, std::defer_lock);
-        try {
-            lock.lock();
-            shard.data[key] = Entry{value, expires_at};
-        } catch (...) {
-            // WAL may already be durable. Do not serve a divergent memory view.
-            failed_.store(true);
-            throw;
-        }
-        return true;
-    }
-
     bool KVStore::Set(const std::string& key, const std::string& value) {
-        OperationObservation observation(metrics_.get(), Operation::Set);
-        return observation.Result(SetInternal(key, value, kNoExpiry));
+        OperationObservation observation(engine_->metrics.get(), Operation::Set);
+        return observation.Result(engine_->Mutate(RecordType::Set, key, value, kNoExpiry));
     }
 
-    bool KVStore::SetWithTtl(const std::string& key, const std::string& value,
-                            std::int64_t ttl_seconds) {
-        OperationObservation observation(metrics_.get(), Operation::SetTtl);
+    bool KVStore::SetWithTtl(const std::string& key, const std::string& value, std::int64_t ttl_seconds) {
+        OperationObservation observation(engine_->metrics.get(), Operation::SetTtl);
         const auto now = NowSeconds();
         if ((ttl_seconds > 0 && now > std::numeric_limits<std::int64_t>::max() - ttl_seconds) ||
-            (ttl_seconds < 0 && now < std::numeric_limits<std::int64_t>::min() - ttl_seconds)) {
-            return false;
-        }
-        std::int64_t expires_at = now + ttl_seconds;
-        if (expires_at == kNoExpiry) {
-            expires_at += 1;  // avoid the no-expiry sentinel
-        }
-        return observation.Result(SetInternal(key, value, expires_at));
-    }
-
-    void KVStore::CheckReadable() const {
-        if (failed_.load()) {
-            throw std::runtime_error("KVStore: store requires close and reopen after failure");
-        }
-    }
-
-    std::optional<std::string> KVStore::Get(const std::string& key) const {
-        OperationObservation observation(metrics_.get(), Operation::Get);
-        const Shard& shard = ShardFor(key);
-        std::shared_lock lock(shard.mutex);
-        CheckReadable();
-        auto it = shard.data.find(key);
-        // Expired reads are misses. The entry is removed at compaction.
-        if (it == shard.data.end() || IsExpired(it->second.expires_at)) {
-            observation.Miss();
-            return std::nullopt;
-        }
-        observation.Success();
-        return it->second.value;
+            (ttl_seconds < 0 && now < std::numeric_limits<std::int64_t>::min() - ttl_seconds)) return false;
+        const auto expiry = now + ttl_seconds;
+        return observation.Result(engine_->Mutate(RecordType::SetTtl, key, value, expiry == kNoExpiry ? 1 : expiry));
     }
 
     bool KVStore::Delete(const std::string& key) {
-        OperationObservation observation(metrics_.get(), Operation::Delete);
-        // append + apply under one lock so log order matches memory
-        std::lock_guard<std::mutex> wal_lock(wal_mutex_);
-        if (!AppendRecordLocked(RecordType::kDelete, key, std::string(), kNoExpiry)) {
-            return false;
-        }
-
-        Shard& shard = ShardFor(key);
-        std::unique_lock lock(shard.mutex, std::defer_lock);
-        try {
-            lock.lock();
-            shard.data.erase(key);
-        } catch (...) {
-            failed_.store(true);
-            throw;
-        }
-        return observation.Result(true);
+        OperationObservation observation(engine_->metrics.get(), Operation::Delete);
+        return observation.Result(engine_->Mutate(RecordType::Delete, key, std::string{}, kNoExpiry));
     }
 
-    std::size_t KVStore::Size() const {
-        OperationObservation observation(metrics_.get(), Operation::Size);
-        CheckReadable();
-        std::size_t total = 0;
-        for (const auto& shard : shards_) {
-            std::shared_lock lock(shard.mutex);
-            CheckReadable();
-            for (const auto& [key, entry] : shard.data) {
-                if (!IsExpired(entry.expires_at)) {
-                    ++total;
-                }
-            }
-        }
-        CheckReadable();
-        observation.Success();
-        return total;
-    }
-
-    std::vector<KeyValue> KVStore::Items() const {
-        return Range(std::string(), std::string());
-    }
-
-    std::vector<KeyValue> KVStore::Range(const std::string& start, const std::string& end) const {
-        OperationObservation observation(metrics_.get(), Operation::Range);
-        CheckReadable();
-        std::vector<KeyValue> result;
-
-        for (const auto& shard : shards_) {
-            std::shared_lock lock(shard.mutex);
-            CheckReadable();
-            for (const auto& [key, entry] : shard.data) {
-                if (IsExpired(entry.expires_at)) {
-                    continue;
-                }
-                if (key < start) {
-                    continue;
-                }
-                if (!end.empty() && key >= end) {
-                    continue;
-                }
-                result.push_back(KeyValue{key, entry.value});
-            }
-        }
-
-        std::sort(result.begin(), result.end(),
-                [](const KeyValue& a, const KeyValue& b) { return a.key < b.key; });
-
-        CheckReadable();
-        observation.Success();
+    std::optional<std::string> KVStore::Get(const std::string& key) const {
+        OperationObservation observation(engine_->metrics.get(), Operation::Get);
+        engine_->CheckReadable();
+        auto result = engine_->Get(key);
+        engine_->CheckReadable();
+        if (result) observation.Success();
+        else observation.Miss();
         return result;
     }
 
     bool KVStore::Compact() {
-        OperationObservation observation(metrics_.get(), Operation::Compact);
-        bool expected = false;
-        if (!compaction_in_progress_.compare_exchange_strong(expected, true)) {
-            return false;  // already compacting
+        OperationObservation observation(engine_->metrics.get(), Operation::Compact);
+        return observation.Result(engine_->FlushAll());
+    }
+
+    std::size_t KVStore::Size() const {
+        OperationObservation observation(engine_->metrics.get(), Operation::Size);
+        engine_->CheckReadable();
+        std::size_t count = 0;
+        engine_->Scan({}, {}, [&](const auto&, const auto&) { ++count; });
+        engine_->CheckReadable();
+        observation.Success();
+        return count;
+    }
+
+    std::vector<KeyValue> KVStore::Items() const { return Range({}, {}); }
+
+    std::vector<KeyValue> KVStore::Range(const std::string& start, const std::string& end) const {
+        OperationObservation observation(engine_->metrics.get(), Operation::Range);
+        engine_->CheckReadable();
+        std::vector<KeyValue> result;
+        engine_->Scan(start, end, [&](const auto& key, const auto& value) { result.push_back({key, value()}); });
+        std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return a.key < b.key; });
+        engine_->CheckReadable();
+        observation.Success();
+        return result;
+    }
+
+    const std::string& KVStore::DatabasePath() const { return engine_->path; }
+
+    std::vector<std::string> KVStore::WalPaths() const {
+        std::lock_guard writer(engine_->write_mutex);
+        std::vector<std::string> result;
+        result.reserve(kNumShards);
+        for (const auto& shard : engine_->shards) result.push_back(shard.WalPath(shard.tables + 1));
+        return result;
+    }
+
+    std::uintmax_t KVStore::WalBytes() const {
+        std::lock_guard writer(engine_->write_mutex);
+        std::uintmax_t bytes = 0;
+        for (const auto& shard : engine_->shards) bytes += FileSize(shard.wal);
+        return bytes;
+    }
+
+    void KVStore::MigrateLegacy(const std::string& source_path, const std::string& destination_path,
+                                std::size_t memtable_budget) {
+        Engine::ValidateBudget(memtable_budget);
+        // Match the legacy engine's exact resolution before adding the sidecar suffix.
+        const auto source = AbsolutePath(source_path).string();
+        const auto destination = AbsoluteStorePath(destination_path);
+        if (source == destination) Invalid("migration requires a different destination");
+        const auto source_lock = AcquireLock(source);
+        const Fd legacy(::open((source + ".wal").c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
+        (void)FileSize(legacy);
+
+        const auto parent = fs::path(destination).parent_path();
+        PrepareParent(parent);
+        const auto destination_lock = AcquireLock(destination);
+        if (Exists(destination) || Exists(destination + ".wal")) Invalid("migration destination already exists");
+
+        Stage stage(parent);
+        Engine::Initialize(stage.Path(), memtable_budget, nullptr);
+        std::array<std::uint64_t, kNumShards> expected{};
+        {
+            Engine staged(stage.Path());
+            staged.Open(memtable_budget);
+            Replay(legacy, true, [&](const Header& header, std::string key, std::string value) {
+                const auto index = ShardIndex(key);
+                if (!staged.Mutate(header.type, std::move(key), std::move(value), header.expiry)) {
+                    Invalid("could not replay legacy mutation");
+                }
+                ++expected[index];
+            });
+            if (!staged.FlushAll()) Invalid("could not flush migrated data");
         }
-
-        struct CompactionGuard {
-            std::atomic<bool>& flag;
-            ~CompactionGuard() { flag.store(false); }
-        } guard{compaction_in_progress_};
-
-        // lock across the snapshot and swap so no write is lost
-        std::lock_guard<std::mutex> wal_lock(wal_mutex_);
-
-        if (failed_.load()) return false;
-        FileDescriptor tmp_fd(::open(wal_tmp_path_.c_str(),
-            O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0644));
-        if (tmp_fd < 0) return false;
-        struct TempCleanup {
-            const std::string& path;
-            ~TempCleanup() { ::unlink(path.c_str()); }
-        } cleanup{wal_tmp_path_};
-
-        for (auto& shard : shards_) {
-            std::shared_lock lock(shard.mutex);
-            CheckReadable();
-            for (const auto& [key, entry] : shard.data) {
-                if (IsExpired(entry.expires_at)) continue;
-                const auto type = entry.expires_at == kNoExpiry
-                    ? RecordType::kSet : RecordType::kSetTtl;
-                const auto record = SerializeRecord(type, key, entry.value, entry.expires_at);
-                if (!WriteFully(tmp_fd, record.data(), record.size(), metrics_.get(), WriteSource::Compaction)) return false;
-            }
-        }
-        if (!SyncWal(tmp_fd, true, metrics_.get(), WalSync::Compact)) return false;
-        // Keep the old fd intact until replacement is durable. The temp fd already
-        // has O_APPEND, avoiding an additional fallible reopen after the rename.
-        if (::rename(wal_tmp_path_.c_str(), wal_path_.c_str()) != 0) return false;
-        try {
-            if (!SyncParentDir(wal_path_)) {
-                failed_.store(true);
-                return false;
-            }
-        } catch (...) {
-            failed_.store(true);
-            throw;
-        }
-        wal_fd_.Reset(tmp_fd.Release());
-
-        // drop expired from memory too
-        for (auto& shard : shards_) {
-            std::unique_lock lock(shard.mutex);
-            for (auto it = shard.data.begin(); it != shard.data.end(); ) {
-                if (IsExpired(it->second.expires_at)) {
-                    it = shard.data.erase(it);
-                } else {
-                    ++it;
+        {
+            Engine validation(stage.Path());
+            validation.Open(memtable_budget);
+            for (std::size_t i = 0; i < kNumShards; ++i) {
+                if (validation.shards[i].flushed != expected[i] || !validation.shards[i].pending.empty()) {
+                    Invalid("migrated shard does not match replayed sequence");
                 }
             }
         }
-
-        return observation.Result(true);
+        stage.Publish(destination);
     }
-
 }

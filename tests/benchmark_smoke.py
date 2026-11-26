@@ -38,8 +38,8 @@ def check_trial(trial, latency_enabled):
 
 def limit_wal_size():
     signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
-    # Allow two complete 93-byte SET records during setup, then fail writes.
-    resource.setrlimit(resource.RLIMIT_FSIZE, (186, 186))
+    # Allow one complete 109-byte SET record during setup, then fail writes to that shard.
+    resource.setrlimit(resource.RLIMIT_FSIZE, (109, 109))
 
 
 with tempfile.TemporaryDirectory(prefix="kvstore-bench-test-") as root:
@@ -82,12 +82,13 @@ with tempfile.TemporaryDirectory(prefix="kvstore-bench-test-") as root:
     assert result.returncode == 0 and recorded["engine_metrics"]
     for workload in recorded["workloads"]:
         resources = workload["trials"][0]["resources"]
-        assert resources["wal_sync_count"] == 5  # Four timed writes and one compaction sync.
-        assert resources["wal_sync_latency"]["samples"] == 5
-        assert resources["compaction_bytes_processed"] == 32 * 93
-        assert resources["bytes_written"] == (32 + 4) * 93
+        # Four writes, plus one table sync and one next-WAL sync per shard.
+        assert resources["wal_sync_count"] == 4 + 2 * 16
+        assert resources["wal_sync_latency"]["samples"] == 4 + 2 * 16
+        assert resources["compaction_bytes_processed"] == 32 * 109 + 16 * (8 + 52)
+        assert resources["bytes_written"] == resources["compaction_bytes_processed"] + 4 * 109
 
-    result, failed = run(root, "--workload", "write", "--keys", "2", "--threads", "1",
+    result, failed = run(root, "--workload", "write", "--keys", "1", "--threads", "1",
                          "--trials", "1", "--mode", "latency", "--engine-metrics", "on", preexec_fn=limit_wal_size)
     assert result.returncode == 1 and failed["passed"] is False, result.stderr
     for workload in failed["workloads"]:

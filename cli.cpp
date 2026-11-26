@@ -36,7 +36,7 @@ namespace {
             "  size                       print the number of keys in the store\n"
             "  keys                       list every live, non-expired key (sorted)\n"
             "  scan <start> [end]         list keys in [start, end), end exclusive and optional\n"
-            "  compact                    rewrite the log down to live, non-expired keys\n"
+            "  compact                    flush pending writes to disk\n"
             "  help                       show this message\n"
             "  exit                       quit\n";
     }
@@ -44,11 +44,27 @@ namespace {
 }
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string_view(argv[1]) == "--migrate") {
+        if (argc != 4) {
+            std::cerr << "usage: kvstore_cli --migrate <legacy_db_path> <new_db_path>\n";
+            return 1;
+        }
+        try {
+            kvstore::KVStore::MigrateLegacy(argv[2], argv[3]);
+            std::cout << "Published migrated database at " << argv[3] << '\n';
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << "Migration failed: " << error.what() << '\n';
+            return 1;
+        }
+    }
+
     std::string db_path = "data/kvstore_cli.db";
     std::string metrics_address = "127.0.0.1";
     std::optional<std::uint16_t> metrics_port;
     bool has_path = false;
-    constexpr auto usage = "usage: kvstore_cli [db_path] [--metrics-port PORT [--metrics-listen IPv4]]\n";
+    constexpr auto usage = "usage: kvstore_cli [db_path] [--metrics-port PORT [--metrics-listen IPv4]]\n"
+                           "       kvstore_cli --migrate <legacy_db_path> <new_db_path>\n";
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
         if (flag == "--help") {
@@ -88,7 +104,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<kvstore::MetricsHttp> exporter;
     if (metrics) {
         try {
-            exporter = std::make_unique<kvstore::MetricsHttp>(*metrics, store->WalPath(), metrics_address, *metrics_port);
+            exporter = std::make_unique<kvstore::MetricsHttp>(*metrics, *store, metrics_address, *metrics_port);
             std::cerr << "metrics listening on " << metrics_address << ':' << exporter->Port() << '\n';
         } catch (const std::exception& error) {
             std::cerr << "metrics exporter unavailable: " << error.what() << '\n';

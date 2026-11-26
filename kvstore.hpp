@@ -1,156 +1,66 @@
 #pragma once
 
-#include <array>
-#include <atomic>
-#include <chrono>
+#include <cstddef>
 #include <cstdint>
-#include <fstream>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <shared_mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace kvstore {
 
-    class Metrics;
+class Metrics;
 
-    constexpr std::size_t kNumShards = 16;
+inline constexpr std::size_t kNumShards = 16;
+inline constexpr std::size_t kDefaultMemtableBudget = 16u << 20;
+inline constexpr std::int64_t kNoExpiry = 0;
+inline constexpr std::uint32_t kMaxKeyLen = 1u << 20;
+inline constexpr std::uint32_t kMaxValueLen = 1u << 28;
 
-    // "no expiry" sentinel
-    constexpr std::int64_t kNoExpiry = 0;
+struct KeyValue {
+    std::string key;
+    std::string value;
+};
 
-    // sanity bounds, a bigger field means a corrupt header
-    constexpr std::uint32_t kMaxKeyLen = 1u << 20;    // 1 MiB
-    constexpr std::uint32_t kMaxValueLen = 1u << 28;  // 256 MiB
+class KVStore {
+public:
+    // Opens or creates a database directory. An existing legacy WAL requires migration.
+    // The budget is shared by the shards and persisted when the database is created.
+    explicit KVStore(std::string path, std::shared_ptr<Metrics> metrics = {},
+                     std::optional<std::size_t> memtable_budget = std::nullopt);
+    ~KVStore();
+    KVStore(const KVStore&) = delete;
+    KVStore& operator=(const KVStore&) = delete;
 
-    enum class RecordType : std::uint8_t {
-        kSet = 1,
-        kDelete = 2,
-        kSetTtl = 3,
-    };
+    // I/O failures return false. After an uncertain failure, writes return false
+    // and reads throw until the store is reopened. Allocation errors can throw.
+    bool Set(const std::string& key, const std::string& value);
+    bool SetWithTtl(const std::string& key, const std::string& value, std::int64_t ttl_seconds);
+    std::optional<std::string> Get(const std::string& key) const;
+    bool Delete(const std::string& key);
 
-    // record prefix, serialized as [type][key_len][value_len][key][value][expires_at?][crc32]
-    struct RecordHeader {
-        RecordType type;
-        std::uint32_t key_len;
-        std::uint32_t value_len;
-    };
+    // Flush all pending memtables synchronously.
+    bool Compact();
 
-    struct Entry {
-        std::string value;
-        std::int64_t expires_at = kNoExpiry;
-    };
+    // Aggregate reads are rolling views across shards.
+    std::size_t Size() const;
+    std::vector<KeyValue> Items() const;
+    // Live pairs in [start, end). Empty end means no upper bound.
+    std::vector<KeyValue> Range(const std::string& start, const std::string& end) const;
 
-    // one keyspace partition, with its own lock
-    struct Shard {
-        mutable std::shared_mutex mutex;
-        std::unordered_map<std::string, Entry> data;
-    };
+    const std::string& DatabasePath() const;
+    // Active paths in shard order. A flush may retire any of these paths.
+    std::vector<std::string> WalPaths() const;
+    std::uintmax_t WalBytes() const;
 
-    struct KeyValue {
-        std::string key;
-        std::string value;
-    };
+    // Replay a legacy <source>.wal into a new destination directory while
+    // holding both process locks. Throws on validation or publication errors.
+    static void MigrateLegacy(const std::string& source, const std::string& destination,
+                              std::size_t memtable_budget = kDefaultMemtableBudget);
 
-    // key-value store backed by a write-ahead log
-    class KVStore {
-    public:
-        // Opens or creates a store; throws on I/O errors or non-tail corruption.
-        // Relative paths bind to the current directory at construction.
-        // Empty paths and paths containing NUL bytes are rejected.
-        // Pass a recorder to enable in-process metrics for this store.
-        explicit KVStore(std::string path, std::shared_ptr<Metrics> metrics = {});
-
-        ~KVStore();
-
-        KVStore(const KVStore&) = delete;
-        KVStore& operator=(const KVStore&) = delete;
-
-        // I/O failures return false. An uncertain failure requires close/reopen;
-        // subsequent writes/compaction return false and reads throw runtime_error.
-        // Allocation errors can throw, including after the WAL becomes durable.
-        bool Set(const std::string& key, const std::string& value);
-
-        // Like Set; nonpositive TTL expires immediately, overflow returns false.
-        bool SetWithTtl(const std::string& key, const std::string& value,
-                        std::int64_t ttl_seconds);
-
-        // value, or empty if absent or expired
-        std::optional<std::string> Get(const std::string& key) const;
-
-        bool Delete(const std::string& key);
-
-        // rewrite the log with only live keys, swapped in atomically
-        bool Compact();
-
-        // Aggregate reads are rolling views across shards, not atomic snapshots.
-        std::size_t Size() const;
-
-        std::vector<KeyValue> Items() const;
-
-        // live pairs in [start, end), empty end means no upper bound
-        std::vector<KeyValue> Range(const std::string& start, const std::string& end) const;
-
-        const std::string& WalPath() const { return wal_path_; }
-
-    private:
-        static std::size_t ShardIndex(const std::string& key);
-
-        Shard& ShardFor(const std::string& key);
-        const Shard& ShardFor(const std::string& key) const;
-
-        static std::int64_t NowSeconds();
-        static bool IsExpired(std::int64_t expires_at);
-
-        bool AppendRecordLocked(RecordType type, const std::string& key,
-                                const std::string& value, std::int64_t expires_at);
-
-        static bool SyncParentDir(const std::string& path);
-        void Recover();
-        void OpenWalForAppend();
-
-        // open or reopen the wal fd, caller must hold wal_mutex_
-        bool OpenWalLocked();
-
-        // exclusive advisory lock so only one process uses the store
-        void AcquireProcessLock();
-
-        bool SetInternal(const std::string& key, const std::string& value,
-                        std::int64_t expires_at);
-
-        std::shared_ptr<Metrics> metrics_;
-        std::string path_;
-        std::string wal_path_;
-        std::string wal_tmp_path_;
-        std::string lock_path_;
-
-        // Owning descriptors also clean up when construction throws.
-        struct FileDescriptor {
-            int value = -1;
-            explicit FileDescriptor(int fd = -1) : value(fd) {}
-            ~FileDescriptor();
-            FileDescriptor(const FileDescriptor&) = delete;
-            FileDescriptor& operator=(const FileDescriptor&) = delete;
-            operator int() const { return value; }
-            void Reset(int fd = -1);
-            int Release();
-        };
-
-        void CheckReadable() const;
-        FileDescriptor lock_fd_;
-
-        std::array<Shard, kNumShards> shards_;
-
-        mutable std::mutex wal_mutex_;
-        FileDescriptor wal_fd_;
-
-        // An uncertain WAL or failed post-WAL memory update requires reopen.
-        std::atomic<bool> failed_{false};
-
-        std::atomic<bool> compaction_in_progress_{false};
-    };
+private:
+    struct Engine;
+    std::unique_ptr<Engine> engine_;
+};
 
 }

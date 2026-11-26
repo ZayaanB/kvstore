@@ -113,6 +113,7 @@ int main() {
         std::cout << "Phase 1 verification PASSED.\n";
     }
 
+    std::string torn_wal;
     PrintHeader("Phase 2: Crash simulation (extra writes + torn record)");
     {
         auto store = std::make_unique<kvstore::KVStore>(kDbPath);
@@ -133,12 +134,13 @@ int main() {
 
         std::cout << "Pre-crash size: " << store->Size() << "\n";
 
+        torn_wal = store->WalPaths().front();
         // "crash" by dropping the store
     }
 
     // append a torn (incomplete) record
     {
-        std::ofstream raw(std::string(kDbPath) + ".wal",
+        std::ofstream raw(torn_wal,
                           std::ios::binary | std::ios::app);
         assert(raw.is_open());
         const char garbage[] = {0x01, 0x02, 0x03}; // incomplete header
@@ -329,17 +331,19 @@ int main() {
     PrintHeader("Phase 7: CRC corruption detection");
     {
         const std::string crc_db = "test_db/kvstore_crc.db";
-        const std::string crc_wal = crc_db + ".wal";
-        std::error_code rm_ec;
-        fs::remove(crc_wal, rm_ec);
+        std::string crc_wal;
 
         // two records, the 2nd is last on disk
         {
             auto store = std::make_unique<kvstore::KVStore>(crc_db);
             [[maybe_unused]] bool ok = store->Set("crc_keep", "good");
             assert(ok);
-            ok = store->Set("crc_corrupt", "target");
+            ok = store->Set("crc_keep", "target");
             assert(ok);
+            for (const auto& path : store->WalPaths()) {
+                if (fs::file_size(path) != 0) crc_wal = path;
+            }
+            assert(!crc_wal.empty());
         }
 
         // corrupt the last record's payload so its crc no longer matches
@@ -368,8 +372,6 @@ int main() {
 
             auto store = std::make_unique<kvstore::KVStore>(crc_db);
             // bad-crc record is dropped, earlier record survives
-            assert(!store->Get("crc_corrupt").has_value() &&
-                   "record with mismatched CRC must be dropped during recovery");
             assert(store->Get("crc_keep").value() == "good");
 
             // recovery must truncate the corrupt tail, not leave it in place
@@ -389,7 +391,6 @@ int main() {
             assert(store->Get("crc_keep").value() == "good");
             assert(store->Get("crc_after").value() == "fresh" &&
                    "writes appended after recovery must persist across restart");
-            assert(!store->Get("crc_corrupt").has_value());
         }
         std::cout << "Phase 7 (CRC corruption detection) PASSED.\n";
     }

@@ -7,11 +7,12 @@
 namespace kvstore {
 
 class Metrics;
+class KVStore;
 
 // Used by the CLI only. The embedded engine never opens a network listener.
 class MetricsHttp {
 public:
-    MetricsHttp(const Metrics& metrics, std::string wal_path, const std::string& address, std::uint16_t port);
+    MetricsHttp(const Metrics& metrics, const KVStore& store, const std::string& address, std::uint16_t port);
     ~MetricsHttp();
     std::uint16_t Port() const;
 
