@@ -1,5 +1,6 @@
 #include "kvstore.hpp"
 #include "metrics.hpp"
+#include "routing.hpp"
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -30,6 +31,8 @@ namespace kvstore {
     namespace fs = std::filesystem;
 
     namespace {
+        using detail::Routing;
+        using detail::ShardIndex;
 
         class OperationObservation {
         public:
@@ -77,10 +80,12 @@ namespace kvstore {
             if (!absolute.has_filename() || absolute.filename() == "." || absolute.filename() == "..") {
                 throw std::invalid_argument("KVStore: invalid database root");
             }
+            // A symlink to the database must use the target's sibling lock.
+            if (fs::is_symlink(fs::symlink_status(absolute))) absolute = fs::canonical(absolute);
+            if (!absolute.has_filename()) throw std::invalid_argument("KVStore: invalid database root");
             return absolute.string();
         }
 
-        // precomputed crc32 table
         struct Crc32Table {
             std::uint32_t v[256];
             constexpr Crc32Table() : v{} {
@@ -95,7 +100,6 @@ namespace kvstore {
         };
         constexpr Crc32Table kCrc32Table{};
 
-        // write every byte, retrying partial writes and EINTR
         bool WriteFully(int fd, const char* data, std::size_t len,
                         Metrics* metrics, WriteSource source) {
             std::size_t written = 0;
@@ -108,7 +112,7 @@ namespace kvstore {
                     return false;
                 }
                 if (n == 0) {
-                    return false;  // no progress, don't spin
+                    return false;
                 }
                 written += static_cast<std::size_t>(n);
                 if (metrics) metrics->AddWritten(source, static_cast<std::uint64_t>(n));
@@ -140,6 +144,11 @@ namespace kvstore {
             return result == 0;
         }
 
+        class StorageError : public std::runtime_error {
+        public:
+            using std::runtime_error::runtime_error;
+        };
+
         // Read errors must never be mistaken for a torn tail.
         bool ReadFully(int fd, char* data, std::size_t length) {
             std::size_t done = 0;
@@ -147,7 +156,7 @@ namespace kvstore {
                 const ssize_t n = ::read(fd, data + done, length - done);
                 if (n < 0) {
                     if (errno == EINTR) continue;
-                    throw std::runtime_error("KVStore: file read failed");
+                    throw StorageError("KVStore: file read failed");
                 }
                 if (n == 0) return false;
                 done += static_cast<std::size_t>(n);
@@ -156,7 +165,7 @@ namespace kvstore {
         }
 
         [[noreturn]] void Invalid(const char* reason) {
-            throw std::runtime_error(std::string("KVStore: ") + reason);
+            throw StorageError(std::string("KVStore: ") + reason);
         }
 
         class Fd {
@@ -199,8 +208,8 @@ namespace kvstore {
 
         class Stage {
         public:
-            explicit Stage(const fs::path& parent)
-                : path_((parent / ".kvstore-stage-XXXXXX").string()) {
+            explicit Stage(const fs::path& parent, const char* pattern = ".kvstore-stage-XXXXXX")
+                : path_((parent / pattern).string()) {
                 if (::mkdtemp(path_.data()) == nullptr) Invalid("could not create staging directory");
             }
             ~Stage() {
@@ -208,6 +217,7 @@ namespace kvstore {
                 if (!path_.empty()) fs::remove_all(path_, error);
             }
             const std::string& Path() const { return path_; }
+            void Release() noexcept { path_.clear(); }
             void Publish(const std::string& destination) {
                 const auto parent = fs::path(destination).parent_path();
                 if (Exists(destination) || ::rename(path_.c_str(), destination.c_str()) != 0) {
@@ -228,6 +238,22 @@ namespace kvstore {
                 Invalid("expected a readable regular file");
             }
             return static_cast<std::uint64_t>(info.st_size);
+        }
+
+        void CopyDurable(const std::string& source, const std::string& destination) {
+            const Fd input(::open(source.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+            const Fd output(::open(destination.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644));
+            auto remaining = FileSize(input);
+            std::array<char, 64 * 1024> buffer;
+            while (remaining != 0) {
+                const auto length = static_cast<std::size_t>(std::min<std::uint64_t>(buffer.size(), remaining));
+                if (!ReadFully(input, buffer.data(), length) ||
+                    !WriteFully(output, buffer.data(), length, nullptr, WriteSource::Compaction)) {
+                    Invalid("could not copy checkpoint file");
+                }
+                remaining -= length;
+            }
+            if (!SyncFile(output)) Invalid("could not sync checkpoint file");
         }
 
         void ReadAt(int fd, std::uint64_t offset, char* data, std::size_t length) {
@@ -274,16 +300,6 @@ namespace kvstore {
             Checksum crc;
             crc.Add(bytes);
             return crc.Value();
-        }
-
-        // FNV-1a over unsigned key bytes, modulo the versioned shard count.
-        std::size_t ShardIndex(std::string_view key) {
-            std::uint64_t hash = 14695981039346656037ull;
-            for (const auto byte : key) {
-                hash ^= static_cast<unsigned char>(byte);
-                hash *= 1099511628211ull;
-            }
-            return hash % kNumShards;
         }
 
         std::int64_t NowSeconds() {
@@ -357,9 +373,9 @@ namespace kvstore {
 
         constexpr std::string_view kMetadataMagic = "KVDB0001";
         constexpr std::uint64_t kFormatVersion = 1;
-        constexpr std::uint64_t kFnv1a64 = 1;
         constexpr std::string_view kManifestMagic = "KVMAN001";
         constexpr std::string_view kTableMagic = "KVSST001";
+        constexpr std::string_view kIdentityMagic = "KVID0001";
         constexpr std::size_t kBlockRecords = 16;
 
         // Fixed-size metadata is little endian and checksummed, including its magic.
@@ -412,13 +428,17 @@ namespace kvstore {
                 low_ = fields[4];
                 blocks_ = count_ == 0 ? 0 : (count_ - 1) / kBlockRecords + 1;
                 const auto payload = size - kFieldsBytes<5>;
-                if (count_ == 0 || count_ > index_ / (kHeaderBytes + kChecksumBytes) || last_ >= index_ ||
+                if ((count_ == 0 ? index_ != 0 || last_ != 0 : last_ >= index_) ||
+                    count_ > index_ / (kHeaderBytes + kChecksumBytes) ||
                     index_ > payload || (payload - index_) % 8 != 0 || (payload - index_) / 8 != blocks_ ||
-                    low_ == 0 || low_ > high_ || count_ - 1 > high_ - low_) Invalid("invalid sorted table footer");
+                    low_ == 0 || low_ > high_ || (count_ != 0 && count_ - 1 > high_ - low_)) {
+                    Invalid("invalid sorted table footer");
+                }
             }
 
             std::uint64_t End() const { return index_; }
             std::uint64_t High() const { return high_; }
+            std::uint64_t Low() const { return low_; }
 
             Record Read(std::uint64_t offset) const {
                 if (offset >= index_ || index_ - offset < kHeaderBytes) Invalid("invalid sorted table offset");
@@ -434,7 +454,7 @@ namespace kvstore {
             }
 
             std::optional<Record> Find(std::string_view key) const {
-                if (key < Read(0).key || key > Read(last_).key) return std::nullopt;
+                if (count_ == 0 || key < Read(0).key || key > Read(last_).key) return std::nullopt;
                 const auto block = SearchBlock(key);
                 const auto end = block + 1 == blocks_ ? index_ : BlockOffset(block + 1);
                 for (auto offset = BlockOffset(block); offset < end;) {
@@ -447,7 +467,7 @@ namespace kvstore {
             }
 
             std::uint64_t StartOffset(std::string_view key) const {
-                if (key.empty()) return 0;
+                if (count_ == 0 || key.empty()) return 0;
                 if (key > Read(last_).key) return index_;
                 return BlockOffset(SearchBlock(key));
             }
@@ -462,35 +482,41 @@ namespace kvstore {
                 return value;
             }
 
-            void Validate(std::size_t shard, std::uint64_t previous) const {
+            void ValidateRecord(const Record& record) const {
+                auto checksum = record.prefix;
+                auto offset = record.offset + kHeaderBytes + record.key.size();
+                auto remaining = static_cast<std::size_t>(record.header.value_length);
+                std::array<char, 64 * 1024> buffer;
+                while (remaining != 0) {
+                    const auto bytes = std::min(buffer.size(), remaining);
+                    ReadAt(fd_, offset, buffer.data(), bytes);
+                    checksum.Add({buffer.data(), bytes});
+                    offset += bytes;
+                    remaining -= bytes;
+                }
+                VerifyChecksum(offset, checksum);
+            }
+
+            void Validate(std::size_t shard, std::uint64_t previous, Routing routing, bool merged = false) const {
                 if (low_ - 1 != previous) Invalid("nonconsecutive sorted table sequence range");
                 std::uint64_t offset = 0;
                 std::uint64_t largest = 0;
                 std::string previous_key;
-                std::array<char, 64 * 1024> buffer;
                 for (std::uint64_t i = 0; i < count_; ++i) {
                     if ((i % kBlockRecords == 0 && BlockOffset(i / kBlockRecords) != offset) ||
                         (i == count_ - 1 && last_ != offset)) Invalid("invalid sorted table index");
                     auto record = Read(offset);
-                    if (ShardIndex(record.key) != shard || (i != 0 && record.key <= previous_key) ||
+                    if (ShardIndex(record.key, routing, kNumShards) != shard ||
+                        (i != 0 && record.key <= previous_key) ||
                         record.header.sequence < low_ || record.header.sequence > high_) {
                         Invalid("invalid sorted table record order or shard");
                     }
-                    auto value_offset = offset + kHeaderBytes + record.key.size();
-                    auto remaining = static_cast<std::size_t>(record.header.value_length);
-                    while (remaining != 0) {
-                        const auto bytes = std::min(buffer.size(), remaining);
-                        ReadAt(fd_, value_offset, buffer.data(), bytes);
-                        record.prefix.Add({buffer.data(), bytes});
-                        value_offset += bytes;
-                        remaining -= bytes;
-                    }
-                    VerifyChecksum(value_offset, record.prefix);
+                    ValidateRecord(record);
                     largest = std::max(largest, record.header.sequence);
                     previous_key = std::move(record.key);
                     offset += record.header.Bytes();
                 }
-                if (offset != index_ || largest != high_) Invalid("invalid sorted table extent");
+                if (offset != index_ || (!merged && largest != high_)) Invalid("invalid sorted table extent");
             }
 
         private:
@@ -520,9 +546,77 @@ namespace kvstore {
             std::uint64_t index_, count_, last_, high_, low_, blocks_;
         };
 
+        class TableCursor {
+        public:
+            explicit TableCursor(const std::string& path, std::string_view start = {})
+                : table(path), offset_(table.StartOffset(start)) {}
+
+            std::optional<Table::Record> Next() {
+                if (offset_ == table.End()) return std::nullopt;
+                auto record = table.Read(offset_);
+                offset_ += record.header.Bytes();
+                return record;
+            }
+
+            Table table;
+
+        private:
+            std::uint64_t offset_;
+        };
+
+        bool MergeTables(const std::string& older_path, const std::string& newer_path,
+                         const std::string& output, std::optional<std::int64_t> prune_at,
+                         Metrics* metrics) {
+            TableCursor older(older_path), newer(newer_path);
+            if (older.table.High() != newer.table.Low() - 1) Invalid("cannot merge nonconsecutive tables");
+            const Fd fd(::open(output.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644));
+            if (fd < 0) return false;
+            auto a = older.Next();
+            auto b = newer.Next();
+            std::uint64_t offset = 0, last = 0, count = 0;
+            while (a || b) {
+                const bool use_older = a && (!b || a->key < b->key);
+                const auto& row = use_older ? *a : *b;
+                const auto& table = use_older ? older.table : newer.table;
+                if (prune_at && !row.header.Live(*prune_at)) table.ValidateRecord(row);
+                else {
+                    if (!WriteRecord(fd, row.header, row.key, table.Value(row), metrics, WriteSource::Compaction)) {
+                        return false;
+                    }
+                    last = offset;
+                    offset += row.header.Bytes();
+                    ++count;
+                }
+                if (use_older) a = older.Next();
+                else {
+                    if (a && a->key == b->key) {
+                        older.table.ValidateRecord(*a);
+                        a = older.Next();
+                    }
+                    b = newer.Next();
+                }
+            }
+            const auto index = offset;
+            offset = 0;
+            for (std::uint64_t row = 0; row < count; ++row) {
+                if (row % kBlockRecords == 0) {
+                    char entry[8];
+                    StoreLe(entry, offset);
+                    if (!WriteFully(fd, entry, sizeof(entry), metrics, WriteSource::Compaction)) return false;
+                }
+                char header[kHeaderBytes];
+                ReadAt(fd, offset, header, sizeof(header));
+                offset += DecodeHeader(header).Bytes();
+            }
+            return WriteFields(fd, kTableMagic,
+                               Fields<5>{index, count, last, newer.table.High(), older.table.Low()}, metrics) &&
+                   SyncFile(fd, true);
+        }
+
         // Sequential reader shared by the legacy migration and the active shard WAL.
         template<class Apply>
-        std::uint64_t Replay(int fd, bool legacy, Apply apply, Metrics* metrics = nullptr) {
+        std::uint64_t Replay(int fd, bool legacy, Apply apply, Metrics* metrics = nullptr,
+                             bool repair = true) {
             const auto size = FileSize(fd);
             std::uint64_t offset = 0;
             const std::size_t header_bytes = legacy ? 9 : kHeaderBytes;
@@ -563,16 +657,15 @@ namespace kvstore {
                 }
                 read(bytes, kChecksumBytes);
                 if (crc.Value() != LoadLe<std::uint32_t>(bytes)) {
-                    if (!legacy && record_bytes == size - offset) break;
+                    if (!legacy && repair && record_bytes == size - offset) break;
                     Invalid("WAL checksum mismatch");
                 }
                 apply(header, std::move(key), std::move(value));
                 offset += record_bytes;
             }
             // Incomplete legacy tails are ignored without touching the source.
-            if (!legacy && offset != size &&
-                (!TruncateFile(fd, static_cast<off_t>(offset)) ||
-                 !SyncWal(fd, false, metrics, WalSync::Recovery))) {
+            if (!legacy && offset != size && (!repair || !TruncateFile(fd, static_cast<off_t>(offset)) ||
+                                              !SyncWal(fd, false, metrics, WalSync::Recovery))) {
                 Invalid("could not durably repair WAL tail");
             }
             return offset;
@@ -582,9 +675,12 @@ namespace kvstore {
     struct KVStore::Engine {
         struct Shard {
             std::string directory;
+            std::size_t index = 0;
             mutable std::shared_mutex mutex;
+            mutable std::atomic<bool> unavailable{false};
             Memtable pending;
             std::size_t charged = 0;
+            std::uint64_t base = 0;
             std::uint64_t tables = 0;
             std::uint64_t flushed = 0;
             std::uint64_t sequence = 0;
@@ -595,12 +691,18 @@ namespace kvstore {
                 return directory + "/" + std::to_string(generation) + ".wal";
             }
             std::string TablePath(std::uint64_t generation) const {
+                if (generation == base) return BasePath(generation);
                 return directory + "/" + std::to_string(generation) + ".sst";
             }
+            std::string BasePath(std::uint64_t generation) const {
+                return directory + "/base-" + std::to_string(generation) + ".sst";
+            }
+            std::uint64_t FirstTable() const { return std::max(std::uint64_t{1}, base); }
         };
 
-        explicit Engine(std::string directory, std::shared_ptr<Metrics> recorder = {})
-            : path(std::move(directory)), metrics(std::move(recorder)) {}
+        explicit Engine(std::string directory, std::shared_ptr<Metrics> recorder = {},
+                        OpenMode mode = OpenMode::Strict)
+            : path(std::move(directory)), metrics(std::move(recorder)), open_mode(mode) {}
 
         static void ValidateBudget(std::uint64_t budget) {
             if (budget < kNumShards * kRecordOverhead || budget > std::numeric_limits<std::size_t>::max()) {
@@ -630,36 +732,106 @@ namespace kvstore {
             }
             const Fd meta(::open((directory + "/METADATA").c_str(),
                                  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644));
-            if (meta < 0 || !WriteFields(meta, kMetadataMagic, Fields<4>{kFormatVersion, kNumShards, kFnv1a64, budget}) ||
+            if (meta < 0 || !WriteFields(meta, kMetadataMagic, Fields<4>{
+                    kFormatVersion, kNumShards, static_cast<std::uint64_t>(Routing::Rendezvous), budget}) ||
                 !SyncFile(meta) || !SyncDirectory(directory.c_str())) {
                 Invalid("could not initialize database metadata");
             }
         }
 
-        void Open(std::optional<std::size_t> requested_budget) {
+        Fields<4> ReadMetadata(std::optional<std::size_t> requested_budget = std::nullopt) {
             const Fd meta(::open((path + "/METADATA").c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW));
             if (FileSize(meta) != kFieldsBytes<4>) Invalid("invalid database metadata length");
             const auto fields = ReadFields<4>(meta, 0, kMetadataMagic);
-            if (fields[0] != kFormatVersion || fields[1] != kNumShards || fields[2] != kFnv1a64) {
+            routing = static_cast<Routing>(fields[2]);
+            if (fields[0] != kFormatVersion || fields[1] != kNumShards ||
+                (routing != Routing::Modulo && routing != Routing::Rendezvous)) {
                 Invalid("unsupported database format or routing");
             }
             ValidateBudget(fields[3]);
             if (requested_budget && *requested_budget != fields[3]) Invalid("memtable budget differs from database metadata");
             shard_budget = static_cast<std::size_t>(fields[3]) / kNumShards;
-            for (std::size_t i = 0; i < shards.size(); ++i) Recover(shards[i], i);
+            return fields;
+        }
+
+        void Open(std::optional<std::size_t> requested_budget, bool repair = true) {
+            ReadMetadata(requested_budget);
+            if (!SyncDirectory(path.c_str())) Invalid("could not sync database directory");
+            for (std::size_t i = 0; i < shards.size(); ++i) {
+                auto& shard = shards[i];
+                shard.index = i;
+                try {
+                    shard.directory = SelectedDirectory(path, i);
+                    Recover(shard, i, repair);
+                } catch (const StorageError&) {
+                    if (open_mode != OpenMode::Degraded) throw;
+                    MarkFailed(shard);
+                } catch (const fs::filesystem_error&) {
+                    if (open_mode != OpenMode::Degraded) throw;
+                    MarkFailed(shard);
+                }
+            }
         }
 
         void OpenOrCreate(std::optional<std::size_t> budget) {
             const auto parent = fs::path(path).parent_path();
+            if (open_mode != OpenMode::Strict && !Exists(path)) Invalid("database directory does not exist");
             PrepareParent(parent);
             process_lock = AcquireLock(path);
             if (Exists(path + ".wal")) Invalid("legacy WAL requires offline migration to a new path");
             if (!Exists(path)) {
+                if (open_mode != OpenMode::Strict) Invalid("database directory does not exist");
                 Stage stage(parent);
                 Initialize(stage.Path(), budget.value_or(kDefaultMemtableBudget), metrics.get());
                 stage.Publish(path);
             }
-            Open(budget);
+            Open(budget, open_mode != OpenMode::Existing);
+        }
+
+        static std::string RestorePrefix(std::size_t index) {
+            return ".shard-" + std::to_string(index) + "-restore-";
+        }
+
+        static std::string ShardPointer(const std::string& root, std::size_t index) {
+            return ShardDirectory(root, index) + ".CURRENT";
+        }
+
+        static std::string SelectedDirectory(const std::string& root, std::size_t index) {
+            const auto pointer = ShardPointer(root, index);
+            if (!Exists(pointer)) return ShardDirectory(root, index);
+            const auto name = fs::read_symlink(pointer).string();
+            const auto prefix = RestorePrefix(index);
+            if (!name.starts_with(prefix) || name.size() != prefix.size() + 6 ||
+                name.find_first_not_of("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", prefix.size()) !=
+                    std::string::npos || !fs::is_directory(fs::symlink_status(root + "/" + name))) {
+                Invalid("invalid restored shard pointer");
+            }
+            return root + "/" + name;
+        }
+
+        static Fields<2> ReadIdentity(const std::string& root) {
+            const Fd fd(::open((root + "/IDENTITY").c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+            if (FileSize(fd) != kFieldsBytes<2>) Invalid("invalid database identity");
+            return ReadFields<2>(fd, 0, kIdentityMagic);
+        }
+
+        static void EnsureIdentity(const std::string& root) {
+            const auto identity = root + "/IDENTITY";
+            if (Exists(identity)) {
+                (void)ReadIdentity(root);
+                if (!SyncDirectory(root.c_str())) Invalid("could not sync database identity");
+                return;
+            }
+            const auto temporary = identity + ".tmp";
+            const Fd random(::open("/dev/urandom", O_RDONLY | O_CLOEXEC));
+            const Fd output(::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC |
+                                                      O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0644));
+            Fields<2> id{};
+            if (!ReadFully(random, reinterpret_cast<char*>(id.data()), sizeof(id)) ||
+                !WriteFields(output, kIdentityMagic, id) || !SyncFile(output) ||
+                ::rename(temporary.c_str(), identity.c_str()) != 0 || !SyncDirectory(root.c_str())) {
+                Invalid("could not save database identity");
+            }
         }
 
         static void RemoveUncommittedFiles(const Shard& shard) {
@@ -667,34 +839,51 @@ namespace kvstore {
             for (const auto& file : fs::directory_iterator(shard.directory)) {
                 const auto name = file.path().filename();
                 const auto extension = name.extension();
-                const auto stem = name.stem().string();
+                auto stem = name.stem().string();
+                const bool base = stem.starts_with("base-");
+                if (base) stem.erase(0, 5);
                 std::uint64_t generation = 0;
                 const auto [end, error] = std::from_chars(stem.data(), stem.data() + stem.size(), generation);
                 const bool numbered = error == std::errc{} && end == stem.data() + stem.size();
                 if (name == "MANIFEST.tmp" ||
-                    (numbered && ((extension == ".wal" && generation != shard.tables + 1) ||
-                                  (extension == ".sst" && generation > shard.tables)))) {
+                    (numbered && ((!base && extension == ".wal" && generation != shard.tables + 1) ||
+                                  (extension == ".sst" && (base ? generation != shard.base :
+                                                           generation <= shard.base || generation > shard.tables))))) {
                     if (::unlink(file.path().c_str()) == 0) removed = true;
+                }
+                if (name.string().starts_with(".kvstore-merge-")) {
+                    std::error_code ignored;
+                    fs::remove_all(file.path(), ignored);
                 }
             }
             if (removed) (void)SyncDirectory(shard.directory.c_str());
         }
 
-        void Recover(Shard& shard, std::size_t index) {
-            shard.directory = ShardDirectory(path, index);
+        static void ReadShardManifest(Shard& shard) {
             const Fd manifest(::open((shard.directory + "/MANIFEST").c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW));
-            if (FileSize(manifest) != kFieldsBytes<2>) Invalid("invalid shard manifest length");
-            const auto fields = ReadFields<2>(manifest, 0, kManifestMagic);
-            shard.tables = fields[0];
-            shard.flushed = fields[1];
-            if (shard.tables > shard.flushed || shard.tables == std::numeric_limits<std::uint64_t>::max()) {
+            const auto manifest_size = FileSize(manifest);
+            if (manifest_size == kFieldsBytes<2>) {
+                const auto fields = ReadFields<2>(manifest, 0, kManifestMagic);
+                shard.tables = fields[0];
+                shard.flushed = fields[1];
+            } else if (manifest_size == kFieldsBytes<3>) {
+                const auto fields = ReadFields<3>(manifest, 0, kManifestMagic);
+                shard.tables = fields[0];
+                shard.flushed = fields[1];
+                shard.base = fields[2];
+            } else Invalid("invalid shard manifest length");
+            if (shard.base > shard.tables || shard.tables > shard.flushed ||
+                shard.tables == std::numeric_limits<std::uint64_t>::max()) {
                 Invalid("invalid shard manifest sequence");
             }
+        }
 
+        void Recover(Shard& shard, std::size_t index, bool repair = true) {
+            ReadShardManifest(shard);
             std::uint64_t previous = 0;
-            for (std::uint64_t generation = 1; generation <= shard.tables; ++generation) {
+            for (auto generation = shard.FirstTable(); generation <= shard.tables; ++generation) {
                 const Table table(shard.TablePath(generation));
-                table.Validate(index, previous);
+                table.Validate(index, previous, routing, generation == shard.base);
                 previous = table.High();
             }
             if (previous != shard.flushed) Invalid("sorted table sequence does not match manifest");
@@ -703,14 +892,14 @@ namespace kvstore {
             shard.sequence = shard.flushed;
             const auto recovered_bytes = Replay(shard.wal, false, [&](const Header& header, std::string key, std::string value) {
                 if (header.sequence <= shard.sequence || header.sequence - shard.sequence != 1 ||
-                    ShardIndex(key) != index || shard.charged >= shard_budget ||
+                    Index(key) != index || shard.charged >= shard_budget ||
                     (shard.charged != 0 && header.Charge() > shard_budget - shard.charged)) {
                     Invalid("unexpected shard WAL sequence, routing or budget");
                 }
                 shard.sequence = header.sequence;
                 shard.charged += header.Charge();
                 shard.pending.insert_or_assign(std::move(key), Entry{header, std::move(value)});
-            }, metrics.get());
+            }, metrics.get(), repair);
             if (metrics) shard.committed_wal_bytes.store(recovered_bytes, std::memory_order_relaxed);
 
             // The manifest rename may have survived a process crash before its fsync.
@@ -718,6 +907,17 @@ namespace kvstore {
             if (!SyncDirectory(shard.directory.c_str())) Invalid("could not sync recovered shard");
             RemoveUncommittedFiles(shard);
             if (shard.charged >= shard_budget && !Flush(shard)) Invalid("could not flush recovered WAL");
+        }
+
+        static void CopyShard(const Shard& shard, const std::string& destination) {
+            CopyDurable(shard.directory + "/MANIFEST", destination + "/MANIFEST");
+            for (auto generation = shard.FirstTable(); generation <= shard.tables; ++generation) {
+                const auto source = shard.TablePath(generation);
+                CopyDurable(source, destination + "/" + fs::path(source).filename().string());
+            }
+            const auto wal = shard.WalPath(shard.tables + 1);
+            CopyDurable(wal, destination + "/" + fs::path(wal).filename().string());
+            if (!SyncDirectory(destination.c_str())) Invalid("could not sync checkpoint shard");
         }
 
         bool WriteTable(int fd, const Shard& shard) {
@@ -743,6 +943,11 @@ namespace kvstore {
                                                         shard.sequence, shard.flushed + 1}, metrics.get());
         }
 
+        static bool WriteManifest(int fd, std::uint64_t generation, std::uint64_t sequence, std::uint64_t base) {
+            if (base == 0) return WriteFields(fd, kManifestMagic, Fields<2>{generation, sequence});
+            return WriteFields(fd, kManifestMagic, Fields<3>{generation, sequence, base});
+        }
+
         bool Flush(Shard& shard) {
             if (shard.pending.empty()) return true;
             OperationObservation observation(metrics.get(), Operation::Flush);
@@ -761,13 +966,13 @@ namespace kvstore {
                                O_RDWR | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0644));
             const Fd manifest(::open(manifest_tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW, 0644));
             if (next_wal < 0 || manifest < 0 || !SyncWal(next_wal, true, metrics.get(), WalSync::Open) ||
-                !WriteFields(manifest, kManifestMagic, Fields<2>{generation, shard.sequence}) ||
+                !WriteManifest(manifest, generation, shard.sequence, shard.base) ||
                 !SyncFile(manifest) || !SyncDirectory(shard.directory.c_str()) ||
                 ::rename(manifest_tmp.c_str(), manifest_path.c_str()) != 0) {
                 return false;
             }
             if (!SyncDirectory(shard.directory.c_str())) {
-                failed.store(true);
+                MarkFailed(shard);
                 return false;
             }
 
@@ -789,9 +994,10 @@ namespace kvstore {
         bool Mutate(RecordType type, Key&& key, Value&& value, std::int64_t expiry) {
             if (key.size() > kMaxKeyLen || value.size() > kMaxValueLen) return false;
             std::lock_guard writer(write_mutex);
-            auto& shard = shards[ShardIndex(key)];
+            auto& shard = shards[Index(key)];
             std::unique_lock lock(shard.mutex);
-            if (failed.load() || shard.sequence >= std::numeric_limits<std::uint64_t>::max() - 1) return false;
+            if (failed.load() || shard.unavailable.load() ||
+                shard.sequence >= std::numeric_limits<std::uint64_t>::max() - 1) return false;
             const Header header{shard.sequence + 1, type, static_cast<std::uint32_t>(key.size()),
                                 static_cast<std::uint32_t>(value.size()), expiry};
             if (shard.charged != 0 && header.Charge() > shard_budget - shard.charged && !Flush(shard)) {
@@ -802,7 +1008,7 @@ namespace kvstore {
             if (!WriteRecord(shard.wal, header, key, value, metrics.get(), WriteSource::Wal) ||
                 !SyncWal(shard.wal, true, metrics.get(), WalSync::Append)) {
                 if (!TruncateFile(shard.wal, before) || !SyncWal(shard.wal, true, metrics.get(), WalSync::Rollback)) {
-                    failed.store(true);
+                    MarkFailed(shard);
                 }
                 return false;
             }
@@ -815,10 +1021,10 @@ namespace kvstore {
                 shard.sequence = header.sequence;
                 shard.charged += header.Charge();
                 if (shard.charged < shard_budget || Flush(shard)) return true;
-                failed.store(true);
+                MarkFailed(shard);
                 return false;
             } catch (...) {
-                failed.store(true);
+                MarkFailed(shard);
                 throw;
             }
         }
@@ -833,15 +1039,91 @@ namespace kvstore {
             return true;
         }
 
+        std::string MergeRange(const Shard& shard, const std::string& scratch, std::uint64_t first,
+                               std::uint64_t last, std::optional<std::int64_t> prune_at) {
+            if (first == last) return shard.TablePath(first);
+            const auto middle = first + (last - first) / 2;
+            const auto older = MergeRange(shard, scratch, first, middle, std::nullopt);
+            if (older.empty()) return {};
+            const auto newer = MergeRange(shard, scratch, middle + 1, last, std::nullopt);
+            if (newer.empty()) return {};
+            const auto output = scratch + "/" + std::to_string(first) + "-" + std::to_string(last) + ".sst";
+            if (!MergeTables(older, newer, output, prune_at, metrics.get())) return {};
+            if (first != middle) (void)::unlink(older.c_str());
+            if (middle + 1 != last) (void)::unlink(newer.c_str());
+            return output;
+        }
+
+        bool Merge(Shard& shard) {
+            const auto first = shard.FirstTable();
+            if (first >= shard.tables) return true;
+            const Stage scratch(shard.directory, ".kvstore-merge-XXXXXX");
+            const auto merged = MergeRange(shard, scratch.Path(), first, shard.tables, NowSeconds());
+            if (merged.empty()) return false;
+            const auto base = shard.BasePath(shard.tables);
+            const auto manifest_path = shard.directory + "/MANIFEST";
+            const auto manifest_tmp = manifest_path + ".tmp";
+            const Fd manifest(::open(manifest_tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC |
+                                                           O_NONBLOCK | O_NOFOLLOW, 0644));
+            if (manifest < 0 || !WriteManifest(manifest, shard.tables, shard.flushed, shard.tables) ||
+                !SyncFile(manifest) || ::rename(merged.c_str(), base.c_str()) != 0 ||
+                !SyncDirectory(shard.directory.c_str()) || ::rename(manifest_tmp.c_str(), manifest_path.c_str()) != 0) {
+                return false;
+            }
+            if (!SyncDirectory(shard.directory.c_str())) {
+                MarkFailed(shard);
+                return false;
+            }
+
+            shard.base = shard.tables;
+            try {
+                RemoveUncommittedFiles(shard);
+            } catch (const std::exception&) {
+                // The manifest already controls visibility. Startup retries cleanup.
+            }
+            return true;
+        }
+
+        bool Compact() {
+            std::lock_guard writer(write_mutex);
+            if (failed.load()) return false;
+            for (const auto& shard : shards) if (shard.unavailable.load()) return false;
+            for (auto& shard : shards) {
+                std::unique_lock lock(shard.mutex);
+                if (shard.unavailable.load()) return false;
+                try {
+                    if (!Flush(shard) || !Merge(shard)) return false;
+                } catch (const StorageError&) {
+                    MarkFailed(shard);
+                    throw;
+                }
+            }
+            return true;
+        }
+
         void CheckReadable() const {
             if (failed.load()) Invalid("store requires close and reopen after failure");
         }
 
+        void MarkFailed(const Shard& shard) const {
+            shard.unavailable.store(true);
+            if (open_mode != OpenMode::Degraded) failed.store(true);
+        }
+
+        void CheckShard(const Shard& shard) const {
+            CheckReadable();
+            if (shard.unavailable.load()) throw ShardUnavailable(shard.index);
+        }
+
+        void CheckAll() const {
+            for (const auto& shard : shards) CheckShard(shard);
+        }
+
         std::optional<std::string> Get(const std::string& key) const {
             if (key.size() > kMaxKeyLen) return std::nullopt;
-            const auto& shard = shards[ShardIndex(key)];
+            const auto& shard = shards[Index(key)];
             std::shared_lock lock(shard.mutex);
-            CheckReadable();
+            CheckShard(shard);
             if (const auto entry = shard.pending.find(key); entry != shard.pending.end()) {
                 if (entry->second.header.Live(NowSeconds())) return entry->second.value;
                 return std::nullopt;
@@ -849,17 +1131,24 @@ namespace kvstore {
             if (shard.tables == 0) return std::nullopt;
             std::lock_guard reader(disk_read_mutex);
             OperationObservation observation(metrics.get(), Operation::DiskLookup);
-            for (auto i = shard.tables; i != 0; --i) {
-                const Table table(shard.TablePath(i));
-                if (const auto record = table.Find(key)) {
-                    if (record->header.Live(NowSeconds())) {
-                        auto value = table.Value(*record);
-                        observation.Success();
-                        return value;
+            try {
+                CheckShard(shard);
+                for (auto i = shard.tables; i >= shard.FirstTable(); --i) {
+                    const Table table(shard.TablePath(i));
+                    if (const auto record = table.Find(key)) {
+                        if (record->header.Live(NowSeconds())) {
+                            auto value = table.Value(*record);
+                            observation.Success();
+                            return value;
+                        }
+                        table.ValidateRecord(*record);
+                        observation.Miss();
+                        return std::nullopt;
                     }
-                    observation.Miss();
-                    return std::nullopt;
                 }
+            } catch (const StorageError&) {
+                MarkFailed(shard);
+                throw;
             }
             observation.Miss();
             return std::nullopt;
@@ -881,40 +1170,207 @@ namespace kvstore {
             const auto now = NowSeconds();
             for (const auto& shard : shards) {
                 std::shared_lock lock(shard.mutex);
-                CheckReadable();
+                CheckShard(shard);
                 for (auto it = shard.pending.lower_bound(start); it != shard.pending.end(); ++it) {
                     const auto& [key, entry] = *it;
                     if (!end.empty() && key >= end) break;
                     if (entry.header.Live(now)) visit(key, [&]() { return entry.value; });
                 }
                 std::lock_guard reader(disk_read_mutex);
-                for (auto i = shard.tables; i != 0; --i) {
-                    const Table table(shard.TablePath(i));
-                    for (auto offset = table.StartOffset(start); offset < table.End();) {
-                        const auto record = table.Read(offset);
-                        if (!end.empty() && record.key >= end) break;
-                        if (record.key >= start && record.header.Live(now) && !Shadowed(shard, i, record.key)) {
-                            visit(record.key, [&]() { return table.Value(record); });
+                try {
+                    CheckShard(shard);
+                    for (auto i = shard.tables; i >= shard.FirstTable(); --i) {
+                        const Table table(shard.TablePath(i));
+                        for (auto offset = table.StartOffset(start); offset < table.End();) {
+                            const auto record = table.Read(offset);
+                            if (!end.empty() && record.key >= end) break;
+                            if (record.key >= start && !Shadowed(shard, i, record.key)) {
+                                if (record.header.Live(now)) visit(record.key, [&]() { return table.Value(record); });
+                                else table.ValidateRecord(record);
+                            }
+                            offset += record.header.Bytes();
                         }
-                        offset += record.header.Bytes();
                     }
+                } catch (const StorageError&) {
+                    MarkFailed(shard);
+                    throw;
                 }
             }
         }
 
         std::string path;
         std::shared_ptr<Metrics> metrics;
+        OpenMode open_mode;
+        Routing routing = Routing::Rendezvous;
+        std::size_t Index(std::string_view key) const { return ShardIndex(key, routing, kNumShards); }
         Fd process_lock;
         std::array<Shard, kNumShards> shards;
         std::size_t shard_budget = 0;
         std::mutex write_mutex;
         mutable std::mutex disk_read_mutex;
-        std::atomic<bool> failed{false};
+        mutable std::atomic<bool> failed{false};
     };
 
+    struct KVStore::Snapshot::Cursor {
+        explicit Cursor(std::shared_ptr<Engine> source)
+            : engine(std::move(source)), writer(engine->write_mutex), captured(NowSeconds()) {
+            engine->CheckAll();
+            SelectShard();
+        }
+
+        bool Next(SnapshotRow& row) {
+            if (!writer.owns_lock()) return false;
+            try {
+                while (index < engine->shards.size()) {
+                    const auto& shard = engine->shards[index];
+                    engine->CheckShard(shard);
+                    while (pending != shard.pending.end()) {
+                        const auto& entry = *pending++;
+                        if (!entry.second.header.Live(captured)) continue;
+                        row = {entry.first, entry.second.value, Expiry(entry.second.header)};
+                        return true;
+                    }
+                    if (ReadTable(shard, row)) return true;
+                    ++index;
+                    if (index < engine->shards.size()) SelectShard();
+                }
+                engine->CheckAll();
+            } catch (...) {
+                table.reset();
+                writer.unlock();
+                throw;
+            }
+            writer.unlock();
+            return false;
+        }
+
+        static std::optional<std::int64_t> Expiry(const Header& header) {
+            if (header.expiry == kNoExpiry) return std::nullopt;
+            return header.expiry;
+        }
+
+        void SelectShard() {
+            const auto& shard = engine->shards[index];
+            pending = shard.pending.begin();
+            generation = shard.tables;
+        }
+
+        bool ReadTable(const Engine::Shard& shard, SnapshotRow& row) {
+            std::lock_guard reader(engine->disk_read_mutex);
+            engine->CheckShard(shard);
+            try {
+                for (; generation >= shard.FirstTable(); --generation) {
+                    if (!table) table.emplace(shard.TablePath(generation));
+                    while (auto record = table->Next()) {
+                        if (Engine::Shadowed(shard, generation, record->key)) continue;
+                        if (record->header.Live(captured)) {
+                            auto value = table->table.Value(*record);
+                            row = {std::move(record->key), std::move(value), Expiry(record->header)};
+                            return true;
+                        }
+                        table->table.ValidateRecord(*record);
+                    }
+                    table.reset();
+                }
+                return false;
+            } catch (const StorageError&) {
+                engine->MarkFailed(shard);
+                throw;
+            }
+        }
+
+        std::shared_ptr<Engine> engine;
+        std::unique_lock<std::mutex> writer;
+        std::int64_t captured;
+        std::size_t index = 0;
+        Memtable::const_iterator pending;
+        std::uint64_t generation = 0;
+        std::optional<TableCursor> table;
+    };
+
+    ShardUnavailable::ShardUnavailable(std::size_t shard)
+        : std::runtime_error("KVStore: shard " + std::to_string(shard) + " is unavailable") {}
+
+    KVStore::Snapshot::Snapshot(std::unique_ptr<Cursor> cursor) : cursor_(std::move(cursor)) {}
+    KVStore::Snapshot::~Snapshot() = default;
+    std::int64_t KVStore::Snapshot::CapturedAt() const { return cursor_->captured; }
+    bool KVStore::Snapshot::Next(SnapshotRow& row) { return cursor_->Next(row); }
+
+    std::unique_ptr<KVStore::Snapshot> KVStore::OpenSnapshot() const {
+        auto cursor = std::make_unique<Snapshot::Cursor>(engine_);
+        return std::unique_ptr<Snapshot>(new Snapshot(std::move(cursor)));
+    }
+
+    std::vector<std::size_t> KVStore::UnavailableShards() const {
+        std::vector<std::size_t> result;
+        for (const auto& shard : engine_->shards) {
+            if (shard.unavailable.load()) result.push_back(shard.index);
+        }
+        return result;
+    }
+
+    void KVStore::Checkpoint(const std::string& destination_path) const {
+        const auto destination = AbsoluteStorePath(destination_path);
+        if (destination == engine_->path) Invalid("checkpoint requires a different destination");
+        const auto parent = fs::path(destination).parent_path();
+        PrepareParent(parent);
+        const auto destination_lock = AcquireLock(destination);
+        if (Exists(destination) || Exists(destination + ".wal")) Invalid("checkpoint destination already exists");
+        std::lock_guard writer(engine_->write_mutex);
+        engine_->CheckAll();
+        Engine::EnsureIdentity(engine_->path);
+
+        Stage stage(parent);
+        CopyDurable(engine_->path + "/METADATA", stage.Path() + "/METADATA");
+        CopyDurable(engine_->path + "/IDENTITY", stage.Path() + "/IDENTITY");
+        for (const auto& shard : engine_->shards) {
+            const auto target = Engine::ShardDirectory(stage.Path(), shard.index);
+            fs::create_directory(target);
+            Engine::CopyShard(shard, target);
+        }
+        Engine validation(stage.Path());
+        validation.Open(std::nullopt, false);
+        engine_->CheckAll();
+        stage.Publish(destination);
+    }
+
+    void KVStore::RestoreShard(const std::string& database_path, const std::string& checkpoint_path,
+                               std::size_t index) {
+        if (index >= kNumShards) throw std::invalid_argument("KVStore: invalid shard number");
+        const auto database = AbsoluteStorePath(database_path);
+        const auto checkpoint = AbsoluteStorePath(checkpoint_path);
+        if (database == checkpoint) Invalid("cannot restore a shard from its own database");
+        const auto database_lock = AcquireLock(database);
+        const auto checkpoint_lock = AcquireLock(checkpoint);
+        Engine target(database), source(checkpoint);
+        if (target.ReadMetadata() != source.ReadMetadata() ||
+            Engine::ReadIdentity(database) != Engine::ReadIdentity(checkpoint)) {
+            Invalid("checkpoint belongs to a different database");
+        }
+        Engine::Shard copy;
+        copy.directory = Engine::SelectedDirectory(checkpoint, index);
+        Engine::ReadShardManifest(copy);
+        const auto pattern = Engine::RestorePrefix(index) + "XXXXXX";
+        Stage stage(database, pattern.c_str());
+        Engine::CopyShard(copy, stage.Path());
+        Engine::Shard validated;
+        validated.directory = stage.Path();
+        target.Recover(validated, index, false);
+
+        const auto temporary = stage.Path() + "/.CURRENT.tmp";
+        const auto name = fs::path(stage.Path()).filename().string();
+        const auto pointer = Engine::ShardPointer(database, index);
+        if (::symlink(name.c_str(), temporary.c_str()) != 0 || !SyncDirectory(stage.Path().c_str()) ||
+            !SyncDirectory(database.c_str()) || ::rename(temporary.c_str(), pointer.c_str()) != 0) {
+            Invalid("could not publish restored shard");
+        }
+        stage.Release();
+        if (!SyncDirectory(database.c_str())) Invalid("shard pointer was renamed; reopen to verify the restore");
+    }
+
     KVStore::KVStore(std::string path, std::shared_ptr<Metrics> metrics,
-                     std::optional<std::size_t> memtable_budget)
-        : engine_(std::make_unique<Engine>(AbsoluteStorePath(path), std::move(metrics))) {
+                     std::optional<std::size_t> memtable_budget, OpenMode mode)
+        : engine_(std::make_shared<Engine>(AbsoluteStorePath(path), std::move(metrics), mode)) {
         OperationObservation observation(engine_->metrics.get(), Operation::Recovery);
         engine_->OpenOrCreate(memtable_budget);
         observation.Success();
@@ -953,15 +1409,15 @@ namespace kvstore {
 
     bool KVStore::Compact() {
         OperationObservation observation(engine_->metrics.get(), Operation::Compact);
-        return observation.Result(engine_->FlushAll());
+        return observation.Result(engine_->Compact());
     }
 
     std::size_t KVStore::Size() const {
         OperationObservation observation(engine_->metrics.get(), Operation::Size);
-        engine_->CheckReadable();
+        engine_->CheckAll();
         std::size_t count = 0;
         engine_->Scan({}, {}, [&](const auto&, const auto&) { ++count; });
-        engine_->CheckReadable();
+        engine_->CheckAll();
         observation.Success();
         return count;
     }
@@ -970,11 +1426,11 @@ namespace kvstore {
 
     std::vector<KeyValue> KVStore::Range(const std::string& start, const std::string& end) const {
         OperationObservation observation(engine_->metrics.get(), Operation::Range);
-        engine_->CheckReadable();
+        engine_->CheckAll();
         std::vector<KeyValue> result;
         engine_->Scan(start, end, [&](const auto& key, const auto& value) { result.push_back({key, value()}); });
         std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return a.key < b.key; });
-        engine_->CheckReadable();
+        engine_->CheckAll();
         observation.Success();
         return result;
     }
@@ -983,6 +1439,7 @@ namespace kvstore {
 
     std::vector<std::string> KVStore::WalPaths() const {
         std::lock_guard writer(engine_->write_mutex);
+        engine_->CheckAll();
         std::vector<std::string> result;
         result.reserve(kNumShards);
         for (const auto& shard : engine_->shards) result.push_back(shard.WalPath(shard.tables + 1));
@@ -991,6 +1448,7 @@ namespace kvstore {
 
     std::uintmax_t KVStore::WalBytes() const {
         std::lock_guard writer(engine_->write_mutex);
+        engine_->CheckAll();
         std::uintmax_t bytes = 0;
         for (const auto& shard : engine_->shards) bytes += FileSize(shard.wal);
         return bytes;
@@ -1028,7 +1486,7 @@ namespace kvstore {
             Engine staged(stage.Path());
             staged.Open(memtable_budget);
             Replay(legacy, true, [&](const Header& header, std::string key, std::string value) {
-                const auto index = ShardIndex(key);
+                const auto index = staged.Index(key);
                 if (!staged.Mutate(header.type, std::move(key), std::move(value), header.expiry)) {
                     Invalid("could not replay legacy mutation");
                 }
@@ -1044,6 +1502,37 @@ namespace kvstore {
                     Invalid("migrated shard does not match replayed sequence");
                 }
             }
+        }
+        stage.Publish(destination);
+    }
+
+    void KVStore::Rehash(const std::string& source_path, const std::string& destination_path) {
+        const KVStore source(source_path, {}, std::nullopt, OpenMode::Existing);
+        const auto budget = static_cast<std::size_t>(source.engine_->ReadMetadata()[3]);
+        const auto destination = AbsoluteStorePath(destination_path);
+        if (source.DatabasePath() == destination) Invalid("rehash requires a different destination");
+        const auto parent = fs::path(destination).parent_path();
+        PrepareParent(parent);
+        const auto destination_lock = AcquireLock(destination);
+        if (Exists(destination) || Exists(destination + ".wal")) Invalid("rehash destination already exists");
+
+        Stage stage(parent);
+        Engine::Initialize(stage.Path(), budget, nullptr);
+        {
+            Engine staged(stage.Path());
+            staged.Open(budget);
+            auto snapshot = source.OpenSnapshot();
+            SnapshotRow row;
+            while (snapshot->Next(row)) {
+                const auto type = row.expires_at ? RecordType::SetTtl : RecordType::Set;
+                if (!staged.Mutate(type, std::move(row.key), std::move(row.value),
+                                   row.expires_at.value_or(kNoExpiry))) Invalid("could not rehash snapshot row");
+            }
+            if (!staged.FlushAll()) Invalid("could not flush rehashed database");
+        }
+        {
+            Engine validation(stage.Path());
+            validation.Open(budget, false);
         }
         stage.Publish(destination);
     }

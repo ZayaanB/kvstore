@@ -40,7 +40,7 @@ add_library(kvstore_mapreduce STATIC mapreduce.cpp word_count.cpp)
 target_include_directories(kvstore_mapreduce PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(kvstore_mapreduce PUBLIC Threads::Threads)
 add_executable(kvstore_word_count examples/word_count_main.cpp)
-target_link_libraries(kvstore_word_count PRIVATE kvstore_mapreduce)
+target_link_libraries(kvstore_word_count PRIVATE kvstore_mapreduce kvstore)
 
 set(BENCH_REVISION "")
 set(BENCH_SOURCE_STATE "")

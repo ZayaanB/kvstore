@@ -1,11 +1,26 @@
 # Local KVStore snapshot publication
 
-The Python producer and Spark publisher work end to end with a representative
-fixture. Live KVStore integration is pending. The C++ engine exposes rolling
-aggregate reads, and the MapReduce cursor has neither a capture timestamp nor
-per-row expiration. The future adapter needs a consistent all-shard cursor
-that pins its view, exposes the capture time and absolute expiration, and
-raises if any required shard cannot be read.
+The Python producer streams a consistent view from the C++ database, then
+Spark publishes it as an Iceberg table snapshot. The export preserves binary
+keys and values and includes each live row's expiration time.
+
+## Export an existing database
+
+Close any other process using the database before export. The engine opens an
+existing database and checks every shard before it provides rows. Set up Spark
+and the Iceberg runtime in [Run locally](#run-locally) before publication.
+
+```bash
+python3 lakehouse/export.py --cli ./build/kvstore_cli \
+  --database data/store --warehouse /tmp/kvstore-warehouse /tmp/kvstore-export
+spark-submit --master 'local[2]' --jars /tmp/kvstore-iceberg-runtime-1.10.1.jar \
+  lakehouse/publish.py --warehouse /tmp/kvstore-warehouse /tmp/kvstore-export
+```
+
+Use a new output directory for each capture. The export uses the same capture
+time for all rows. Values with an expiration outside Iceberg's configured year
+9999 limit fail export with an error. An interrupted or incomplete capture
+cannot publish a table version.
 
 ## Run locally
 
@@ -19,7 +34,8 @@ python -m pip install -r lakehouse/requirements.txt
 curl -fL --max-time 120 -o /tmp/kvstore-iceberg-runtime-1.10.1.jar https://repo.maven.apache.org/maven2/org/apache/iceberg/iceberg-spark-runtime-4.0_2.13/1.10.1/iceberg-spark-runtime-4.0_2.13-1.10.1.jar
 export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 # Set to your Java 17 or 21 installation.
 export SPARK_LOCAL_IP=127.0.0.1 PYTHONDONTWRITEBYTECODE=1
-spark-submit --master 'local[2]' --jars /tmp/kvstore-iceberg-runtime-1.10.1.jar lakehouse/verify.py
+spark-submit --master 'local[2]' --jars /tmp/kvstore-iceberg-runtime-1.10.1.jar \
+  lakehouse/verify.py --kvstore-cli ./build/kvstore_cli
 ```
 
 The check deletes its temporary warehouse and export directories on exit. Add
@@ -132,9 +148,9 @@ The fixture checks byte-for-byte rows and TTLs, two full publications with
 additions, overwrites, deletes, and expiration, Spark SQL count and binary
 filtering, historical queries, empty replacements, corrupt and incomplete
 exports, duplicate keys, stale sequences, and commit failure and recovery.
-The script prints fixture capture time, chunk bytes and write time, and one
-SQL scan time. Live capture performance, concurrent engine writes, and real
-shard read failures require the source adapter.
+With `--kvstore-cli`, the check also exports from a real database, publishes two
+versions, reads the older version after publication, and rejects a source with
+missing shard data.
 
 In the local check, the first export had 5 rows and 326 chunk bytes. The
 second had 4 rows and 238 chunk bytes. Fixture capture with sequence

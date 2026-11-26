@@ -8,7 +8,8 @@ from collections import defaultdict
 from pathlib import Path
 
 LATENCY = ("mean_seconds", "p50_seconds", "p95_seconds", "p99_seconds")
-ENV_BUILD = {"revision", "source_state_at_configure", "shards", "compiler", "build_type"}
+ENV_REVISION = {"revision", "source_state_at_configure"}
+ENV_BUILD = {"shards", "shard_routing", "compiler", "build_type"}
 
 
 def load(path):
@@ -136,13 +137,15 @@ def compare(baseline, candidate, allow_mode_change, allow_engine_change):
     fields = sorted(env_before.keys() | env_after.keys())
     env_rows = [(key, fmt(env_before.get(key)), fmt(env_after.get(key)),
                  "Changed" if env_before.get(key) != env_after.get(key) else "") for key in fields]
-    host_diff = any(env_before.get(key) != env_after.get(key) for key in fields if key not in ENV_BUILD)
+    changed = {key for key in fields if env_before.get(key) != env_after.get(key)}
+    host_diff = changed - ENV_REVISION - ENV_BUILD
     mode_before, mode_after = before["telemetry_mode"], after["telemetry_mode"]
     engine_before, engine_after = before.get("engine_metrics", False), after.get("engine_metrics", False)
     engine_diff = engine_before != engine_after
     mode_diff = mode_before != mode_after
     mode_allowed = allow_mode_change and {mode_before, mode_after} == {"throughput", "latency"}
     run_reason = ("Host metadata differs" if host_diff else
+                  "Build or shard configuration differs" if changed & ENV_BUILD else
                   "Both instrumentation settings differ" if mode_diff and engine_diff else
                   "Telemetry mode differs" if mode_diff and not mode_allowed else
                   "Engine metrics setting differs" if engine_diff and not allow_engine_change else

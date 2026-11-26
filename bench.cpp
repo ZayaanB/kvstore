@@ -460,8 +460,8 @@ void ParametersJson(std::ostream& out, const Options& options, Workload workload
         << ",\"reopen\":" << (reopen ? 100 : 0) << '}'
         << ",\"expected_read_miss_fraction\":" << (get ? "0.0625" : "0")
         << ",\"cache_conditions\":";
-    Quote(out, reopen ? "warm WAL page cache (no eviction requested)"
-                      : "prepopulated in-memory index; no OS cache eviction");
+    Quote(out, reopen ? "reopen after population; no OS cache eviction"
+                      : "prepopulated store; no OS cache eviction");
     out << ",\"load_model\":\"closed-loop\",\"durability\":\"fdatasync-per-write\"";
 }
 
@@ -478,6 +478,7 @@ void EnvironmentJson(std::ostream& out, const fs::path& root) {
     field("source_state_at_configure", KVSTORE_BENCH_SOURCE_STATE);
     field("build_type", KVSTORE_BENCH_BUILD_TYPE);
     field("compiler", KVSTORE_BENCH_COMPILER);
+    field("shard_routing", "rendezvous");
     utsname system{};
     if (::uname(&system) == 0) {
         field("os", std::string(system.sysname) + " " + system.release);
@@ -681,7 +682,6 @@ int main(int argc, char** argv) {
     try {
         const auto options = Parse(argc, argv);
         std::ofstream file;
-        // Preserve console-only invocation without building a JSON artifact in memory.
         std::ostream discard(nullptr);
         std::ostream* output = &discard;
         if (options.json == "-") output = &std::cout;

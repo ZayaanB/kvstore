@@ -76,6 +76,13 @@ std::string ResourceMetrics(const KVStore& store, Clock::time_point deadline) {
     }
     std::error_code error;
     const fs::path database(store.DatabasePath());
+    const auto quarantined = store.UnavailableShards();
+    out << "# HELP kvstore_shard_quarantined Whether KVStore detected a fault in this shard.\n"
+           "# TYPE kvstore_shard_quarantined gauge\n";
+    for (std::size_t shard = 0; shard < kNumShards; ++shard) {
+        out << "kvstore_shard_quarantined{shard=\"" << shard << "\"} "
+            << (std::find(quarantined.begin(), quarantined.end(), shard) != quarantined.end()) << '\n';
+    }
     if (const auto bytes = store.TelemetryWalBytes()) {
         out << "# HELP kvstore_wal_file_bytes Committed logical bytes in active shard WALs.\n"
                "# TYPE kvstore_wal_file_bytes gauge\nkvstore_wal_file_bytes " << *bytes << '\n';

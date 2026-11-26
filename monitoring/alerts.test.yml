@@ -77,3 +77,26 @@ tests:
     alert_rule_test:
       - eval_time: 2m
         alertname: KVStoreErrorRateHigh
+
+  - interval: 5s
+    input_series:
+      - series: 'up{job="kvstore",instance="test"}'
+        values: '1x10'
+      - series: 'kvstore_shard_quarantined{job="kvstore",instance="test",shard="3"}'
+        values: '0x2 1x5 0x2'
+    alert_rule_test:
+      - eval_time: 20s
+        alertname: KVStoreShardQuarantined
+      - eval_time: 35s
+        alertname: KVStoreShardQuarantined
+        exp_alerts:
+          - exp_labels:
+              job: kvstore
+              instance: test
+              shard: "3"
+              severity: warning
+            exp_annotations:
+              summary: A KVStore shard is quarantined
+              description: Shard 3 on test requires recovery.
+      - eval_time: 45s
+        alertname: KVStoreShardQuarantined

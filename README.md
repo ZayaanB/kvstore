@@ -4,22 +4,29 @@ An embedded C++20 key-value store with durable writes and disk-backed point read
 Each of 16 shards has a WAL, a bounded ordered memtable, and immutable sorted
 tables. The engine uses POSIX I/O and has no external library dependencies.
 
+See [Architecture](docs/architecture.md) for the engine, batch runner, lakehouse
+demo, monitoring stack, and current integration boundaries.
+
 ```cpp
 kvstore::KVStore store("data/mydb.db");  // Opens or creates a database directory.
 store.Set("hello", "world");
 auto value = store.Get("hello");
 store.Delete("hello");
-store.Compact();                       // Flush all pending memtables.
+store.Compact();                       // Flush writes and merge sorted files.
 ```
 
 ## Storage and recovery
 
 Version 1 stores the shard count, hash identifier, and memory budget in
-`METADATA`. The shard is 64-bit FNV-1a over unsigned key bytes, reduced modulo
-16. Each `shard-N` directory has a checksummed `MANIFEST` containing the number
-of committed tables and the last flushed sequence. Table generations start at
-1. If a manifest lists `n` tables, recovery uses tables `1.sst` through `n.sst`
-and replays `(n+1).wal`.
+`METADATA`. A shard is one of 16 groups of keys. New databases use rendezvous
+consistent hashing. The engine gives each shard a repeatable score for a key
+and picks the highest score. Existing databases keep their recorded routing.
+The shard's checksummed `MANIFEST` lists the newest
+committed generation and last flushed sequence. After compaction, it can also
+select a merged base table. If the newest generation is `n`, the active WAL is
+`(n+1).wal`. The current engine reads databases created before merged tables
+were introduced. Older binaries cannot open shards whose manifests select a
+merged base or databases that use rendezvous hashing.
 
 WAL and table records use little-endian sequence (8 bytes), operation (1 byte),
 key and value lengths (4 bytes each), and absolute expiry in Unix seconds
@@ -48,14 +55,42 @@ caps ordinary WAL replay per shard. A single record above its shard allowance
 uses temporary memory and flushes synchronously. Point reads check the memtable
 and then sorted tables, probing on-disk key ranges and a sparse index. `Size`,
 `Items`, and `Range` read each shard in turn. The vector APIs allocate memory
-for returned results. `Compact()` flushes pending writes. Sorted tables and
-their obsolete versions accumulate until table merging is implemented.
+for returned results. `Compact()` flushes pending writes, merges multiple sorted
+files in each shard, and removes older versions. The merge publishes its
+replacement before removing the old files.
 
 Use `WalPaths()` in place of `WalPath()`. It returns the current WALs in shard
 order. A flush can change those paths. Use `WalBytes()` for aggregate active WAL size and `DatabasePath()` for
 the database directory. A sibling `<db_path>.lock` prevents concurrent opens.
 Join callers before destroying an instance and reopen the database in any
 child process that uses it after `fork()`.
+
+### Shard recovery and backups
+
+The default mode requires every shard to recover. Open an existing store with
+`--degraded` to keep point reads and writes working on healthy shards if one
+fails. Use the `shards` command to list quarantined shards, meaning shards taken
+out of service. A read on a quarantined shard reports an error. Whole-store
+scans and snapshots require all shards.
+
+```bash
+./build/kvstore_cli --checkpoint data/store backups/store-copy
+./build/kvstore_cli data/store --degraded
+./build/kvstore_cli --restore-shard data/store backups/store-copy 3
+```
+
+Close the other process using the database before running the checkpoint or
+restore command. A checkpoint is a consistent, verified copy of all shards.
+Store it on separate storage to protect against device failure. Restoring shard
+3 replaces that shard with the copy from the checkpoint and leaves other shards
+alone. The previous files stay on disk for diagnosis. Writes to shard 3 made
+after the checkpoint are lost when you restore it.
+
+For manual failover after a host loss, take the original service out of service
+so it cannot also accept writes. Copy the verified checkpoint to the replacement
+host, use `--checkpoint` to make a working copy if you want to keep the backup
+unchanged, and point the application at the replacement. Automatic failover
+and live replication between hosts require additional coordination.
 
 ## Offline migration
 
@@ -65,6 +100,15 @@ prefix, which has a sibling `<legacy_db_path>.wal`, and an unused destination.
 ```bash
 ./build/kvstore_cli --migrate data/legacy.db data/new.db
 ./build/kvstore_cli data/new.db
+```
+
+For an existing disk-backed database that uses the earlier modulo hashing,
+use `--rehash` instead. It copies all live rows and their absolute expiration
+times into a new database with rendezvous hashing. The source stays available
+for rollback. Stop writes to the source before switching the application.
+
+```bash
+./build/kvstore_cli --rehash data/old-disk-store data/rendezvous-store
 ```
 
 The command locks the source, streams its CRC-protected WAL in order, and
@@ -125,11 +169,18 @@ OK
 
 Other commands: `size`, `help`.
 
-## Local lakehouse export
+## Word count and lakehouse export
 
-The fixture-backed [Spark-to-Iceberg integration](lakehouse/README.md)
-verifies full snapshot publication and historical queries. A consistent
-all-shard KVStore snapshot cursor is required for live exports.
+Both integrations use a snapshot, a consistent view of the database at one
+time. The cursor streams rows and pauses writes until it finishes. Close the
+CLI before opening the database from a separate process.
+
+```bash
+./build/kvstore_word_count --database data/store results.tsv
+```
+
+See [Spark-to-Iceberg export](lakehouse/README.md#export-an-existing-database)
+for exporting live rows and querying versions of the resulting table.
 
 ## Benchmark
 
@@ -223,12 +274,12 @@ point lookups that reach sorted tables, and CLI resource use.
 
 The database footprint is a best-effort gauge. The exporter omits it when
 files change during the scan or the scan exceeds its entry or time budget.
-Sorted-table merge metrics, background flush backlog, cache hit rate,
-per-shard availability and the failed-shard alert await those engine capabilities.
+Sorted-table write metrics include merge output. The exporter also records
+which shards are quarantined.
 
 The [Prometheus Alerts page](http://127.0.0.1:9090/alerts) lists the same local
 rules shown on the dashboard. The rules cover sustained data errors,
-missing telemetry, and low disk space. Both services keep their data in named
+missing telemetry, low disk space, and quarantined shards. Both services keep their data in named
 volumes, and Prometheus retains 30 days of samples.
 
 ```bash

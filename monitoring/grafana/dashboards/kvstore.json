@@ -1298,34 +1298,6 @@
           "sort": "desc"
         }
       }
-    },
-    {
-      "id": 3,
-      "type": "text",
-      "title": "Storage coverage",
-      "description": "Storage milestones required for additional panels.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "kvstore-prometheus"
-      },
-      "targets": [],
-      "gridPos": {
-        "x": 0,
-        "y": 63,
-        "w": 24,
-        "h": 4
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "noValue": "No data"
-        },
-        "overrides": []
-      },
-      "options": {
-        "mode": "markdown",
-        "content": "**Available** · memtable flushes and sorted-table point lookups\n\n**Pending** · sorted-table merges, background flush queue, cache hit rate, shard availability and failed-shard alert"
-      }
     }
   ],
   "templating": {

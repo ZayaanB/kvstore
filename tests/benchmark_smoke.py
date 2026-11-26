@@ -77,15 +77,25 @@ with tempfile.TemporaryDirectory(prefix="kvstore-bench-test-") as root:
     assert "Matched telemetry overhead comparison" in content
     assert "<svg" in content and "Candidate trials" in content and "Base samples" in content
 
+    rebuilt = json.loads((root / "throughput.json").read_text(encoding="utf-8"))
+    build_type = rebuilt["environment"]["build_type"]
+    rebuilt["environment"]["build_type"] = "Release" if build_type == "Debug" else "Debug"
+    (root / "different-build.json").write_text(json.dumps(rebuilt), encoding="utf-8")
+    subprocess.run([sys.executable, sys.argv[2], str(root / "throughput.json"),
+                    str(root / "different-build.json"), "--output", str(report)], check=True)
+    content = report.read_text(encoding="utf-8")
+    assert "Build or shard configuration differs" in content and "<svg" not in content
+
     result, recorded = run(root, "--workload", "compaction", "--threads", "1", "--trials", "1",
                            "--engine-metrics", "on")
     assert result.returncode == 0 and recorded["engine_metrics"]
     for workload in recorded["workloads"]:
         resources = workload["trials"][0]["resources"]
-        # Four appends and one next-WAL sync per shard.
-        assert resources["wal_sync_count"] == 4 + 16
-        assert resources["wal_sync_latency"]["samples"] == 4 + 16
-        assert resources["compaction_bytes_processed"] == 32 * 109 + 16 * (8 + 52)
+        # The 32 fixture keys land in 14 of the 16 shards.
+        flushed_shards = 14
+        assert resources["wal_sync_count"] == 4 + flushed_shards
+        assert resources["wal_sync_latency"]["samples"] == 4 + flushed_shards
+        assert resources["compaction_bytes_processed"] == 32 * 109 + flushed_shards * (8 + 52)
         assert resources["bytes_written"] == resources["compaction_bytes_processed"] + 4 * 109
 
     result, failed = run(root, "--workload", "write", "--keys", "1", "--threads", "1",
