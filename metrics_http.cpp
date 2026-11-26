@@ -51,7 +51,7 @@ bool Await(int fd, short events, Clock::time_point deadline) {
     }
 }
 
-std::string ResourceMetrics(const KVStore& store) {
+std::string ResourceMetrics(const KVStore& store, Clock::time_point deadline) {
     std::ostringstream out;
     out.imbue(std::locale::classic());
     rusage usage{};
@@ -76,18 +76,9 @@ std::string ResourceMetrics(const KVStore& store) {
     }
     std::error_code error;
     const fs::path database(store.DatabasePath());
-    out << "# HELP kvstore_wal_file_bytes Combined logical length of active shard WALs in bytes.\n"
-           "# TYPE kvstore_wal_file_bytes gauge\nkvstore_wal_file_bytes " << store.WalBytes() << '\n';
-    auto total = fs::file_size(store.DatabasePath() + ".lock", error);
-    if (!error) {
-        for (fs::recursive_directory_iterator file(database, error), end;
-             !error && file != end; file.increment(error)) {
-            if (file->is_regular_file(error)) total += file->file_size(error);
-        }
-        if (!error) {
-            out << "# HELP kvstore_database_file_bytes Combined logical length of database files in bytes.\n"
-                   "# TYPE kvstore_database_file_bytes gauge\nkvstore_database_file_bytes " << total << '\n';
-        }
+    if (const auto bytes = store.TelemetryWalBytes()) {
+        out << "# HELP kvstore_wal_file_bytes Committed logical bytes in active shard WALs.\n"
+               "# TYPE kvstore_wal_file_bytes gauge\nkvstore_wal_file_bytes " << *bytes << '\n';
     }
     const auto space = fs::space(database, error);
     if (!error) {
@@ -95,6 +86,22 @@ std::string ResourceMetrics(const KVStore& store) {
                "# TYPE kvstore_filesystem_available_bytes gauge\nkvstore_filesystem_available_bytes " << space.available << '\n'
             << "# HELP kvstore_filesystem_capacity_bytes Total capacity in bytes of the database filesystem.\n"
                    "# TYPE kvstore_filesystem_capacity_bytes gauge\nkvstore_filesystem_capacity_bytes " << space.capacity << '\n';
+    }
+
+    // Bound the scan as immutable tables accumulate. Omit an incomplete total.
+    constexpr std::size_t max_entries = 4096;
+    auto total = fs::file_size(store.DatabasePath() + ".lock", error);
+    if (error) return out.str();
+    fs::recursive_directory_iterator file(database, error), end;
+    std::size_t entries = 0;
+    while (!error && file != end && entries < max_entries && Clock::now() < deadline) {
+        if (fs::is_regular_file(file->symlink_status(error))) total += file->file_size(error);
+        if (!error) file.increment(error);
+        ++entries;
+    }
+    if (!error && file == end) {
+        out << "# HELP kvstore_database_file_bytes Combined logical length of database files in bytes.\n"
+               "# TYPE kvstore_database_file_bytes gauge\nkvstore_database_file_bytes " << total << '\n';
     }
     return out.str();
 }
@@ -119,7 +126,8 @@ void Serve(int fd, const Metrics& metrics, const KVStore& store) {
     if (header.find("\r\n\r\n") == std::string_view::npos) return;
     const auto first_line = header.substr(0, header.find("\r\n"));
     const bool found = first_line == "GET /metrics HTTP/1.1" || first_line == "GET /metrics HTTP/1.0";
-    const auto body = found ? metrics.Prometheus() + ResourceMetrics(store) : "Not found\n";
+    const auto body = found ? metrics.Prometheus() + ResourceMetrics(store, std::min(deadline, Clock::now() + 100ms))
+                            : "Not found\n";
     std::string response = found ? "HTTP/1.1 200 OK\r\n" : "HTTP/1.1 404 Not Found\r\n";
     response += "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\nConnection: close\r\nContent-Length: ";
     response += std::to_string(body.size()) + "\r\n\r\n" + body;

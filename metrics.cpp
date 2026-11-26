@@ -15,10 +15,10 @@ constexpr std::size_t Index(Enum value) {
 
 constexpr auto kRelaxed = std::memory_order_relaxed;
 constexpr std::array<const char*, Index(Operation::Count)> kOperations{
-    "get", "set", "set_ttl", "delete", "size", "range", "compact", "recovery"
+    "get", "set", "set_ttl", "delete", "size", "range", "compact", "recovery", "flush", "disk_lookup"
 };
 constexpr std::array<const char*, Index(Outcome::Count)> kOutcomes{"ok", "miss", "error"};
-constexpr std::array<const char*, Index(WalSync::Count)> kSyncs{"append", "rollback", "open", "recovery", "compact"};
+constexpr std::array<const char*, Index(WalSync::Count)> kSyncs{"append", "rollback", "open", "recovery"};
 constexpr std::array<const char*, Index(WriteSource::Count)> kSources{"wal", "compaction"};
 
 double Seconds(std::uint64_t ns) {

@@ -9,9 +9,9 @@
 
 namespace kvstore {
 
-enum class Operation { Get, Set, SetTtl, Delete, Size, Range, Compact, Recovery, Count };
+enum class Operation { Get, Set, SetTtl, Delete, Size, Range, Compact, Recovery, Flush, DiskLookup, Count };
 enum class Outcome { Ok, Miss, Error, Count };
-enum class WalSync { Append, Rollback, Open, Recovery, Compact, Count };
+enum class WalSync { Append, Rollback, Open, Recovery, Count };
 enum class WriteSource { Wal, Compaction, Count };
 
 struct StorageTotals {

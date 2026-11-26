@@ -116,9 +116,14 @@ def exercise(args, work):
             ]}
             return json.loads(http(endpoint, body, auth))["results"]["A"]
 
-        def value_matches(result, compare):
-            return any(compare(value) for frame in result.get("frames", [])
-                       for value in frame.get("data", {}).get("values", [[], []])[-1] if value is not None)
+        def value_matches(result, compare, labels=None):
+            for frame in result.get("frames", []):
+                fields = frame["schema"]["fields"]
+                for field, values in zip(fields, frame["data"].get("values", [])):
+                    if field["type"] == "number" and (labels or {}).items() <= field.get("labels", {}).items():
+                        if any(value is not None and compare(value) for value in values):
+                            return True
+            return False
 
         configure(exporter)
         with process([str(args.cli.resolve()), str(work / "store"), "--metrics-port", str(exporter)],
@@ -134,14 +139,25 @@ def exercise(args, work):
             # A stalled scrape must not delay a database operation.
             with socket.create_connection(("127.0.0.1", exporter)) as slow:
                 slow.sendall(b"GET /metrics")
-                send("set live steady", "get absent")
+                send("set private-fixture-key private-fixture-value", "get absent")
                 slow.settimeout(2)
                 if slow.recv(16):
                     raise RuntimeError("Exporter answered an incomplete request")
             live = until(lambda: scrape_has('kvstore_operations_total{operation="get",outcome="miss"} 1'),
                          "miss counter")
-            if "steady" in live:
-                raise RuntimeError("A database value leaked into the metrics")
+            if any(secret in live for secret in ("private-fixture-key", "private-fixture-value", str(work))):
+                raise RuntimeError("Database data leaked into the metrics")
+            if "kvstore_wal_file_bytes 0\n" in live:
+                raise RuntimeError("Committed WAL bytes did not grow after a durable write")
+            send("compact", "get private-fixture-key")
+            flushed = until(lambda: scrape_has('kvstore_operations_total{operation="disk_lookup",outcome="ok"} 1'),
+                            "sorted-table lookup")
+            for expected in ('kvstore_operations_total{operation="flush",outcome="ok"} 1',
+                             'kvstore_wal_syncs_total{phase="append",outcome="ok"} 1',
+                             'kvstore_wal_syncs_total{phase="open",outcome="ok"} 17',
+                             'kvstore_wal_file_bytes 0\n'):
+                if expected not in flushed:
+                    raise RuntimeError(f"Missing storage measurement: {expected}")
             until(lambda: query('up{job="kvstore"} == 1'), "healthy scrape")
             dashboard = until(lambda: json.loads(http(f"{url(grafana)}/api/dashboards/uid/kvstore-live", headers=auth)),
                               "provisioned Grafana dashboard")
@@ -150,36 +166,46 @@ def exercise(args, work):
             panels = {panel["title"]: panel for panel in dashboard["dashboard"]["panels"]}
 
             def panel_expression(title, target=0):
-                return panels[title]["targets"][target]["expr"].replace("$operation", "get").replace("$window", "30s")
+                return (panels[title]["targets"][target]["expr"]
+                        .replace("${operation:regex}", "get").replace("$window", "30s"))
 
             expressions = {
                 "throughput": panel_expression("Completed data operations"),
-                "latency": panel_expression("Operation latency", 1),
+                "p95": panel_expression("Operation latency", 1),
+                "mean": panel_expression("Operation latency", 3),
                 "wal": panel_expression("WAL sync calls"),
+                "flush": panel_expression("Maintenance activity"),
+                "table_writes": panel_expression("WAL and sorted-table writes"),
+                "disk_lookup": panel_expression("Sorted-table lookup latency"),
             }
             samples = {}
+            labels = {"flush": {"operation": "flush", "outcome": "ok"},
+                      "table_writes": {"source": "compaction"}}
             deadline = time.monotonic() + 40
             while len(samples) < len(expressions) and time.monotonic() < deadline:
-                send(*(["set live steady", "get live", "get absent"] * 12), "compact")
+                send(*(["set live steady", "get live", "get absent"] * 48), "compact", "get live")
                 time.sleep(1)
                 for name, expression in expressions.items():
                     result = grafana_query(expression)
-                    if value_matches(result, lambda value: value > 0):
+                    if value_matches(result, lambda value: value > 0, labels.get(name)):
                         samples[name] = result
             if samples.keys() != expressions.keys():
                 raise RuntimeError(f"Grafana load samples incomplete: {samples.keys()}")
             save(output / "grafana-load.json", samples)
             (output / "metrics.txt").write_text(http(f"{url(exporter)}/metrics"), encoding="utf-8")
-            print("Grafana returned live throughput, p95, and WAL sync data", flush=True)
+            print("Grafana returned live throughput, latency, WAL syncs, and table activity", flush=True)
 
             # Suspend collection without stopping the CLI or Prometheus alert evaluation.
             configure(broken)
             prom.send_signal(signal.SIGHUP)
             timeout = 55
-            firing = until(lambda: [entry for entry in alerts()
-                                    if entry["labels"]["alertname"] == "KVStoreTelemetryMissing"
-                                    and entry["state"] == "firing"], "missing telemetry alert", timeout)
-            save(output / "firing-alert.json", firing)
+            def firing(name):
+                return [entry for entry in alerts() if entry["labels"]["alertname"] == name
+                        and entry["state"] == "firing"]
+
+            missing_name = "KVStoreTelemetryMissing"
+            active = until(lambda: firing(missing_name), "missing telemetry alert", timeout)
+            save(output / "missing-alert.json", active)
             send("set outage still-available", "get outage", "setttl overflow 9223372036854775807 value")
             until(lambda: scrape_has('kvstore_operations_total{operation="set_ttl",outcome="error"} 1'),
                   "operation after collector outage")
@@ -194,15 +220,38 @@ def exercise(args, work):
             configure(exporter)
             prom.send_signal(signal.SIGHUP)
             until(lambda: query('up{job="kvstore"} == 1') and not any(
-                entry["labels"]["alertname"] == "KVStoreTelemetryMissing" for entry in alerts()), "alert resolution")
+                entry["labels"]["alertname"] == missing_name for entry in alerts()), "alert resolution")
             save(output / "resolved-alerts.json", alerts())
             restored = until(lambda: result if value_matches(result := grafana_query(telemetry), lambda value: value == 1)
                              else None, "Grafana restored telemetry")
             save(output / "grafana-restored.json", restored)
+            print("Scraping recovered and the missing telemetry alert resolved", flush=True)
+
+            # Repeated TTL overflow exercises the real engine error path without damaging the store.
+            error_name = "KVStoreErrorRateHigh"
+
+            def drive_until_alert(expected):
+                deadline = time.monotonic() + 100
+                commands = ["get live"] * 48
+                if expected:
+                    commands += ["setttl overflow 9223372036854775807 value"] * 48
+                while time.monotonic() < deadline:
+                    send(*commands)
+                    active = firing(error_name)
+                    if bool(active) == expected:
+                        return active
+                    time.sleep(1)
+                raise RuntimeError(f"Error alert did not reach firing={expected}")
+
+            save(output / "error-alert.json", drive_until_alert(True))
+            print("Sustained engine errors fired the error-rate alert", flush=True)
+            drive_until_alert(False)
+            save(output / "final-alerts.json", alerts())
+            print("Successful operations resolved the error-rate alert", flush=True)
+
             send("exit")
             if cli.wait(timeout=5) != 0:
                 raise RuntimeError("CLI did not exit successfully")
-            print("Scraping recovered and the missing telemetry alert resolved", flush=True)
 
 
 def main():

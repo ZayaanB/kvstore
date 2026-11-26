@@ -82,9 +82,9 @@ with tempfile.TemporaryDirectory(prefix="kvstore-bench-test-") as root:
     assert result.returncode == 0 and recorded["engine_metrics"]
     for workload in recorded["workloads"]:
         resources = workload["trials"][0]["resources"]
-        # Four writes, plus one table sync and one next-WAL sync per shard.
-        assert resources["wal_sync_count"] == 4 + 2 * 16
-        assert resources["wal_sync_latency"]["samples"] == 4 + 2 * 16
+        # Four appends and one next-WAL sync per shard.
+        assert resources["wal_sync_count"] == 4 + 16
+        assert resources["wal_sync_latency"]["samples"] == 4 + 16
         assert resources["compaction_bytes_processed"] == 32 * 109 + 16 * (8 + 52)
         assert resources["bytes_written"] == resources["compaction_bytes_processed"] + 4 * 109
 
