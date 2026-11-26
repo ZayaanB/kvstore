@@ -4,3 +4,5 @@
 !*.hpp
 !benchmarks/
 !benchmarks/benchmark_build.hpp.in
+!examples/
+!examples/word_count_main.cpp

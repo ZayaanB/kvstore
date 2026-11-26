@@ -3,6 +3,7 @@ RUN apt-get update && apt-get install --no-install-recommends -y cmake g++ && rm
 WORKDIR /source
 COPY CMakeLists.txt *.cpp *.hpp ./
 COPY benchmarks/benchmark_build.hpp.in benchmarks/
+COPY examples/word_count_main.cpp examples/
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF && \
     cmake --build build --target kvstore_cli -j
 

@@ -2,9 +2,9 @@
   "uid": "kvstore-live",
   "title": "KVStore live",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "time": {
-    "from": "now-15m",
+    "from": "now-5m",
     "to": "now"
   },
   "refresh": "5s",
@@ -20,7 +20,7 @@
       },
       "targets": [
         {
-          "expr": "((up{job=\"kvstore\"} == 1) and on(job,instance) kvstore_operations_total{job=\"kvstore\"}) or (up{job=\"kvstore\"} * 0) or (absent(up{job=\"kvstore\"}) * 0)",
+          "expr": "(max((up{job=\"kvstore\"} == 1) and on(job,instance) kvstore_operations_total{job=\"kvstore\"}) or vector(0))",
           "legendFormat": "Scrape",
           "instant": true,
           "range": false,
@@ -30,7 +30,7 @@
       "gridPos": {
         "x": 0,
         "y": 0,
-        "w": 8,
+        "w": 5,
         "h": 4
       },
       "fieldConfig": {
@@ -54,6 +54,150 @@
           ]
         },
         "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 17,
+      "title": "Data throughput",
+      "description": "Successful operations and expected lookup misses per second.",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kvstore-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(kvstore_operations_total{job=\"kvstore\",operation=~\"get|set|set_ttl|delete|size|range\",outcome=~\"ok|miss\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))",
+          "legendFormat": "Throughput",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "noValue": "No data",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "value"
+      },
+      "gridPos": {
+        "x": 5,
+        "y": 0,
+        "w": 5,
+        "h": 4
+      }
+    },
+    {
+      "id": 18,
+      "title": "p99 latency",
+      "description": "Pooled data-operation p99 for the selected rate window.",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kvstore-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(kvstore_operation_duration_seconds_bucket{job=\"kvstore\",operation=~\"get|set|set_ttl|delete|size|range\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))) and (sum(rate(kvstore_operation_duration_seconds_count{job=\"kvstore\",operation=~\"get|set|set_ttl|delete|size|range\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)) > 0)",
+          "legendFormat": "p99",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "No data",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "purple"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "value"
+      },
+      "gridPos": {
+        "x": 10,
+        "y": 0,
+        "w": 5,
+        "h": 4
+      }
+    },
+    {
+      "id": 19,
+      "title": "Error rate",
+      "description": "Failed data operations as a fraction of attempts.",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kvstore-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(kvstore_operations_total{job=\"kvstore\",operation=~\"get|set|set_ttl|delete|size|range\",outcome=\"error\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)) / (sum(rate(kvstore_operations_total{job=\"kvstore\",operation=~\"get|set|set_ttl|delete|size|range\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)) > 0)",
+          "legendFormat": "Errors",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "No data",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "value"
+      },
+      "gridPos": {
+        "x": 15,
+        "y": 0,
+        "w": 5,
+        "h": 4
       }
     },
     {
@@ -82,60 +226,67 @@
         }
       ],
       "gridPos": {
-        "x": 8,
+        "x": 20,
         "y": 0,
-        "w": 8,
+        "w": 4,
         "h": 4
       },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "noValue": "No data"
-        },
-        "overrides": []
-      }
-    },
-    {
-      "id": 3,
-      "type": "text",
-      "title": "Shard health",
-      "description": "The current storage engine has no separate shard availability states.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "kvstore-prometheus"
-      },
-      "targets": [],
-      "gridPos": {
-        "x": 16,
-        "y": 0,
-        "w": 8,
-        "h": 4
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "noValue": "No data"
+          "noValue": "No data",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
         },
         "overrides": []
       },
       "options": {
-        "mode": "markdown",
-        "content": "Independent shard availability is unavailable in this engine."
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "id": 20,
+      "title": "Operations",
+      "type": "row",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 24,
+        "h": 1
       }
     },
     {
       "id": 4,
       "type": "timeseries",
       "title": "Completed data operations",
-      "description": "Successes and lookup misses per second. The selected window applies to rates and histograms.",
+      "description": "Completions per second by operation and outcome. Expected lookup misses are completed reads.",
       "datasource": {
         "type": "prometheus",
         "uid": "kvstore-prometheus"
       },
       "targets": [
         {
-          "expr": "sum by (operation,outcome) (rate(kvstore_operations_total{job=\"kvstore\",operation=~\"$operation\",operation!~\"compact|recovery\",outcome=~\"ok|miss\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))",
-          "legendFormat": "{{operation}} \u00b7 {{outcome}}",
+          "expr": "sum by (operation,outcome) (rate(kvstore_operations_total{job=\"kvstore\",operation=~\"${operation:regex}\",operation=~\"get|set|set_ttl|delete|size|range\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))",
+          "legendFormat": "{{operation}} · {{outcome}}",
           "instant": false,
           "range": true,
           "refId": "A"
@@ -143,7 +294,7 @@
       ],
       "gridPos": {
         "x": 0,
-        "y": 4,
+        "y": 5,
         "w": 12,
         "h": 8
       },
@@ -152,80 +303,59 @@
           "unit": "ops",
           "noValue": "No data",
           "custom": {
-            "spanNulls": false
-          }
+            "spanNulls": false,
+            "showPoints": "never",
+            "fillOpacity": 12,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "min": 0
         },
-        "overrides": []
-      }
-    },
-    {
-      "id": 5,
-      "type": "timeseries",
-      "title": "Failed operations and lookup misses",
-      "description": "Shown separately so expected misses are visible without increasing error rate.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "kvstore-prometheus"
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/ · error$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/ · miss$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
       },
-      "targets": [
-        {
-          "expr": "sum by (operation,outcome) (rate(kvstore_operations_total{job=\"kvstore\",operation=~\"$operation\",operation!~\"compact|recovery\",outcome=~\"error|miss\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))",
-          "legendFormat": "{{operation}} \u00b7 {{outcome}}",
-          "instant": false,
-          "range": true,
-          "refId": "A"
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
         }
-      ],
-      "gridPos": {
-        "x": 12,
-        "y": 4,
-        "w": 12,
-        "h": 8
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "noValue": "No data",
-          "custom": {
-            "spanNulls": false
-          }
-        },
-        "overrides": []
-      }
-    },
-    {
-      "id": 6,
-      "type": "timeseries",
-      "title": "Failure rate",
-      "description": "Failed data operations divided by all attempts. Idle operations have no rate ratio.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "kvstore-prometheus"
-      },
-      "targets": [
-        {
-          "expr": "sum by(operation) (rate(kvstore_operations_total{job=\"kvstore\",operation=~\"$operation\",operation!~\"compact|recovery\",outcome=\"error\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)) / sum by(operation) (rate(kvstore_operations_total{job=\"kvstore\",operation=~\"$operation\",operation!~\"compact|recovery\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))",
-          "legendFormat": "{{operation}}",
-          "instant": false,
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "gridPos": {
-        "x": 0,
-        "y": 12,
-        "w": 12,
-        "h": 8
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percentunit",
-          "noValue": "No data",
-          "custom": {
-            "spanNulls": false
-          }
-        },
-        "overrides": []
       }
     },
     {
@@ -239,29 +369,29 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (operation,le) (rate(kvstore_operation_duration_seconds_bucket{job=\"kvstore\",operation=~\"$operation\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)))",
-          "legendFormat": "p50 \u00b7 {{operation}}",
+          "expr": "histogram_quantile(0.5, sum by (operation,le) (rate(kvstore_operation_duration_seconds_bucket{job=\"kvstore\",operation=~\"${operation:regex}\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))) and (sum by (operation) (rate(kvstore_operation_duration_seconds_count{job=\"kvstore\",operation=~\"${operation:regex}\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)) > 0)",
+          "legendFormat": "p50 · {{operation}}",
           "instant": false,
           "range": true,
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (operation,le) (rate(kvstore_operation_duration_seconds_bucket{job=\"kvstore\",operation=~\"$operation\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)))",
-          "legendFormat": "p95 \u00b7 {{operation}}",
+          "expr": "histogram_quantile(0.95, sum by (operation,le) (rate(kvstore_operation_duration_seconds_bucket{job=\"kvstore\",operation=~\"${operation:regex}\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))) and (sum by (operation) (rate(kvstore_operation_duration_seconds_count{job=\"kvstore\",operation=~\"${operation:regex}\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)) > 0)",
+          "legendFormat": "p95 · {{operation}}",
           "instant": false,
           "range": true,
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (operation,le) (rate(kvstore_operation_duration_seconds_bucket{job=\"kvstore\",operation=~\"$operation\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)))",
-          "legendFormat": "p99 \u00b7 {{operation}}",
+          "expr": "histogram_quantile(0.99, sum by (operation,le) (rate(kvstore_operation_duration_seconds_bucket{job=\"kvstore\",operation=~\"${operation:regex}\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))) and (sum by (operation) (rate(kvstore_operation_duration_seconds_count{job=\"kvstore\",operation=~\"${operation:regex}\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)) > 0)",
+          "legendFormat": "p99 · {{operation}}",
           "instant": false,
           "range": true,
           "refId": "C"
         },
         {
-          "expr": "sum by(operation) (rate(kvstore_operation_duration_seconds_sum{job=\"kvstore\",operation=~\"$operation\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)) / sum by(operation) (rate(kvstore_operation_duration_seconds_count{job=\"kvstore\",operation=~\"$operation\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))",
-          "legendFormat": "Mean \u00b7 {{operation}}",
+          "expr": "sum by (operation) (rate(kvstore_operation_duration_seconds_sum{job=\"kvstore\",operation=~\"${operation:regex}\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)) / (sum by (operation) (rate(kvstore_operation_duration_seconds_count{job=\"kvstore\",operation=~\"${operation:regex}\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)) > 0)",
+          "legendFormat": "Mean · {{operation}}",
           "instant": false,
           "range": true,
           "refId": "D"
@@ -269,7 +399,7 @@
       ],
       "gridPos": {
         "x": 12,
-        "y": 12,
+        "y": 5,
         "w": 12,
         "h": 8
       },
@@ -278,10 +408,165 @@
           "unit": "s",
           "noValue": "No data",
           "custom": {
-            "spanNulls": false
-          }
+            "spanNulls": false,
+            "showPoints": "never",
+            "fillOpacity": 12,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "min": 0
         },
         "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Failed operations and lookup misses",
+      "description": "Shown separately so expected misses are visible without increasing error rate.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kvstore-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (operation,outcome) (rate(kvstore_operations_total{job=\"kvstore\",operation=~\"${operation:regex}\",operation=~\"get|set|set_ttl|delete|size|range\",outcome=~\"error|miss\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))",
+          "legendFormat": "{{operation}} · {{outcome}}",
+          "instant": false,
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "showPoints": "never",
+            "fillOpacity": 12,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/ · error$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/ · miss$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Failure rate",
+      "description": "Failed data operations divided by all attempts. Idle operations have no rate ratio.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kvstore-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (operation) (rate(kvstore_operations_total{job=\"kvstore\",operation=~\"${operation:regex}\",operation=~\"get|set|set_ttl|delete|size|range\",outcome=\"error\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)) / (sum by (operation) (rate(kvstore_operations_total{job=\"kvstore\",operation=~\"${operation:regex}\",operation=~\"get|set|set_ttl|delete|size|range\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)) > 0)",
+          "legendFormat": "{{operation}}",
+          "instant": false,
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 13,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "showPoints": "never",
+            "fillOpacity": 12,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       }
     },
     {
@@ -295,7 +580,7 @@
       },
       "targets": [
         {
-          "expr": "sum by(operation) (increase(kvstore_operation_duration_seconds_count{job=\"kvstore\",operation=~\"$operation\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))",
+          "expr": "sum by(operation) (increase(kvstore_operation_duration_seconds_count{job=\"kvstore\",operation=~\"${operation:regex}\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))",
           "legendFormat": "{{operation}}",
           "instant": false,
           "range": true,
@@ -304,7 +589,7 @@
       ],
       "gridPos": {
         "x": 0,
-        "y": 20,
+        "y": 21,
         "w": 12,
         "h": 8
       },
@@ -313,25 +598,43 @@
           "unit": "short",
           "noValue": "No data",
           "custom": {
-            "spanNulls": false
-          }
+            "spanNulls": false,
+            "showPoints": "never",
+            "fillOpacity": 12,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "min": 0
         },
         "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       }
     },
     {
-      "id": 9,
+      "id": 16,
       "type": "timeseries",
-      "title": "Maintenance activity",
-      "description": "Compaction and startup/recovery completions, separated from data throughput.",
+      "title": "Active alerts",
+      "description": "Alert names and pending or firing states from Prometheus.",
       "datasource": {
         "type": "prometheus",
         "uid": "kvstore-prometheus"
       },
       "targets": [
         {
-          "expr": "sum by (operation,outcome) (rate(kvstore_operations_total{job=\"kvstore\",operation=~\"compact|recovery\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))",
-          "legendFormat": "{{operation}} \u00b7 {{outcome}}",
+          "expr": "ALERTS{alertname=~\"KVStore.*\"}",
+          "legendFormat": "{{alertname}} · {{alertstate}}",
           "instant": false,
           "range": true,
           "refId": "A"
@@ -339,19 +642,81 @@
       ],
       "gridPos": {
         "x": 12,
-        "y": 20,
+        "y": 21,
         "w": 12,
         "h": 8
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "ops",
+          "unit": "short",
           "noValue": "No data",
           "custom": {
-            "spanNulls": false
-          }
+            "spanNulls": false,
+            "showPoints": "never",
+            "fillOpacity": 12,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "min": 0
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/ · firing$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/ · pending$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "title": "Storage",
+      "type": "row",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 29,
+        "w": 24,
+        "h": 1
       }
     },
     {
@@ -366,7 +731,7 @@
       "targets": [
         {
           "expr": "sum by(phase,outcome) (rate(kvstore_wal_syncs_total{job=\"kvstore\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))",
-          "legendFormat": "{{phase}} \u00b7 {{outcome}}",
+          "legendFormat": "{{phase}} · {{outcome}}",
           "instant": false,
           "range": true,
           "refId": "A"
@@ -374,7 +739,7 @@
       ],
       "gridPos": {
         "x": 0,
-        "y": 28,
+        "y": 30,
         "w": 12,
         "h": 8
       },
@@ -383,17 +748,66 @@
           "unit": "ops",
           "noValue": "No data",
           "custom": {
-            "spanNulls": false
-          }
+            "spanNulls": false,
+            "showPoints": "never",
+            "fillOpacity": 12,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "min": 0
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/ · error$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/ · miss$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       }
     },
     {
       "id": 11,
       "type": "timeseries",
       "title": "WAL sync latency",
-      "description": "p95 and mean include successful and failed sync calls. Parent-directory sync is outside this measurement.",
+      "description": "Mean and p95 of WAL file sync calls. These include failed syncs.",
       "datasource": {
         "type": "prometheus",
         "uid": "kvstore-prometheus"
@@ -401,14 +815,14 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.95,sum by(phase,le) (rate(kvstore_wal_sync_duration_seconds_bucket{job=\"kvstore\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)))",
-          "legendFormat": "p95 \u00b7 {{phase}}",
+          "legendFormat": "p95 · {{phase}}",
           "instant": false,
           "range": true,
           "refId": "A"
         },
         {
           "expr": "sum by(phase) (rate(kvstore_wal_sync_duration_seconds_sum{job=\"kvstore\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)) / sum by(phase) (rate(kvstore_wal_sync_duration_seconds_count{job=\"kvstore\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))",
-          "legendFormat": "Mean \u00b7 {{phase}}",
+          "legendFormat": "Mean · {{phase}}",
           "instant": false,
           "range": true,
           "refId": "B"
@@ -416,7 +830,7 @@
       ],
       "gridPos": {
         "x": 12,
-        "y": 28,
+        "y": 30,
         "w": 12,
         "h": 8
       },
@@ -425,17 +839,119 @@
           "unit": "s",
           "noValue": "No data",
           "custom": {
-            "spanNulls": false
-          }
+            "spanNulls": false,
+            "showPoints": "never",
+            "fillOpacity": 12,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "min": 0
         },
         "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Maintenance activity",
+      "description": "Explicit compact calls, individual nonempty shard flushes and startup/recovery completions.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kvstore-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (operation,outcome) (rate(kvstore_operations_total{job=\"kvstore\",operation=~\"compact|flush|recovery\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))",
+          "legendFormat": "{{operation}} · {{outcome}}",
+          "instant": false,
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 38,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "showPoints": "never",
+            "fillOpacity": 12,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/ · error$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/ · miss$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       }
     },
     {
       "id": 12,
       "type": "timeseries",
-      "title": "WAL and compaction writes",
-      "description": "Bytes accepted by write calls, including bytes later rolled back. Compaction bytes are serialized output.",
+      "title": "WAL and sorted-table writes",
+      "description": "Logical bytes accepted by write syscalls. WAL can include rolled-back writes. Flush output counts serialized sorted-table bytes.",
       "datasource": {
         "type": "prometheus",
         "uid": "kvstore-prometheus"
@@ -450,8 +966,8 @@
         }
       ],
       "gridPos": {
-        "x": 0,
-        "y": 36,
+        "x": 12,
+        "y": 38,
         "w": 12,
         "h": 8
       },
@@ -460,17 +976,35 @@
           "unit": "Bps",
           "noValue": "No data",
           "custom": {
-            "spanNulls": false
-          }
+            "spanNulls": false,
+            "showPoints": "never",
+            "fillOpacity": 12,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "min": 0
         },
         "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       }
     },
     {
       "id": 13,
       "type": "timeseries",
-      "title": "Disk space",
-      "description": "Logical database file length (WAL, lock and temporary compaction WAL), active WAL length and filesystem space available to the CLI.",
+      "title": "Database footprint",
+      "description": "Logical database file lengths, including WALs, tables, metadata, lock file and transient files. The total is omitted when the bounded scan cannot finish.",
       "datasource": {
         "type": "prometheus",
         "uid": "kvstore-prometheus"
@@ -478,29 +1012,22 @@
       "targets": [
         {
           "expr": "kvstore_wal_file_bytes{job=\"kvstore\"} and on(job,instance) (up{job=\"kvstore\"} == 1)",
-          "legendFormat": "WAL bytes",
+          "legendFormat": "Committed active WAL",
           "instant": false,
           "range": true,
           "refId": "A"
         },
         {
           "expr": "kvstore_database_file_bytes{job=\"kvstore\"} and on(job,instance) (up{job=\"kvstore\"} == 1)",
-          "legendFormat": "Database file bytes",
+          "legendFormat": "Database files",
           "instant": false,
           "range": true,
           "refId": "C"
-        },
-        {
-          "expr": "kvstore_filesystem_available_bytes{job=\"kvstore\"} and on(job,instance) (up{job=\"kvstore\"} == 1)",
-          "legendFormat": "Available filesystem bytes",
-          "instant": false,
-          "range": true,
-          "refId": "B"
         }
       ],
       "gridPos": {
-        "x": 12,
-        "y": 36,
+        "x": 0,
+        "y": 46,
         "w": 12,
         "h": 8
       },
@@ -509,10 +1036,108 @@
           "unit": "bytes",
           "noValue": "No data",
           "custom": {
-            "spanNulls": false
-          }
+            "spanNulls": false,
+            "showPoints": "never",
+            "fillOpacity": 12,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "min": 0
         },
         "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Sorted-table lookup latency",
+      "description": "Point lookup time across immutable sorted tables, excluding time waiting for the disk-read mutex. Includes misses and errors.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kvstore-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (operation) (rate(kvstore_operation_duration_seconds_sum{job=\"kvstore\",operation=\"disk_lookup\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)) / (sum by (operation) (rate(kvstore_operation_duration_seconds_count{job=\"kvstore\",operation=\"disk_lookup\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)) > 0)",
+          "legendFormat": "Mean",
+          "instant": false,
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (operation,le) (rate(kvstore_operation_duration_seconds_bucket{job=\"kvstore\",operation=\"disk_lookup\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))) and (sum by (operation) (rate(kvstore_operation_duration_seconds_count{job=\"kvstore\",operation=\"disk_lookup\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)) > 0)",
+          "legendFormat": "p95",
+          "instant": false,
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (operation,le) (rate(kvstore_operation_duration_seconds_bucket{job=\"kvstore\",operation=\"disk_lookup\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1))) and (sum by (operation) (rate(kvstore_operation_duration_seconds_count{job=\"kvstore\",operation=\"disk_lookup\"}[$window]) and on(job,instance) (up{job=\"kvstore\"} == 1)) > 0)",
+          "legendFormat": "p99",
+          "instant": false,
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 46,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "showPoints": "never",
+            "fillOpacity": 12,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 22,
+      "title": "Resources and health",
+      "type": "row",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 54,
+        "w": 24,
+        "h": 1
       }
     },
     {
@@ -535,8 +1160,8 @@
       ],
       "gridPos": {
         "x": 0,
-        "y": 44,
-        "w": 12,
+        "y": 55,
+        "w": 8,
         "h": 8
       },
       "fieldConfig": {
@@ -544,10 +1169,28 @@
           "unit": "percentunit",
           "noValue": "No data",
           "custom": {
-            "spanNulls": false
-          }
+            "spanNulls": false,
+            "showPoints": "never",
+            "fillOpacity": 12,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "min": 0
         },
         "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       }
     },
     {
@@ -569,9 +1212,9 @@
         }
       ],
       "gridPos": {
-        "x": 12,
-        "y": 44,
-        "w": 12,
+        "x": 8,
+        "y": 55,
+        "w": 8,
         "h": 8
       },
       "fieldConfig": {
@@ -579,45 +1222,109 @@
           "unit": "bytes",
           "noValue": "No data",
           "custom": {
-            "spanNulls": false
-          }
+            "spanNulls": false,
+            "showPoints": "never",
+            "fillOpacity": 12,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "min": 0
         },
         "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       }
     },
     {
-      "id": 16,
+      "id": 24,
       "type": "timeseries",
-      "title": "Active alerts",
-      "description": "Alert names and pending or firing states from Prometheus.",
+      "title": "Free filesystem space",
+      "description": "Available bytes on the filesystem containing the database.",
       "datasource": {
         "type": "prometheus",
         "uid": "kvstore-prometheus"
       },
       "targets": [
         {
-          "expr": "ALERTS{alertname=~\"KVStore.*\"}",
-          "legendFormat": "{{alertname}} \u00b7 {{alertstate}}",
+          "expr": "kvstore_filesystem_available_bytes{job=\"kvstore\"} and on(job,instance) (up{job=\"kvstore\"} == 1)",
+          "legendFormat": "Available bytes",
           "instant": false,
           "range": true,
           "refId": "A"
         }
       ],
       "gridPos": {
-        "x": 0,
-        "y": 52,
-        "w": 24,
+        "x": 16,
+        "y": 55,
+        "w": 8,
         "h": 8
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
+          "unit": "bytes",
           "noValue": "No data",
           "custom": {
-            "spanNulls": false
-          }
+            "spanNulls": false,
+            "showPoints": "never",
+            "fillOpacity": 12,
+            "lineWidth": 2
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "min": 0
         },
         "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "text",
+      "title": "Storage coverage",
+      "description": "Storage milestones required for additional panels.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kvstore-prometheus"
+      },
+      "targets": [],
+      "gridPos": {
+        "x": 0,
+        "y": 63,
+        "w": 24,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Available** · memtable flushes and sorted-table point lookups\n\n**Pending** · sorted-table merges, background flush queue, cache hit rate, shard availability and failed-shard alert"
       }
     }
   ],
@@ -630,7 +1337,7 @@
         "includeAll": true,
         "allValue": ".*",
         "multi": true,
-        "query": "get,set,set_ttl,delete,size,range,compact,recovery",
+        "query": "get,set,set_ttl,delete,size,range,compact,recovery,flush,disk_lookup",
         "current": {
           "text": "All",
           "value": "$__all"
@@ -647,5 +1354,9 @@
         }
       }
     ]
-  }
+  },
+  "tags": [
+    "kvstore",
+    "observability"
+  ]
 }

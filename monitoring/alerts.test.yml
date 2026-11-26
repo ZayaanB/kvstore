@@ -63,3 +63,17 @@ tests:
         alertname: KVStoreTelemetryMissing
       - eval_time: 80s
         alertname: KVStoreErrorRateHigh
+
+  - interval: 5s
+    input_series:
+      - series: 'up{job="kvstore",instance="test"}'
+        values: '1x30'
+      - series: 'kvstore_operations_total{job="kvstore",instance="test",operation="get",outcome="ok"}'
+        values: '0+90x30'
+      - series: 'kvstore_operations_total{job="kvstore",instance="test",operation="get",outcome="miss"}'
+        values: '0+10x30'
+      - series: 'kvstore_operations_total{job="kvstore",instance="test",operation="disk_lookup",outcome="error"}'
+        values: '0+50x30'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: KVStoreErrorRateHigh

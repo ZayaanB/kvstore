@@ -522,7 +522,7 @@ namespace kvstore {
 
         // Sequential reader shared by the legacy migration and the active shard WAL.
         template<class Apply>
-        void Replay(int fd, bool legacy, Apply apply, Metrics* metrics = nullptr) {
+        std::uint64_t Replay(int fd, bool legacy, Apply apply, Metrics* metrics = nullptr) {
             const auto size = FileSize(fd);
             std::uint64_t offset = 0;
             const std::size_t header_bytes = legacy ? 9 : kHeaderBytes;
@@ -575,6 +575,7 @@ namespace kvstore {
                  !SyncWal(fd, false, metrics, WalSync::Recovery))) {
                 Invalid("could not durably repair WAL tail");
             }
+            return offset;
         }
     }
 
@@ -588,6 +589,7 @@ namespace kvstore {
             std::uint64_t flushed = 0;
             std::uint64_t sequence = 0;
             Fd wal;
+            std::atomic<std::uint64_t> committed_wal_bytes{0};
 
             std::string WalPath(std::uint64_t generation) const {
                 return directory + "/" + std::to_string(generation) + ".wal";
@@ -699,7 +701,7 @@ namespace kvstore {
 
             shard.wal = Fd(::open(shard.WalPath(shard.tables + 1).c_str(), O_RDWR | O_APPEND | O_CLOEXEC | O_NOFOLLOW));
             shard.sequence = shard.flushed;
-            Replay(shard.wal, false, [&](const Header& header, std::string key, std::string value) {
+            const auto recovered_bytes = Replay(shard.wal, false, [&](const Header& header, std::string key, std::string value) {
                 if (header.sequence <= shard.sequence || header.sequence - shard.sequence != 1 ||
                     ShardIndex(key) != index || shard.charged >= shard_budget ||
                     (shard.charged != 0 && header.Charge() > shard_budget - shard.charged)) {
@@ -709,6 +711,7 @@ namespace kvstore {
                 shard.charged += header.Charge();
                 shard.pending.insert_or_assign(std::move(key), Entry{header, std::move(value)});
             }, metrics.get());
+            if (metrics) shard.committed_wal_bytes.store(recovered_bytes, std::memory_order_relaxed);
 
             // The manifest rename may have survived a process crash before its fsync.
             // Make its observed state durable before removing any obsolete names.
@@ -742,6 +745,7 @@ namespace kvstore {
 
         bool Flush(Shard& shard) {
             if (shard.pending.empty()) return true;
+            OperationObservation observation(metrics.get(), Operation::Flush);
             const auto generation = shard.tables + 1;
             const auto retired = shard.WalPath(generation);
             const auto manifest_path = shard.directory + "/MANIFEST";
@@ -750,7 +754,7 @@ namespace kvstore {
             // Future generation names are invisible until a durable manifest selects them.
             const Fd table(::open(shard.TablePath(generation).c_str(),
                                   O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW, 0644));
-            if (table < 0 || !WriteTable(table, shard) || !SyncWal(table, true, metrics.get(), WalSync::Compact)) {
+            if (table < 0 || !WriteTable(table, shard) || !SyncFile(table, true)) {
                 return false;
             }
             Fd next_wal(::open(shard.WalPath(generation + 1).c_str(),
@@ -768,6 +772,7 @@ namespace kvstore {
             }
 
             shard.wal = std::move(next_wal);
+            if (metrics) shard.committed_wal_bytes.store(0, std::memory_order_relaxed);
             shard.tables = generation;
             shard.flushed = shard.sequence;
             shard.pending.clear();
@@ -776,6 +781,7 @@ namespace kvstore {
             // Retirement is housekeeping after commit. A failed unlink or sync
             // can only leave an obsolete WAL, which recovery ignores and retries.
             if (::unlink(retired.c_str()) == 0) (void)SyncDirectory(shard.directory.c_str());
+            observation.Success();
             return true;
         }
 
@@ -799,6 +805,10 @@ namespace kvstore {
                     failed.store(true);
                 }
                 return false;
+            }
+            if (metrics) {
+                shard.committed_wal_bytes.store(static_cast<std::uint64_t>(before) + header.Bytes(),
+                                                std::memory_order_relaxed);
             }
             try {
                 shard.pending.insert_or_assign(std::forward<Key>(key), Entry{header, std::forward<Value>(value)});
@@ -836,14 +846,22 @@ namespace kvstore {
                 if (entry->second.header.Live(NowSeconds())) return entry->second.value;
                 return std::nullopt;
             }
+            if (shard.tables == 0) return std::nullopt;
             std::lock_guard reader(disk_read_mutex);
+            OperationObservation observation(metrics.get(), Operation::DiskLookup);
             for (auto i = shard.tables; i != 0; --i) {
                 const Table table(shard.TablePath(i));
                 if (const auto record = table.Find(key)) {
-                    if (record->header.Live(NowSeconds())) return table.Value(*record);
+                    if (record->header.Live(NowSeconds())) {
+                        auto value = table.Value(*record);
+                        observation.Success();
+                        return value;
+                    }
+                    observation.Miss();
                     return std::nullopt;
                 }
             }
+            observation.Miss();
             return std::nullopt;
         }
 
@@ -975,6 +993,15 @@ namespace kvstore {
         std::lock_guard writer(engine_->write_mutex);
         std::uintmax_t bytes = 0;
         for (const auto& shard : engine_->shards) bytes += FileSize(shard.wal);
+        return bytes;
+    }
+
+    std::optional<std::uint64_t> KVStore::TelemetryWalBytes() const noexcept {
+        if (!engine_->metrics) return std::nullopt;
+        std::uint64_t bytes = 0;
+        for (const auto& shard : engine_->shards) {
+            bytes += shard.committed_wal_bytes.load(std::memory_order_relaxed);
+        }
         return bytes;
     }
 

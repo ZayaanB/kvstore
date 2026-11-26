@@ -52,6 +52,8 @@ public:
     // Active paths in shard order. A flush may retire any of these paths.
     std::vector<std::string> WalPaths() const;
     std::uintmax_t WalBytes() const;
+    // Rolling snapshot of committed active WAL bytes, available with a recorder.
+    std::optional<std::uint64_t> TelemetryWalBytes() const noexcept;
 
     // Replay a legacy <source>.wal into a new destination directory while
     // holding both process locks. Throws on validation or publication errors.

@@ -194,7 +194,8 @@ takes ~11 ms.
 ## Local monitoring
 
 The CLI can attach an in-process recorder and expose Prometheus metrics on
-loopback. The embedded engine opens no listener.
+loopback. The embedded engine opens no listener. Keys, values and database
+paths stay out of the metrics.
 
 ```bash
 ./build/kvstore_cli /tmp/kvstore-demo/store --metrics-port 9108
@@ -212,11 +213,23 @@ docker compose -f monitoring/compose.yml attach kvstore
 
 Run `set hello world`, `get hello`, `get absent`, and `compact` repeatedly
 across several scrapes. Detach from the CLI with Ctrl-P, Ctrl-Q.
-Grafana is at `http://127.0.0.1:3000` with initial credentials
-`admin` / `admin`. Open **KVStore live** and select a time range, rate window,
-and operation. Prometheus is at `http://127.0.0.1:9090`; its Alerts page lists
-the same local rules shown on the dashboard. Both services keep their data
-in named volumes, and Prometheus retains 30 days of samples.
+Open [KVStore live](http://127.0.0.1:3000/d/kvstore-live/kvstore-live) with
+the initial credentials `admin` / `admin`. Use the time range, rate window
+and operation filter to drill into counts and mean, p50, p95 and p99 latency.
+The summary cards show totals across data operations. Expected lookup misses
+count toward throughput and have their own outcome. The dashboard shows WAL
+syncs, explicit compaction, automatic shard flushes, sorted-table writes,
+point lookups that reach sorted tables, and CLI resource use.
+
+The database footprint is a best-effort gauge. The exporter omits it when
+files change during the scan or the scan exceeds its entry or time budget.
+Sorted-table merge metrics, background flush backlog, cache hit rate,
+per-shard availability and the failed-shard alert await those engine capabilities.
+
+The [Prometheus Alerts page](http://127.0.0.1:9090/alerts) lists the same local
+rules shown on the dashboard. The rules cover sustained data errors,
+missing telemetry, and low disk space. Both services keep their data in named
+volumes, and Prometheus retains 30 days of samples.
 
 ```bash
 docker compose -f monitoring/compose.yml down
@@ -226,6 +239,23 @@ For embedded use, pass a shared `kvstore::Metrics` recorder to the
 `KVStore` constructor. For benchmark comparisons, set
 `--engine-metrics off` or `--engine-metrics on` and use
 `benchmarks/compare.py --compare-engine-metrics` to compare the two runs.
+
+To exercise the dashboard and alerts with local Prometheus and Grafana
+binaries, set `PROMETHEUS_DIR` and `GRAFANA_DIR` to their distribution
+directories. Run these checks from the repository root.
+
+```bash
+"$PROMETHEUS_DIR/promtool" test rules monitoring/alerts.test.yml
+python3 monitoring/smoke.py --cli ./build/kvstore_cli \
+  --prometheus "$PROMETHEUS_DIR/prometheus" --grafana "$GRAFANA_DIR" \
+  --output /tmp/kvstore-monitoring-results
+```
+
+The smoke test drives durable writes and reads, interrupts scraping while
+checking reads and writes through the same CLI, and exercises the firing
+and resolution of both telemetry and error alerts. It stops its processes
+and removes its temporary database. The requested output directory holds
+the Grafana query results and process logs.
 
 ## Sanitizers
 
