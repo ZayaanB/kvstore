@@ -1,0 +1,45 @@
+services:
+  kvstore:
+    build:
+      context: ..
+      dockerfile: monitoring/Dockerfile
+    command: ["/data/store", "--metrics-port", "9108", "--metrics-listen", "0.0.0.0"]
+    stdin_open: true
+    tty: true
+    volumes:
+      - kvstore-data:/data
+
+  prometheus:
+    image: prom/prometheus:v3.13.5
+    command:
+      - --config.file=/etc/prometheus/kvstore.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/kvstore.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:13.2.2
+    environment:
+      KVSTORE_PROMETHEUS_URL: http://prometheus:9090
+      KVSTORE_DASHBOARDS_PATH: /etc/grafana/dashboards
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+
+volumes:
+  kvstore-data:
+  prometheus-data:
+  grafana-data:

@@ -1,4 +1,5 @@
 #include "kvstore.hpp"
+#include "metrics.hpp"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -199,12 +200,22 @@ void TestRollback() {
             const auto path = Db("rollback-" + std::to_string(static_cast<int>(f)) +
                                  (compact_first ? "-compacted" : ""));
             {
-                kvstore::KVStore store(path);
+                const auto metrics = std::make_shared<kvstore::Metrics>();
+                kvstore::KVStore store(path, metrics);
                 Check(store.Set("base", "original"), "seed failed");
                 if (compact_first) Check(store.Compact(), "pre-failure compaction failed");
+                const auto before = metrics->Storage();
                 Arm(f);
                 Check(!store.Set("broken", "value"), "injected write unexpectedly succeeded");
                 Disarm();
+                if (f == Fault::SyncOnce) {
+                    const auto after = metrics->Storage();
+                    Check(after.wal_syncs - before.wal_syncs == 2, "metrics missed append or rollback sync");
+                    Check(after.failed_wal_syncs - before.failed_wal_syncs == 1, "metrics missed failed sync");
+                    Check(after.wal_written_bytes - before.wal_written_bytes == 24, "metrics missed bytes rolled back");
+                    Check(metrics->Prometheus().find("kvstore_operations_total{operation=\"set\",outcome=\"error\"} 1") !=
+                        std::string::npos, "metrics missed failed Set");
+                }
                 if (f == Fault::RollbackTruncate || f == Fault::RollbackSync) {
                     CheckUnavailable(store);
                 } else {

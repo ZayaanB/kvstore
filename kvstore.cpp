@@ -1,4 +1,5 @@
 #include "kvstore.hpp"
+#include "metrics.hpp"
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -9,6 +10,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
@@ -18,6 +20,38 @@ namespace kvstore {
     namespace fs = std::filesystem;
 
     namespace {
+
+        class OperationObservation {
+        public:
+            OperationObservation(Metrics* metrics, Operation operation) noexcept
+                : metrics_(metrics), operation_(operation) {
+                if (metrics_) {
+                    start_ = Metrics::Clock::now();
+                    exceptions_ = std::uncaught_exceptions();
+                }
+            }
+
+            ~OperationObservation() {
+                if (metrics_) {
+                    const auto outcome = std::uncaught_exceptions() > exceptions_ ? Outcome::Error : outcome_;
+                    metrics_->Observe(operation_, outcome, Metrics::Clock::now() - start_);
+                }
+            }
+
+            void Success() noexcept { outcome_ = Outcome::Ok; }
+            void Miss() noexcept { outcome_ = Outcome::Miss; }
+            bool Result(bool ok) noexcept {
+                if (ok) Success();
+                return ok;
+            }
+
+        private:
+            Metrics* metrics_;
+            Operation operation_;
+            Outcome outcome_ = Outcome::Error;
+            Metrics::Clock::time_point start_;
+            int exceptions_ = 0;
+        };
 
         std::string AbsoluteStorePath(const std::string& path) {
             if (path.empty() || path.find('\0') != std::string::npos) {
@@ -124,7 +158,8 @@ namespace kvstore {
         }
 
         // write every byte, retrying partial writes and EINTR
-        bool WriteFully(int fd, const char* data, std::size_t len) {
+        bool WriteFully(int fd, const char* data, std::size_t len,
+                        Metrics* metrics, WriteSource source) {
             std::size_t written = 0;
             while (written < len) {
                 const ssize_t n = ::write(fd, data + written, len - written);
@@ -138,6 +173,7 @@ namespace kvstore {
                     return false;  // no progress, don't spin
                 }
                 written += static_cast<std::size_t>(n);
+                if (metrics) metrics->AddWritten(source, static_cast<std::uint64_t>(n));
             }
             return true;
         }
@@ -148,6 +184,14 @@ namespace kvstore {
                 result = data_only ? ::fdatasync(fd) : ::fsync(fd);
             } while (result != 0 && errno == EINTR);
             return result == 0;
+        }
+
+        bool SyncWal(int fd, bool data_only, Metrics* metrics, WalSync phase) {
+            if (!metrics) return SyncFile(fd, data_only);
+            const auto start = Metrics::Clock::now();
+            const bool ok = SyncFile(fd, data_only);
+            metrics->Observe(phase, ok, Metrics::Clock::now() - start);
+            return ok;
         }
 
         bool TruncateFile(int fd, off_t length) {
@@ -196,11 +240,13 @@ namespace kvstore {
         return fd >= 0 && SyncFile(fd);
     }
 
-    KVStore::KVStore(std::string path)
-        : path_(AbsoluteStorePath(path)),
+    KVStore::KVStore(std::string path, std::shared_ptr<Metrics> metrics)
+        : metrics_(std::move(metrics)),
+          path_(AbsoluteStorePath(path)),
           wal_path_(path_ + ".wal"),
           wal_tmp_path_(path_ + ".wal.tmp"),
           lock_path_(path_ + ".lock") {
+        OperationObservation observation(metrics_.get(), Operation::Recovery);
         const fs::path parent = fs::absolute(fs::path(path_)).parent_path();
         fs::create_directories(parent);
         // Persist newly created directory entries, including nested ancestors.
@@ -212,6 +258,7 @@ namespace kvstore {
         AcquireProcessLock();
         Recover();
         OpenWalForAppend();
+        observation.Success();
     }
 
     KVStore::~KVStore() = default;
@@ -261,7 +308,7 @@ namespace kvstore {
                                  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644));
         if (fd < 0) return false;
         // Sync even on reopen: an earlier failed create may have left the name behind.
-        if (!SyncFile(fd, true) || !SyncParentDir(wal_path_)) return false;
+        if (!SyncWal(fd, true, metrics_.get(), WalSync::Open) || !SyncParentDir(wal_path_)) return false;
         wal_fd_.Reset(fd.Release());
         return true;
     }
@@ -326,7 +373,7 @@ namespace kvstore {
             good_offset += record_size;
         }
         if (good_offset < size &&
-            (!TruncateFile(fd, static_cast<off_t>(good_offset)) || !SyncFile(fd))) {
+            (!TruncateFile(fd, static_cast<off_t>(good_offset)) || !SyncWal(fd, false, metrics_.get(), WalSync::Recovery))) {
             throw std::runtime_error("KVStore: failed to durably repair WAL tail");
         }
     }
@@ -350,9 +397,10 @@ namespace kvstore {
             return false;
         }
 
-        if (!WriteFully(wal_fd_, record.data(), record.size()) || !SyncFile(wal_fd_, true)) {
+        if (!WriteFully(wal_fd_, record.data(), record.size(), metrics_.get(), WriteSource::Wal) ||
+            !SyncWal(wal_fd_, true, metrics_.get(), WalSync::Append)) {
             // Both rollback and its durability must be established before continuing.
-            if (!TruncateFile(wal_fd_, before) || !SyncFile(wal_fd_, true)) {
+            if (!TruncateFile(wal_fd_, before) || !SyncWal(wal_fd_, true, metrics_.get(), WalSync::Rollback)) {
                 failed_.store(true);
             }
             return false;
@@ -384,11 +432,13 @@ namespace kvstore {
     }
 
     bool KVStore::Set(const std::string& key, const std::string& value) {
-        return SetInternal(key, value, kNoExpiry);
+        OperationObservation observation(metrics_.get(), Operation::Set);
+        return observation.Result(SetInternal(key, value, kNoExpiry));
     }
 
     bool KVStore::SetWithTtl(const std::string& key, const std::string& value,
                             std::int64_t ttl_seconds) {
+        OperationObservation observation(metrics_.get(), Operation::SetTtl);
         const auto now = NowSeconds();
         if ((ttl_seconds > 0 && now > std::numeric_limits<std::int64_t>::max() - ttl_seconds) ||
             (ttl_seconds < 0 && now < std::numeric_limits<std::int64_t>::min() - ttl_seconds)) {
@@ -398,7 +448,7 @@ namespace kvstore {
         if (expires_at == kNoExpiry) {
             expires_at += 1;  // avoid the no-expiry sentinel
         }
-        return SetInternal(key, value, expires_at);
+        return observation.Result(SetInternal(key, value, expires_at));
     }
 
     void KVStore::CheckReadable() const {
@@ -408,21 +458,22 @@ namespace kvstore {
     }
 
     std::optional<std::string> KVStore::Get(const std::string& key) const {
+        OperationObservation observation(metrics_.get(), Operation::Get);
         const Shard& shard = ShardFor(key);
         std::shared_lock lock(shard.mutex);
         CheckReadable();
         auto it = shard.data.find(key);
-        if (it == shard.data.end()) {
+        // Expired reads are misses. The entry is removed at compaction.
+        if (it == shard.data.end() || IsExpired(it->second.expires_at)) {
+            observation.Miss();
             return std::nullopt;
         }
-        // expired reads as absent, removed at compaction
-        if (IsExpired(it->second.expires_at)) {
-            return std::nullopt;
-        }
+        observation.Success();
         return it->second.value;
     }
 
     bool KVStore::Delete(const std::string& key) {
+        OperationObservation observation(metrics_.get(), Operation::Delete);
         // append + apply under one lock so log order matches memory
         std::lock_guard<std::mutex> wal_lock(wal_mutex_);
         if (!AppendRecordLocked(RecordType::kDelete, key, std::string(), kNoExpiry)) {
@@ -438,10 +489,11 @@ namespace kvstore {
             failed_.store(true);
             throw;
         }
-        return true;
+        return observation.Result(true);
     }
 
     std::size_t KVStore::Size() const {
+        OperationObservation observation(metrics_.get(), Operation::Size);
         CheckReadable();
         std::size_t total = 0;
         for (const auto& shard : shards_) {
@@ -454,6 +506,7 @@ namespace kvstore {
             }
         }
         CheckReadable();
+        observation.Success();
         return total;
     }
 
@@ -462,6 +515,7 @@ namespace kvstore {
     }
 
     std::vector<KeyValue> KVStore::Range(const std::string& start, const std::string& end) const {
+        OperationObservation observation(metrics_.get(), Operation::Range);
         CheckReadable();
         std::vector<KeyValue> result;
 
@@ -486,10 +540,12 @@ namespace kvstore {
                 [](const KeyValue& a, const KeyValue& b) { return a.key < b.key; });
 
         CheckReadable();
+        observation.Success();
         return result;
     }
 
     bool KVStore::Compact() {
+        OperationObservation observation(metrics_.get(), Operation::Compact);
         bool expected = false;
         if (!compaction_in_progress_.compare_exchange_strong(expected, true)) {
             return false;  // already compacting
@@ -520,10 +576,10 @@ namespace kvstore {
                 const auto type = entry.expires_at == kNoExpiry
                     ? RecordType::kSet : RecordType::kSetTtl;
                 const auto record = SerializeRecord(type, key, entry.value, entry.expires_at);
-                if (!WriteFully(tmp_fd, record.data(), record.size())) return false;
+                if (!WriteFully(tmp_fd, record.data(), record.size(), metrics_.get(), WriteSource::Compaction)) return false;
             }
         }
-        if (!SyncFile(tmp_fd, true)) return false;
+        if (!SyncWal(tmp_fd, true, metrics_.get(), WalSync::Compact)) return false;
         // Keep the old fd intact until replacement is durable. The temp fd already
         // has O_APPEND, avoiding an additional fallible reopen after the rename.
         if (::rename(wal_tmp_path_.c_str(), wal_path_.c_str()) != 0) return false;
@@ -550,7 +606,7 @@ namespace kvstore {
             }
         }
 
-        return true;
+        return observation.Result(true);
     }
 
 }

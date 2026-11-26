@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -13,6 +14,8 @@
 #include <vector>
 
 namespace kvstore {
+
+    class Metrics;
 
     constexpr std::size_t kNumShards = 16;
 
@@ -58,7 +61,8 @@ namespace kvstore {
         // Opens or creates a store; throws on I/O errors or non-tail corruption.
         // Relative paths bind to the current directory at construction.
         // Empty paths and paths containing NUL bytes are rejected.
-        explicit KVStore(std::string path);
+        // Pass a recorder to enable in-process metrics for this store.
+        explicit KVStore(std::string path, std::shared_ptr<Metrics> metrics = {});
 
         ~KVStore();
 
@@ -117,6 +121,7 @@ namespace kvstore {
         bool SetInternal(const std::string& key, const std::string& value,
                         std::int64_t expires_at);
 
+        std::shared_ptr<Metrics> metrics_;
         std::string path_;
         std::string wal_path_;
         std::string wal_tmp_path_;

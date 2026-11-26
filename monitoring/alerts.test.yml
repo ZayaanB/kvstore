@@ -1,0 +1,65 @@
+rule_files:
+  - alerts.yml
+evaluation_interval: 5s
+tests:
+  - interval: 5s
+    input_series:
+      - series: 'up{job="kvstore",instance="test"}'
+        values: '1x30'
+      - series: 'kvstore_operations_total{job="kvstore",instance="test",operation="set",outcome="error"}'
+        values: '0+10x30'
+      - series: 'kvstore_operations_total{job="kvstore",instance="test",operation="set",outcome="ok"}'
+        values: '0+90x30'
+      - series: 'kvstore_filesystem_available_bytes{job="kvstore",instance="test"}'
+        values: '10x30'
+      - series: 'kvstore_filesystem_capacity_bytes{job="kvstore",instance="test"}'
+        values: '1000x30'
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: KVStoreErrorRateHigh
+      - eval_time: 2m
+        alertname: KVStoreErrorRateHigh
+        exp_alerts:
+          - exp_labels:
+              job: kvstore
+              instance: test
+              severity: warning
+            exp_annotations:
+              summary: Over 5% of data operations are failing
+              description: Check operation outcomes and WAL sync failures for test.
+      - eval_time: 2m
+        alertname: KVStoreDiskSpaceLow
+        exp_alerts:
+          - exp_labels:
+              job: kvstore
+              instance: test
+              severity: warning
+            exp_annotations:
+              summary: Under 5% of the database filesystem is available
+              description: Check free space on the filesystem used by test.
+      - eval_time: 2m
+        alertname: KVStoreTelemetryMissing
+
+  - interval: 5s
+    input_series:
+      - series: 'up{job="kvstore",instance="test"}'
+        values: '1x3 0x9 1x6'
+      - series: 'kvstore_operations_total{job="kvstore",instance="test",operation="get",outcome="miss"}'
+        values: '0+5x3 stale _x8 20+5x6'
+    alert_rule_test:
+      - eval_time: 15s
+        alertname: KVStoreTelemetryMissing
+      - eval_time: 55s
+        alertname: KVStoreTelemetryMissing
+        exp_alerts:
+          - exp_labels:
+              job: kvstore
+              instance: test
+              severity: warning
+            exp_annotations:
+              summary: KVStore telemetry is missing
+              description: Prometheus has no recent KVStore operation counters from the configured target.
+      - eval_time: 80s
+        alertname: KVStoreTelemetryMissing
+      - eval_time: 80s
+        alertname: KVStoreErrorRateHigh
