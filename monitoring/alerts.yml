@@ -1,0 +1,40 @@
+groups:
+  - name: kvstore
+    rules:
+      - alert: KVStoreErrorRateHigh
+        expr: |
+          (
+            sum by (job, instance) (rate(kvstore_operations_total{job="kvstore",operation!~"compact|recovery",outcome="error"}[1m]))
+            / sum by (job, instance) (rate(kvstore_operations_total{job="kvstore",operation!~"compact|recovery"}[1m]))
+            > 0.05
+          ) and on(job,instance) (up{job="kvstore"} == 1)
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Over 5% of data operations are failing
+          description: Check operation outcomes and WAL sync failures for {{ $labels.instance }}.
+
+      - alert: KVStoreDiskSpaceLow
+        expr: |
+          (kvstore_filesystem_available_bytes{job="kvstore"}
+           / kvstore_filesystem_capacity_bytes{job="kvstore"} < 0.05)
+          and on(job,instance) (up{job="kvstore"} == 1)
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Under 5% of the database filesystem is available
+          description: Check free space on the filesystem used by {{ $labels.instance }}.
+
+      - alert: KVStoreTelemetryMissing
+        expr: |
+          (up{job="kvstore"} == 0)
+          or absent(up{job="kvstore"})
+          or ((up{job="kvstore"} == 1) unless on(job,instance) kvstore_operations_total{job="kvstore"})
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: KVStore telemetry is missing
+          description: Prometheus has no recent KVStore operation counters from the configured target.

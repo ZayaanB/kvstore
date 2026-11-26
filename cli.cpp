@@ -1,4 +1,10 @@
 #include "kvstore.hpp"
+#include "metrics.hpp"
+#include "metrics_http.hpp"
+
+#include <charconv>
+#include <optional>
+#include <string_view>
 
 #include <iostream>
 #include <memory>
@@ -39,16 +45,54 @@ namespace {
 
 int main(int argc, char** argv) {
     std::string db_path = "data/kvstore_cli.db";
-    if (argc > 1) {
-        db_path = argv[1];
+    std::string metrics_address = "127.0.0.1";
+    std::optional<std::uint16_t> metrics_port;
+    bool has_path = false;
+    constexpr auto usage = "usage: kvstore_cli [db_path] [--metrics-port PORT [--metrics-listen IPv4]]\n";
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view flag = argv[i];
+        if (flag == "--help") {
+            std::cout << usage;
+            return 0;
+        }
+        if (flag == "--metrics-port" && i + 1 < argc) {
+            const std::string_view value = argv[++i];
+            std::uint16_t port = 0;
+            const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), port);
+            if (error != std::errc{} || end != value.data() + value.size()) {
+                std::cerr << usage;
+                return 1;
+            }
+            metrics_port = port;
+        } else if (flag == "--metrics-listen" && i + 1 < argc) {
+            metrics_address = argv[++i];
+        } else if (!has_path && !flag.starts_with("--")) {
+            db_path = flag;
+            has_path = true;
+        } else {
+            std::cerr << usage;
+            return 1;
+        }
     }
 
+    std::shared_ptr<kvstore::Metrics> metrics;
     std::unique_ptr<kvstore::KVStore> store;
     try {
-        store = std::make_unique<kvstore::KVStore>(db_path);
+        if (metrics_port) metrics = std::make_shared<kvstore::Metrics>();
+        store = std::make_unique<kvstore::KVStore>(db_path, metrics);
     } catch (const std::exception& e) {
         std::cerr << "failed to open store at '" << db_path << "': " << e.what() << "\n";
         return 1;
+    }
+
+    std::unique_ptr<kvstore::MetricsHttp> exporter;
+    if (metrics) {
+        try {
+            exporter = std::make_unique<kvstore::MetricsHttp>(*metrics, store->WalPath(), metrics_address, *metrics_port);
+            std::cerr << "metrics listening on " << metrics_address << ':' << exporter->Port() << '\n';
+        } catch (const std::exception& error) {
+            std::cerr << "metrics exporter unavailable: " << error.what() << '\n';
+        }
     }
 
     std::cout << "kvstore cli - db: " << db_path << "\n";

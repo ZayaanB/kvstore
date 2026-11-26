@@ -25,7 +25,7 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake g++
+          sudo apt-get install -y -qq cmake g++ python3
 
       - name: Configure
         run: |
@@ -37,5 +37,4 @@ jobs:
         run: cmake --build build -j
 
       - name: Run tests (${{ matrix.name }})
-        working-directory: build
-        run: ./kvstore_test
+        run: ctest --test-dir build --output-on-failure

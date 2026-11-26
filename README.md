@@ -168,12 +168,31 @@ Other commands: `size`, `help`.
 
 ## Benchmark
 
-`kvstore_bench` reports read, write, mixed read/write, and compaction
-throughput:
+`kvstore_bench` runs closed-loop point reads, durable writes, 80/20 mixed traffic,
+compaction under mixed traffic, and reopening a populated store. Data workloads
+run against uniform and hot-key distributions. Each trial creates and removes an
+isolated database and verifies the final data, including WAL recovery. Writes
+use the engine's normal `fdatasync` path.
 
 ```bash
-./kvstore_bench
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+mkdir -p build/benchmarks/baseline build/benchmarks/candidate
+./build/kvstore_bench --smoke --mode latency --json build/benchmarks/baseline/results.json
+./build/kvstore_bench --smoke --mode latency --json build/benchmarks/candidate/results.json
+python3 benchmarks/compare.py build/benchmarks/baseline build/benchmarks/candidate \
+  --output build/benchmarks/comparison.html
 ```
+
+Use the same parameters when comparing revisions. Drop `--smoke` for the full
+suite, or use `--help` for workload, thread count, seed, trial count, and sample
+size controls. Select `--mode throughput` to omit per-operation latency sampling
+(the default). To measure the cost of sampling, use the same binary and workload
+settings for both modes and pass `--compare-modes` to the report script. Store
+each report with its two raw JSON files and commands. Keep designated baselines
+until replaced and retain other local runs for 30 days.
+
+### Historical sharding benchmark
 
 Results on a 13th-gen Intel i9-13900H (20 hardware threads), Kingston NVMe SSD,
 ext4, Linux, GCC 14 `-O3` (Release). Reads are 1M `Get`s per thread over a
@@ -207,12 +226,48 @@ is just the write ceiling divided by the write fraction: 235 / 0.2 ≈ 1,175 —
 the 20% of ops that fsync dominate everything else. Compacting 1,000 live keys
 takes ~11 ms.
 
+## Local monitoring
+
+The CLI can attach an in-process recorder and expose Prometheus metrics on
+loopback. The embedded engine opens no listener.
+
+```bash
+./build/kvstore_cli /tmp/kvstore-demo/store --metrics-port 9108
+# From another terminal
+curl -fsS http://127.0.0.1:9108/metrics
+```
+
+Start the complete local stack with Docker Compose. The Compose CLI uses its
+own database volume and serves metrics only on the Compose network.
+
+```bash
+docker compose -f monitoring/compose.yml up --build -d
+docker compose -f monitoring/compose.yml attach kvstore
+```
+
+Run `set hello world`, `get hello`, `get absent`, and `compact` repeatedly
+across several scrapes. Detach from the CLI with Ctrl-P, Ctrl-Q.
+Grafana is at `http://127.0.0.1:3000` with initial credentials
+`admin` / `admin`. Open **KVStore live** and select a time range, rate window,
+and operation. Prometheus is at `http://127.0.0.1:9090`; its Alerts page lists
+the same local rules shown on the dashboard. Both services keep their data
+in named volumes, and Prometheus retains 30 days of samples.
+
+```bash
+docker compose -f monitoring/compose.yml down
+```
+
+For embedded use, pass a shared `kvstore::Metrics` recorder to the
+`KVStore` constructor. For benchmark comparisons, set
+`--engine-metrics off` or `--engine-metrics on` and use
+`benchmarks/compare.py --compare-engine-metrics` to compare the two runs.
+
 ## Sanitizers
 
 ```bash
 # data races
-g++ -std=c++20 -O1 -g -fsanitize=thread -pthread kvstore.cpp main.cpp -o kvstore_tsan && ./kvstore_tsan
+g++ -std=c++20 -O1 -g -fsanitize=thread -pthread kvstore.cpp metrics.cpp main.cpp -o kvstore_tsan && ./kvstore_tsan
 
 # memory / undefined behavior
-g++ -std=c++20 -O1 -g -fsanitize=address,undefined -pthread kvstore.cpp main.cpp -o kvstore_asan && ./kvstore_asan
+g++ -std=c++20 -O1 -g -fsanitize=address,undefined -pthread kvstore.cpp metrics.cpp main.cpp -o kvstore_asan && ./kvstore_asan
 ```

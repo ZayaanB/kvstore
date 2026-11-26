@@ -28,25 +28,56 @@ find_package(Threads REQUIRED)
 
 add_library(kvstore STATIC
     kvstore.cpp
+    metrics.cpp
 )
 target_include_directories(kvstore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(kvstore PUBLIC Threads::Threads)
 
-add_executable(kvstore_cli cli.cpp)
+add_executable(kvstore_cli cli.cpp metrics_http.cpp)
 target_link_libraries(kvstore_cli PRIVATE kvstore Threads::Threads)
 
+set(BENCH_REVISION "")
+set(BENCH_SOURCE_STATE "")
+find_package(Git QUIET)
+if(Git_FOUND)
+    execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} OUTPUT_VARIABLE BENCH_REVISION
+        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(BENCH_REVISION)
+        execute_process(COMMAND ${GIT_EXECUTABLE} status --porcelain
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} OUTPUT_VARIABLE BENCH_CHANGES
+            RESULT_VARIABLE BENCH_GIT_RESULT ERROR_QUIET)
+        if(BENCH_GIT_RESULT EQUAL 0)
+            if(BENCH_CHANGES)
+                set(BENCH_SOURCE_STATE dirty)
+            else()
+                set(BENCH_SOURCE_STATE clean)
+            endif()
+        endif()
+    endif()
+endif()
+configure_file(benchmarks/benchmark_build.hpp.in benchmark_build.hpp @ONLY)
 add_executable(kvstore_bench bench.cpp)
+target_include_directories(kvstore_bench PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(kvstore_bench PRIVATE kvstore Threads::Threads)
 
 if(BUILD_TESTING)
+    add_test(NAME kvstore_benchmark_math COMMAND kvstore_bench --self-test)
     add_executable(kvstore_test main.cpp)
     target_link_libraries(kvstore_test PRIVATE kvstore Threads::Threads)
     # The existing suite uses assert; keep its checks active in Release builds too.
     target_compile_options(kvstore_test PRIVATE -UNDEBUG)
     add_test(NAME kvstore_suite COMMAND kvstore_test)
 
-    # Linux linker wrapping injects failures into real POSIX I/O without production hooks.
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        find_package(Python3 QUIET COMPONENTS Interpreter)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME kvstore_benchmark_smoke COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_smoke.py $<TARGET_FILE:kvstore_bench>
+                ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/compare.py)
+            set_tests_properties(kvstore_benchmark_smoke PROPERTIES TIMEOUT 120)
+        endif()
+        # Linker wrapping injects failures into real POSIX I/O without production hooks.
         add_executable(kvstore_failure_test tests/failure_tests.cpp)
         target_link_libraries(kvstore_failure_test PRIVATE kvstore Threads::Threads)
         target_link_options(kvstore_failure_test PRIVATE
