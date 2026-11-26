@@ -125,6 +125,12 @@ OK
 
 Other commands: `size`, `help`.
 
+## Local lakehouse export
+
+The fixture-backed [Spark-to-Iceberg integration](lakehouse/README.md)
+verifies full snapshot publication and historical queries. A consistent
+all-shard KVStore snapshot cursor is required for live exports.
+
 ## Benchmark
 
 `kvstore_bench` runs closed-loop point reads, durable writes, 80/20 mixed traffic,
