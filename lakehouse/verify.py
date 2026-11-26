@@ -4,11 +4,12 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 from tempfile import TemporaryDirectory
 from time import perf_counter
 from unittest.mock import patch
 
-from export import Capture, MANIFEST_NAME, capture_sequence, new_capture, write_export
+from export import Capture, MANIFEST_NAME, capture_sequence, export_database, new_capture, write_export
 import publish as publisher
 
 FIRST_TIME = 1_760_000_000
@@ -186,16 +187,55 @@ def verify(work):
           "duplicate and stale retries, and empty replacements", flush=True)
 
 
+def verify_database(work, cli):
+    work.mkdir()
+    database, warehouse = work / "store", work / "warehouse"
+    first, second = work / "first", work / "second"
+
+    def commands(*lines):
+        out = subprocess.run([cli.resolve(), database], input="\n".join((*lines, "exit", "")),
+                             text=True, capture_output=True, check=True)
+        assert "ERROR:" not in out.stdout, out.stdout
+
+    commands("set edit old value", "set gone remove me", "setttl expired 0 hidden", "compact")
+    first_capture = export_database(cli, database, warehouse, first, chunk_bytes=64)
+    commands("set edit new value", "del gone", "set add a new row", "compact")
+    second_capture = export_database(cli, database, warehouse, second, chunk_bytes=64)
+    assert first_capture["row_count"] == second_capture["row_count"] == 2
+    with publisher.spark_session(warehouse) as spark:
+        first_id = publisher.publish(spark, warehouse, first)
+        second_id = publisher.publish(spark, warehouse, second)
+        assert second_id != first_id and publisher.publish(spark, warehouse, second) == second_id
+        query(spark, {b"add": (b"a new row", None), b"edit": (b"new value", None)}, second_capture["captured_at"])
+        query(spark, {b"gone": (b"remove me", None), b"edit": (b"old value", None)},
+              first_capture["captured_at"], first_id)
+        table = next(database.glob("shard-*/*.sst"))
+        table.rename(table.with_suffix(".bad"))
+        broken = work / "broken"
+        expect_failure(lambda: export_database(cli, database, warehouse, broken), OSError, "ended early")
+        assert not (broken / MANIFEST_NAME).exists()
+        assert spark.table(f"{publisher.TABLE}.snapshots").count() == 2
+    print("PASS: KVStore database to Iceberg, updates and deletes, time travel, and corrupt source rejection",
+          flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-dir", type=Path, help="keep fixtures in a new directory for SQL inspection")
+    parser.add_argument("--kvstore-cli", type=Path, help="also verify export from a real KVStore database")
     args = parser.parse_args()
+
+    def run(work):
+        verify(work)
+        if args.kvstore_cli:
+            verify_database(work / "live", args.kvstore_cli)
+
     if args.work_dir:
         args.work_dir.mkdir()
-        verify(args.work_dir.resolve())
+        run(args.work_dir.resolve())
     else:
         with TemporaryDirectory(prefix="kvstore-lakehouse-") as work:
-            verify(Path(work))
+            run(Path(work))
 
 
 if __name__ == "__main__":

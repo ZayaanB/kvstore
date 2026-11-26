@@ -9,7 +9,8 @@
 
 namespace kvstore {
 
-enum class Operation { Get, Set, SetTtl, Delete, Size, Range, Compact, Recovery, Flush, DiskLookup, Count };
+enum class Operation { Get, Set, SetTtl, Delete, Size, Range, Compact, Recovery, Flush, DiskLookup,
+                       SetBatch, AutoCompact, Count };
 enum class Outcome { Ok, Miss, Error, Count };
 enum class WalSync { Append, Rollback, Open, Recovery, Count };
 enum class WriteSource { Wal, Compaction, Count };

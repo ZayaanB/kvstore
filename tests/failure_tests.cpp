@@ -1,5 +1,6 @@
 #include "kvstore.hpp"
 #include "metrics.hpp"
+#include "routing.hpp"
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <new>
@@ -27,6 +29,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -38,7 +41,8 @@ enum class Fault {
     TempWrite, TempSync, Rename, AllocationAfterSync, AllocationInCompact,
     CrashWrite, CrashTableWrite, CrashTempSync, CrashRename, CrashDirectorySync,
     Retire, CrashBeforeRetire, CrashAfterRetire, CrashMigrationBeforePublish, CrashMigrationAfterPublish,
-    MigrationValidation
+    MigrationValidation, CrashRestoreBeforePublish, CrashRestoreAfterPublish,
+    BatchWrite, CrashBatchBeforeSync, CrashBatchAfterSync, CountBatchWrites
 };
 std::atomic<Fault> fault{Fault::None};
 std::atomic<int> phase{0};
@@ -154,6 +158,22 @@ extern "C" int __wrap_open(const char* path, int flags, ...) {
 extern "C" ssize_t __wrap_write(int fd, const void* data, size_t len) {
     const auto f = fault.load();
     if (FdEndsWith(fd, ".wal")) {
+        if (f == Fault::CountBatchWrites) ++phase;
+        if (f == Fault::BatchWrite || f == Fault::CrashBatchBeforeSync) {
+            if (phase++ != 0) {
+                if (f == Fault::CrashBatchBeforeSync) ::_exit(77);
+                errno = ENOSPC;
+                return -1;
+            }
+            const auto* record = static_cast<const unsigned char*>(data);
+            const auto length_at = [&](unsigned offset) {
+                std::size_t length = 0;
+                for (unsigned i = 0; i < 4; ++i) length |= std::size_t{record[offset + i]} << (8 * i);
+                return length;
+            };
+            // Leave exactly one complete record before failing the retry.
+            return __real_write(fd, data, std::min(len, 29 + length_at(9) + length_at(13)));
+        }
         if (f == Fault::PartialWrite || f == Fault::RollbackTruncate) {
             if (phase == 0) { phase = 1; return __real_write(fd, data, std::min(len, size_t{3})); }
             if (phase == 1) { phase = 2; errno = ENOSPC; return -1; }
@@ -191,6 +211,7 @@ extern "C" int __wrap_fdatasync(int fd) {
     }
     if (FdEndsWith(fd, ".sst") && f == Fault::TempSync) { errno = EIO; return -1; }
     const int result = __real_fdatasync(fd);
+    if (result == 0 && FdEndsWith(fd, ".wal") && f == Fault::CrashBatchAfterSync) ::_exit(77);
     if (result == 0 && FdEndsWith(fd, ".wal") && f == Fault::AllocationAfterSync) fail_allocation = true;
     if (result == 0 && FdEndsWith(fd, ".sst") && f == Fault::CrashTempSync) ::_exit(77);
     return result;
@@ -209,14 +230,17 @@ extern "C" int __wrap_fsync(int fd) {
 }
 extern "C" int __wrap_rename(const char* from, const char* to) {
     const bool manifest = std::string_view(to).ends_with("/MANIFEST");
+    const bool restore = std::string_view(to).ends_with(".CURRENT");
     if (manifest && fault == Fault::Rename) { errno = EIO; return -1; }
     if (!manifest && fault == Fault::CrashMigrationBeforePublish) ::_exit(77);
+    if (restore && fault == Fault::CrashRestoreBeforePublish) ::_exit(77);
     const int result = __real_rename(from, to);
     if (result == 0 && manifest) {
         phase = 1;
         if (fault == Fault::CrashRename) ::_exit(77);
     }
     if (result == 0 && !manifest && fault == Fault::CrashMigrationAfterPublish) ::_exit(77);
+    if (result == 0 && restore && fault == Fault::CrashRestoreAfterPublish) ::_exit(77);
     return result;
 }
 extern "C" int __wrap_unlink(const char* path) {
@@ -273,6 +297,110 @@ void TestRollback() {
     kvstore::KVStore store(path);
     Disarm();
     Check(store.Get("key") == "value", "read EINTR was not retried");
+}
+
+std::string BatchKey(const kvstore::KVStore& store, std::size_t shard, bool same_shard) {
+    for (unsigned i = 0; i < 1'000; ++i) {
+        auto key = "batch-" + std::to_string(i);
+        if ((store.ShardForKey(key) == shard) == same_shard) return key;
+    }
+    throw std::runtime_error("could not find batch test key");
+}
+
+void TestSetBatch() {
+    const auto path = Db("set-batch");
+    const std::string first("key\0a", 5);
+    const std::string last_value("value\0b", 7);
+    std::string second;
+    {
+        const auto metrics = std::make_shared<kvstore::Metrics>();
+        kvstore::KVStore store(path, metrics);
+        const auto shard = store.ShardForKey(first);
+        second = BatchKey(store, shard, true);
+        const auto other = BatchKey(store, shard, false);
+        const std::array batch{kvstore::KeyValue{first, "first"},
+                               kvstore::KeyValue{second, "second"},
+                               kvstore::KeyValue{first, last_value}};
+        Check(store.Set(first, "old"), "could not seed batch");
+        const auto wal = store.WalPaths().at(shard);
+        const auto before = Bytes(wal);
+        Check(store.SetBatch({}), "empty batch should succeed");
+        Check(!store.SetBatch(std::array{batch[0], kvstore::KeyValue{other, "wrong shard"}}),
+              "mixed-shard batch should fail");
+        Check(!store.SetBatch(std::array{batch[0], kvstore::KeyValue{first, std::string(1 << 20, 'x')}}),
+              "oversized batch should fail");
+        Check(Bytes(wal) == before && store.Get(first) == "old" && !store.Get(second) && !store.Get(other),
+              "invalid batch changed data");
+
+        for (auto failure : {Fault::BatchWrite, Fault::SyncOnce}) {
+            Arm(failure);
+            const bool succeeded = store.SetBatch(batch);
+            Disarm();
+            Check(!succeeded && Bytes(wal) == before, "batch WAL rollback did not restore its original bytes");
+            Check(store.Get(first) == "old" && !store.Get(second), "failed batch changed visible data");
+        }
+
+        const auto syncs = metrics->Storage().wal_syncs;
+        Arm(Fault::CountBatchWrites);
+        const bool succeeded = store.SetBatch(batch);
+        Disarm();
+        Check(succeeded && phase == 1, "valid batch should take one append write");
+        Check(metrics->Storage().wal_syncs == syncs + 1, "batch did not use exactly one WAL sync");
+        Check(store.Get(first) == last_value && store.Get(second) == "second", "batch order or value changed");
+        Check(metrics->Prometheus().find("kvstore_operations_total{operation=\"set_batch\",outcome=\"ok\"} 2") !=
+              std::string::npos, "batch call did not reach telemetry");
+    }
+    kvstore::KVStore reopened(path);
+    Check(reopened.Get(first) == last_value && reopened.Get(second) == "second",
+          "reopen did not recover acknowledged batch");
+}
+
+void TestBatchAtBufferBoundary() {
+    const auto path = Db("batch-at-boundary");
+    {
+        // Three records of 256 charged bytes on a shard with a 512-byte budget.
+        kvstore::KVStore store(path, {}, kvstore::kNumShards * 512);
+        const std::string key = "key";
+        const auto shard = store.ShardForKey(key);
+        const auto wal = store.WalPaths().at(shard);
+        Check(store.Set(key, std::string(61, 'a')), "could not seed buffer");
+        const std::array batch{kvstore::KeyValue{key, std::string(61, 'b')},
+                               kvstore::KeyValue{key, std::string(61, 'c')}};
+        Check(store.SetBatch(batch), "batch that exactly fills the buffer failed");
+        Check(store.WalPaths().at(shard) != wal, "batch did not flush pending records first");
+    }
+    kvstore::KVStore reopened(path);
+    Check(reopened.Get("key") == std::string(61, 'c'), "full batch could not replay");
+    Check(reopened.Set("key", "later") && reopened.Get("key") == "later", "append after batch replay failed");
+}
+
+void TestUnacknowledgedBatchRecovery() {
+    for (auto fault_point : {Fault::CrashBatchBeforeSync, Fault::CrashBatchAfterSync}) {
+        const auto path = Db("batch-crash-" + std::to_string(static_cast<int>(fault_point)));
+        const std::string key = "base";
+        std::string second;
+        {
+            kvstore::KVStore store(path);
+            Check(store.Set(key, "old"), "could not seed crash test");
+            second = BatchKey(store, store.ShardForKey(key), true);
+        }
+        const pid_t child = ::fork();
+        Check(child >= 0, "fork failed");
+        if (child == 0) {
+            kvstore::KVStore store(path);
+            const std::array batch{kvstore::KeyValue{key, "first"}, kvstore::KeyValue{second, "second"}};
+            Arm(fault_point);
+            (void)store.SetBatch(batch);
+            ::_exit(3);
+        }
+        int status = 0;
+        Check(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 77,
+              "batch crash point was not reached");
+        kvstore::KVStore store(path);
+        Check(store.Get(key) == "first", "complete WAL record did not replay after process exit");
+        Check(store.Get(second).has_value() == (fault_point == Fault::CrashBatchAfterSync),
+              "batch recovery boundary was incorrect");
+    }
 }
 void TestRecoveryFailures() {
     for (auto f : {Fault::ReadError, Fault::RecoveryTruncate, Fault::RecoverySync, Fault::RecoveryOpen}) {
@@ -434,6 +562,23 @@ void TestPaths() {
           "chdir redirected acknowledged writes away from original database");
 }
 
+void TestSymlinkLock() {
+    const auto path = Db("real-store");
+    const auto alias = Db("store-alias");
+    {
+        const kvstore::KVStore store(path);
+        fs::create_directory_symlink(fs::path(path).filename(), alias);
+        Throws([&] { kvstore::KVStore second(alias); }, "database alias bypassed process lock");
+    }
+    {
+        kvstore::KVStore store(alias);
+        Throws([&] { kvstore::KVStore second(path); }, "target bypassed database alias's process lock");
+        Check(store.Set("key", "value"), "write through database alias failed");
+    }
+    const kvstore::KVStore store(path);
+    Check(store.Get("key") == "value", "database alias wrote to the wrong target");
+}
+
 void TestModel() {
     const auto path = Db("model");
     auto store = std::make_unique<kvstore::KVStore>(path);
@@ -486,6 +631,267 @@ void TestModel() {
     store.reset();
     store = std::make_unique<kvstore::KVStore>(path);
     verify();
+}
+
+void TestCorruptVisibilityRecord() {
+    const auto path = Db("corrupt-visibility");
+    kvstore::KVStore store(path, {}, kvstore::kNumShards * 192);
+    Check(store.Set("base", "original") && store.Delete("base"), "could not flush tombstone");
+    Check(!store.Get("base") && store.Items().empty(), "valid tombstone did not hide old value");
+    fs::path table;
+    for (const auto& file : fs::recursive_directory_iterator(path)) {
+        if (file.path().filename() == "2.sst") table = file.path();
+    }
+    auto data = Bytes(table.string());
+    data[25 + std::string_view("base").size()] ^= 1;
+    std::ofstream(table, std::ios::binary | std::ios::trunc) << data;
+    Throws([&] { (void)store.Get("base"); }, "lookup treated a corrupt tombstone as a miss");
+    Throws([&] { (void)store.Items(); }, "scan accepted a corrupt tombstone");
+}
+
+void TestSnapshot() {
+    kvstore::KVStore store(Db("snapshot"));
+    Check(store.Set("expired", "old") && store.Set("gone", "old") &&
+          store.Set("value", "old") && store.Compact(), "snapshot disk seed failed");
+    Check(store.SetWithTtl("expired", "new", 0) && store.Delete("gone") &&
+          store.SetWithTtl("value", "new", 3600), "snapshot memtable seed failed");
+    std::promise<void> ready;
+    std::future<bool> writer;
+    auto snapshot = store.OpenSnapshot();
+    writer = std::async(std::launch::async, [&] {
+        ready.set_value();
+        return store.Set("after", "new");
+    });
+    ready.get_future().wait();
+    Check(writer.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout,
+          "write advanced during snapshot");
+    kvstore::SnapshotRow row;
+    Check(snapshot->Next(row) && row.key == "value" && row.value == "new" &&
+          row.expires_at && *row.expires_at > snapshot->CapturedAt(), "snapshot row mismatch");
+    Check(!snapshot->Next(row) && !snapshot->Next(row), "snapshot exposed a shadowed row");
+    Check(writer.get() && store.Get("after") == "new", "snapshot exhaustion did not release writer");
+}
+
+void TestMergeCrashBoundaries() {
+    for (auto fault_point : {Fault::CrashTempSync, Fault::CrashRename, Fault::None}) {
+        const auto path = Db("table-merge-" + std::to_string(static_cast<int>(fault_point)));
+        {
+            kvstore::KVStore store(path, {}, kvstore::kNumShards * 192);
+            Check(store.Set("base", std::string(4096, 'a')) &&
+                  store.Set("base", std::string(4096, 'b')) &&
+                  store.Delete("base"), "merge fixture failed");
+        }
+        if (fault_point != Fault::None) {
+            const pid_t child = ::fork();
+            Check(child >= 0, "fork failed");
+            if (child == 0) {
+                kvstore::KVStore store(path);
+                Arm(fault_point);
+                (void)store.Compact();
+                ::_exit(3);
+            }
+            int status = 0;
+            Check(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 77,
+                  "merge crash point was not reached");
+        }
+        {
+            kvstore::KVStore store(path);
+            Check(!store.Get("base") && store.Size() == 0, "merge crash revived deleted value");
+            Check(store.Compact(), "could not finish merge");
+            std::vector<fs::path> tables;
+            for (const auto& entry : fs::recursive_directory_iterator(path)) {
+                if (entry.path().extension() == ".sst") tables.push_back(entry.path());
+            }
+            Check(tables.size() == 1 && tables[0].filename() == "base-3.sst" &&
+                  fs::file_size(tables[0]) < 4096, "merge retained obsolete tables");
+            Check(store.Set("base", "after"), "write after merge failed");
+        }
+        kvstore::KVStore store(path);
+        Check(store.Get("base") == "after" && store.Compact(), "merged manifest did not recover");
+    }
+}
+
+void SeedCompactionTables(kvstore::KVStore& store) {
+    for (unsigned record = 0; record < 16; ++record) {
+        Check(store.Set("key", std::string(61, static_cast<char>('a' + record))), "flush seed failed");
+    }
+}
+
+void TestAutomaticCompaction() {
+    const auto path = Db("automatic-compaction");
+    {
+        const auto metrics = std::make_shared<kvstore::Metrics>();
+        kvstore::KVStore store(path, metrics, kvstore::kNumShards * 512);
+        const std::string key = "key";
+        const auto shard = store.ShardForKey(key);
+        const auto directory = std::filesystem::path(store.WalPaths().at(shard)).parent_path();
+        SeedCompactionTables(store);
+        Check(std::filesystem::exists(directory / "1.sst") && std::filesystem::exists(directory / "8.sst"),
+              "expected eight tables before automatic merge");
+        Check(store.Set(key, "after merge"), "write that triggers automatic compaction failed");
+        const auto tables = std::count_if(fs::directory_iterator(directory), fs::directory_iterator{},
+            [](const fs::directory_entry& file) { return file.path().extension() == ".sst"; });
+        Check(tables == 1 && fs::exists(directory / "base-8.sst"), "automatic compaction did not merge eight tables");
+        Check(metrics->Prometheus().find("kvstore_operations_total{operation=\"auto_compact\",outcome=\"ok\"} 1") !=
+              std::string::npos, "automatic compaction did not record telemetry");
+    }
+    kvstore::KVStore reopened(path);
+    Check(reopened.Get("key") == "after merge", "automatic compaction lost an acknowledged write");
+
+    const auto damaged_path = Db("failed-automatic-compaction");
+    { const kvstore::KVStore initial(damaged_path, {}, kvstore::kNumShards * 512); }
+    kvstore::KVStore degraded(damaged_path, {}, std::nullopt, kvstore::OpenMode::Degraded);
+    SeedCompactionTables(degraded);
+    const auto shard = degraded.ShardForKey("key");
+    const auto directory = fs::path(degraded.WalPaths().at(shard)).parent_path();
+    Check(fs::remove(directory / "1.sst"), "could not remove table fixture");
+    Check(!degraded.Set("key", "reject") &&
+          degraded.UnavailableShards() == std::vector<std::size_t>{shard},
+          "automatic compaction did not reject the write and isolate the damaged shard");
+    Check(degraded.ShardForKey("different") != shard &&
+          degraded.Set("different", "healthy") && degraded.Get("different") == "healthy",
+          "automatic compaction failure blocked a healthy shard");
+}
+
+std::uint32_t TestCrc(std::string_view bytes) {
+    std::uint32_t crc = 0xffffffffu;
+    for (const auto byte : bytes) {
+        crc ^= static_cast<unsigned char>(byte);
+        for (int bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ ((crc & 1u) != 0 ? 0xedb88320u : 0u);
+    }
+    return ~crc;
+}
+
+void CreateModuloStore(const std::string& path) {
+    { const kvstore::KVStore empty(path); }
+    const auto metadata = path + "/METADATA";
+    auto bytes = Bytes(metadata);
+    bytes.at(24) = static_cast<char>(kvstore::detail::Routing::Modulo);
+    const auto crc = TestCrc(std::string_view(bytes).substr(0, bytes.size() - 4));
+    for (unsigned i = 0; i < 4; ++i) bytes[bytes.size() - 4 + i] = static_cast<char>(crc >> (8 * i));
+    std::ofstream(metadata, std::ios::binary | std::ios::trunc) << bytes;
+}
+
+void TestCheckpointAndRestore(bool modulo) {
+    const auto path = Db(modulo ? "checkpoint-modulo-primary" : "checkpoint-primary");
+    const auto checkpoint = Db(modulo ? "checkpoint-modulo-copy" : "checkpoint-copy");
+    if (modulo) CreateModuloStore(path);
+    std::size_t shard = 0;
+    fs::path table;
+    std::array<std::string, kvstore::kNumShards> healthy_keys;
+    {
+        kvstore::KVStore store(path);
+        Check(store.Set("base", "backup value"), "checkpoint seed failed");
+        shard = store.ShardForKey("base");
+        const auto wals = store.WalPaths();
+        Check(store.Compact(), "checkpoint flush failed");
+        table = fs::path(wals[shard]).parent_path() / "1.sst";
+        auto remaining = kvstore::kNumShards - 1;
+        for (unsigned i = 0; i < 8192 && remaining != 0; ++i) {
+            auto key = "healthy-" + std::to_string(i);
+            const auto owner = store.ShardForKey(key);
+            if (owner == shard || !healthy_keys[owner].empty()) continue;
+            Check(store.Set(key, "available"), "healthy shard seed failed");
+            healthy_keys[owner] = std::move(key);
+            --remaining;
+        }
+        Check(remaining == 0, "expected one key on every healthy shard");
+        Check(store.Set("different", "pending"), "checkpoint pending seed failed");
+        store.Checkpoint(checkpoint);
+        Check(store.Set("base", "after backup"), "primary update failed");
+    }
+    {
+        const kvstore::KVStore copy(checkpoint);
+        Check(copy.Get("base") == "backup value" && copy.Get("different") == "pending",
+              "standalone checkpoint lost disk or WAL data");
+    }
+    fs::rename(table, table.string() + ".bad");
+    Throws([&] { kvstore::KVStore strict(path); }, "strict open accepted missing shard data");
+    const auto interrupt_restore = [&](Fault point) {
+        const pid_t child = ::fork();
+        Check(child >= 0, "fork failed");
+        if (child == 0) {
+            Arm(point);
+            kvstore::KVStore::RestoreShard(path, checkpoint, shard);
+            ::_exit(3);
+        }
+        int status = 0;
+        Check(::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 77,
+              "restore crash point was not reached");
+    };
+    interrupt_restore(Fault::CrashRestoreBeforePublish);
+    if (modulo) {
+        Check(Bytes(path + "/METADATA").at(8) == 2 && Bytes(checkpoint + "/METADATA").at(8) == 1,
+              "modulo metadata must block older readers before publishing the shard pointer");
+    }
+    {
+        kvstore::KVStore degraded(path, {}, std::nullopt, kvstore::OpenMode::Degraded);
+        Check(degraded.UnavailableShards() == std::vector<std::size_t>{shard}, "wrong shard quarantined");
+        bool unavailable = false;
+        try { (void)degraded.Get("base"); }
+        catch (const kvstore::ShardUnavailable&) { unavailable = true; }
+        Check(unavailable && !degraded.Set("base", "discard"), "failed shard accepted a point operation");
+        for (const auto& key : healthy_keys) {
+            if (!key.empty()) Check(degraded.Get(key) == "available", "healthy shard could not serve a read");
+        }
+        Check(degraded.Set("different", "healthy") && degraded.Get("different") == "healthy",
+              "healthy shard did not serve operations");
+        Throws([&] { (void)degraded.OpenSnapshot(); }, "snapshot accepted an incomplete database");
+        Throws([&] { (void)degraded.Size(); }, "count accepted an incomplete database");
+    }
+    kvstore::KVStore::RestoreShard(path, checkpoint, shard);
+    {
+        kvstore::KVStore restored(path);
+        Check(restored.Get("base") == "backup value" && restored.Get("different") == "healthy" &&
+              restored.UnavailableShards().empty(), "restore changed the wrong shard or lost backup data");
+        Check(restored.Set("base", "restored write"), "restored shard was not writable");
+    }
+    interrupt_restore(Fault::CrashRestoreAfterPublish);
+    kvstore::KVStore restored(path);
+    Check(restored.Get("base") == "backup value", "second restore did not replace the selected generation");
+}
+
+void TestConsistentHashing() {
+    using namespace kvstore::detail;
+    constexpr auto count = kvstore::kNumShards;
+    static_assert(count == 16);
+    const std::string binary("\0\xff", 2);
+    Check(ShardIndex(binary, Routing::Modulo, count) == 0 &&
+          ShardIndex(binary, Routing::Rendezvous, count) == 2, "binary routing changed");
+    std::array<std::size_t, count> distributed{};
+    for (int i = 0; i < 8192; ++i) {
+        const auto key = "hash-key-" + std::to_string(i);
+        const auto before = ShardIndex(key, Routing::Rendezvous, count);
+        const auto after = ShardIndex(key, Routing::Rendezvous, count + 1);
+        Check(before == after || after == count, "adding a shard reassigned nearby keys");
+        const auto smaller = ShardIndex(key, Routing::Rendezvous, count - 1);
+        Check(before == smaller || before == count - 1, "removing a shard moved a surviving key");
+        ++distributed[before];
+    }
+    for (auto size : distributed) Check(size > 300 && size < 700, "uneven hash distribution");
+
+    const auto source = Db("old-modulo"), destination = Db("rehashed");
+    CreateModuloStore(source);
+    {
+        kvstore::KVStore old(source);
+        Check(old.SetWithTtl(binary, "bytes", 3600) && old.Set("other", "other value") &&
+              old.Compact() && old.Delete("other"), "old routing could not write");
+        const auto shard = fs::path(old.WalPaths().front()).parent_path();
+        Check(fs::exists(shard / "1.sst"), "old routing moved a committed key");
+    }
+    kvstore::KVStore::Rehash(source, destination);
+    kvstore::KVStore old(source), rehashed(destination);
+    const auto collect_row = [&](const kvstore::KVStore& store) {
+        auto snapshot = store.OpenSnapshot();
+        kvstore::SnapshotRow row;
+        Check(snapshot->Next(row) && row.key == binary && row.value == "bytes" &&
+              row.expires_at && !snapshot->Next(row), "rehash copied an incorrect row");
+        return row.expires_at;
+    };
+    Check(collect_row(old) == collect_row(rehashed), "rehash changed absolute expiry");
+    const auto new_shard = fs::path(rehashed.WalPaths().at(2)).parent_path();
+    Check(fs::exists(new_shard / "1.sst") && rehashed.Set(binary, "new"),
+          "rehash did not route binary key to its new shard");
 }
 
 void TestConcurrentCompaction() {
@@ -611,12 +1017,7 @@ void LegacyRecord(std::ofstream& file, unsigned char type, std::string_view key,
     bytes.append(key);
     bytes.append(value);
     if (type == 3) append_le(static_cast<std::uint64_t>(expiry), 8);
-    std::uint32_t crc = 0xffffffffu;
-    for (const auto byte : bytes) {
-        crc ^= static_cast<unsigned char>(byte);
-        for (int bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ ((crc & 1u) != 0 ? 0xedb88320u : 0u);
-    }
-    append_le(~crc, 4);
+    append_le(TestCrc(bytes), 4);
     file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
 }
 
@@ -647,8 +1048,7 @@ void TestMigration() {
         Check(!store.Get("deleted") && !store.Get("expired") && store.Size() == 3,
               "migrated deletion or absolute expiry mismatch");
         Check(store.Set(key, "routed"), "migrated destination is not writable");
-        // FNV-1a hashes the bytes 00 ff into shard 0.
-        Check(fs::file_size(store.WalPaths().at(0)) != 0, "binary key routed to the wrong shard");
+        Check(fs::file_size(store.WalPaths().at(2)) != 0, "binary key routed to the wrong shard");
     };
     Throws([&] { kvstore::KVStore wrong_layout(source); }, "legacy WAL was silently bypassed");
     const auto locked = Db("locked-destination");
@@ -725,16 +1125,27 @@ int main() {
     root = directory;
     try {
         TestRollback();
+        TestSetBatch();
+        TestBatchAtBufferBoundary();
+        TestUnacknowledgedBatchRecovery();
         TestRecoveryFailures();
         TestCorruptionAndTornRecords();
         TestFlushFailures();
         TestCreateFailuresAndMemoryFailure();
         TestEdges();
         TestPaths();
+        TestSymlinkLock();
         TestModel();
         TestConcurrentCompaction();
         TestCrashBoundaries();
         TestRetirementAndCommittedCorruption();
+        TestCorruptVisibilityRecord();
+        TestSnapshot();
+        TestMergeCrashBoundaries();
+        TestAutomaticCompaction();
+        TestCheckpointAndRestore(false);
+        TestCheckpointAndRestore(true);
+        TestConsistentHashing();
         TestBoundedFlush();
         TestMigration();
         fs::remove_all(root);

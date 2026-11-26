@@ -4,8 +4,8 @@ groups:
       - alert: KVStoreErrorRateHigh
         expr: |
           (
-            sum by (job, instance) (rate(kvstore_operations_total{job="kvstore",operation=~"get|set|set_ttl|delete|size|range",outcome="error"}[1m]))
-            / sum by (job, instance) (rate(kvstore_operations_total{job="kvstore",operation=~"get|set|set_ttl|delete|size|range"}[1m]))
+            sum by (job, instance) (rate(kvstore_operations_total{job="kvstore",operation=~"get|set|set_batch|set_ttl|delete|size|range",outcome="error"}[1m]))
+            / sum by (job, instance) (rate(kvstore_operations_total{job="kvstore",operation=~"get|set|set_batch|set_ttl|delete|size|range"}[1m]))
             > 0.05
           ) and on(job,instance) (up{job="kvstore"} == 1)
         for: 1m
@@ -38,3 +38,14 @@ groups:
         annotations:
           summary: KVStore telemetry is missing
           description: Prometheus has no recent KVStore operation counters from the configured target.
+
+      - alert: KVStoreShardQuarantined
+        expr: |
+          (kvstore_shard_quarantined{job="kvstore"} == 1)
+          and on(job,instance) (up{job="kvstore"} == 1)
+        for: 15s
+        labels:
+          severity: warning
+        annotations:
+          summary: A KVStore shard is quarantined
+          description: Shard {{ $labels.shard }} on {{ $labels.instance }} requires recovery.

@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KVStore Monitoring</title>
+<style>
+  :root {
+    color-scheme: dark;
+    font: 16px/1.5 system-ui, sans-serif;
+    background: #17131f;
+    color: #f5f0ff;
+    --border: #453755;
+    --muted: #c1b6d2;
+    --violet: #b596ff;
+  }
+  body { margin: 0; }
+  header {
+    border-top: 4px solid var(--violet);
+    border-bottom: 1px solid #5d447a;
+    background: linear-gradient(110deg, #35224f, #21182c);
+  }
+  h1, main { width: min(720px, calc(100% - 40px)); margin-inline: auto; }
+  h1 { box-sizing: border-box; padding: 30px 0; margin-block: 0; font-size: clamp(1.65rem, 6vw, 2.4rem); letter-spacing: -.035em; }
+  main { margin-block: 38px; }
+  section { border: 1px solid var(--border); border-radius: 10px; background: #211a2c; padding: clamp(18px, 4vw, 28px); }
+  h2 { font-size: 1.2rem; margin: 0 0 10px; }
+  p { display: flex; gap: 10px; margin: 0 0 24px; color: var(--muted); }
+  p::before { content: ""; width: 8px; height: 8px; margin-top: .5em; flex: 0 0 8px; border-radius: 50%; background: #9b8db1; }
+  p[data-state="starting"]::before { background: #fbbf24; }
+  p[data-state="connected"]::before { background: #34d399; }
+  p[data-state="failed"]::before { background: #fb7185; }
+  nav { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  button, a { font: inherit; font-weight: 650; padding: 8px 15px; border-radius: 6px; }
+  button { border: 1px solid #9369e6; background: #8154cd; color: #fff; cursor: pointer; }
+  button:hover:not(:disabled) { background: #7043bd; }
+  button:disabled { background: #493460; border-color: #644b83; color: #d5c6e9; cursor: default; }
+  a { color: #e5d8ff; border: 1px solid #614e77; text-decoration: none; }
+  a:hover { background: #342344; border-color: var(--violet); }
+  :focus-visible { outline: 2px solid var(--violet); outline-offset: 3px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>KVStore Monitoring</h1>
+</header>
+<main>
+  <section aria-labelledby="app-title">
+    <h2 id="app-title">KVStore app</h2>
+    <p id="status" role="status">Checking the local connection…</p>
+    <nav aria-label="Monitoring controls">
+      <button id="start" type="button" disabled>Start KVStore</button>
+      <a href="http://127.0.0.1:3000/d/kvstore-live/kvstore-live">Open Grafana</a>
+      <a href="http://127.0.0.1:9090/alerts">Prometheus alerts</a>
+    </nav>
+  </section>
+</main>
+<script>
+  const button = document.getElementById('start');
+  const statusText = document.getElementById('status');
+  const descriptions = {
+    stopped: 'Start a local demo and send one minute of read-heavy traffic.',
+    starting: 'Starting KVStore and waiting for its metrics endpoint…',
+    connected: 'KVStore is connected. Grafana will show data after Prometheus collects a few samples.',
+    failed: 'KVStore failed to start. Check build/monitoring/local/kvstore.log and try again.'
+  };
+  let pending = false;
+  let lastError = '';
+
+  function show(state) {
+    statusText.textContent = lastError || descriptions[state];
+    statusText.dataset.state = lastError ? 'failed' : state;
+    button.disabled = pending || state === 'starting' || state === 'connected';
+  }
+
+  async function refresh() {
+    if (pending) return;
+    try {
+      const result = await fetch('/api/status');
+      if (!result.ok) throw new Error();
+      const {app} = await result.json();
+      if (app === 'connected') lastError = '';
+      if (!pending) show(app);
+    } catch {
+      statusText.textContent = 'The monitoring launcher is unavailable.';
+      statusText.dataset.state = 'failed';
+      button.disabled = true;
+    }
+  }
+
+  button.addEventListener('click', async () => {
+    pending = true;
+    lastError = '';
+    show('starting');
+    try {
+      const result = await fetch('/api/start', {method: 'POST'});
+      const state = await result.json();
+      if (!result.ok) throw new Error(state.error);
+      show(state.app);
+    } catch (error) {
+      lastError = error.message;
+    } finally {
+      pending = false;
+      refresh();
+    }
+  });
+
+  refresh();
+  setInterval(refresh, 1500);
+</script>
+</body>
+</html>

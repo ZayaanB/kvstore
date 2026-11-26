@@ -165,9 +165,9 @@ def exercise(args, work):
 
             panels = {panel["title"]: panel for panel in dashboard["dashboard"]["panels"]}
 
-            def panel_expression(title, target=0):
+            def panel_expression(title, target=0, operation="get"):
                 return (panels[title]["targets"][target]["expr"]
-                        .replace("${operation:regex}", "get").replace("$window", "30s"))
+                        .replace("${operation:regex}", operation).replace("$window", "30s"))
 
             expressions = {
                 "throughput": panel_expression("Completed data operations"),
@@ -244,6 +244,13 @@ def exercise(args, work):
                 raise RuntimeError(f"Error alert did not reach firing={expected}")
 
             save(output / "error-alert.json", drive_until_alert(True))
+            failure_labels = {"operation": "set_ttl", "outcome": "error"}
+            failures = panel_expression("Failed operations and lookup misses", operation="set_ttl")
+            completed = panel_expression("Completed data operations", operation="set_ttl")
+            if not value_matches(grafana_query(failures), lambda value: value > 0, failure_labels):
+                raise RuntimeError("Grafana did not report the failed TTL writes")
+            if value_matches(grafana_query(completed), lambda value: value > 0, failure_labels):
+                raise RuntimeError("Grafana counted failed TTL writes as completed")
             print("Sustained engine errors fired the error-rate alert", flush=True)
             drive_until_alert(False)
             save(output / "final-alerts.json", alerts())

@@ -1,7 +1,8 @@
 """Local snapshot interchange, independent of Spark and the C++ library."""
 
+import argparse
 import base64
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, ExitStack
 from dataclasses import dataclass
 import hashlib
 import json
@@ -9,6 +10,8 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import struct
+import subprocess
 from uuid import UUID, uuid4
 
 import fcntl
@@ -257,3 +260,68 @@ def validate_export(directory, input_copy):
 
 def new_capture(sequence, captured_at):
     return Capture(sequence, captured_at, str(uuid4()))
+
+
+def _read_exact(stream, size):
+    data = stream.read(size)
+    if len(data) != size:
+        raise OSError("KVStore snapshot stream ended early")
+    return data
+
+
+def _snapshot_rows(process):
+    stream = process.stdout
+    while True:
+        tag = _read_exact(stream, 1)
+        if tag == b"\0":
+            if stream.read(1) or process.wait() != 0:
+                raise OSError("KVStore did not finish the snapshot successfully")
+            return
+        if tag != b"\1":
+            raise ValueError("invalid KVStore snapshot record tag")
+        key_length, value_length, expiry = struct.unpack("<IIq", _read_exact(stream, 16))
+        if key_length > MAX_KEY_BYTES or value_length > MAX_VALUE_BYTES:
+            raise ValueError("snapshot record exceeds KVStore size limits")
+        yield _read_exact(stream, key_length), _read_exact(stream, value_length), expiry or None
+
+
+@contextmanager
+def _snapshot_process(cli, database):
+    with subprocess.Popen([cli.resolve(), "--snapshot", database], stdout=subprocess.PIPE) as process:
+        try:
+            yield process
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+
+
+def export_database(cli, database, warehouse, output, *, chunk_bytes=8 << 20):
+    with ExitStack() as source:
+        with capture_sequence(warehouse) as sequence:
+            process = source.enter_context(_snapshot_process(cli, database))
+            if _read_exact(process.stdout, 8) != b"KVSNAP01":
+                raise ValueError("unsupported KVStore snapshot stream")
+            captured_at, = struct.unpack("<q", _read_exact(process.stdout, 8))
+            capture = new_capture(sequence, captured_at)
+        return write_export(output, capture, _snapshot_rows(process), chunk_bytes=chunk_bytes)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Export a consistent snapshot from a KVStore database.")
+    parser.add_argument("--cli", required=True, type=Path)
+    parser.add_argument("--database", required=True, type=Path)
+    parser.add_argument("--warehouse", required=True, type=Path)
+    parser.add_argument("--chunk-bytes", type=int, default=8 << 20)
+    parser.add_argument("output", type=Path)
+    args = parser.parse_args()
+    manifest = export_database(args.cli, args.database, args.warehouse, args.output,
+                               chunk_bytes=args.chunk_bytes)
+    print(f"Export {manifest['export_id']} contains {manifest['row_count']} live rows")
+
+
+if __name__ == "__main__":
+    main()
