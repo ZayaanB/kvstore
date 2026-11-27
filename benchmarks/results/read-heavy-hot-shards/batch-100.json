@@ -1,0 +1,499 @@
+{
+  "schema_version": 1,
+  "telemetry_mode": "latency",
+  "engine_metrics": false,
+  "environment": {
+    "revision": "a96c30e4add6fe279fb46b758d62f9e23f0b0f3b",
+    "source_state_at_configure": "dirty",
+    "build_type": "Release",
+    "compiler": "GNU 14.3.0",
+    "shard_routing": "rendezvous",
+    "os": "Linux 7.0.0-43-generic",
+    "architecture": "x86_64",
+    "cpu": "13th Gen Intel(R) Core(TM) i9-13900H",
+    "filesystem_magic": "0xef53",
+    "storage_device": "nvme0n1p2 (KINGSTON OM8PGP41024Q-AA)",
+    "hardware_threads": 20,
+    "shards": 16
+  },
+  "workloads": [
+    {
+      "parameters": {
+        "workload": "mixed",
+        "distribution": "hot",
+        "hot_keys": 4,
+        "hot_selection_percent": 90,
+        "write_batch_size": 100,
+        "write_key_distribution": "one-hot-shard-per-worker",
+        "hot_reads_only": true,
+        "threads": 4,
+        "compaction_threads": 0,
+        "seed": 1,
+        "keys": 1000,
+        "key_bytes": 16,
+        "value_bytes": 64,
+        "min_operations_per_worker": 40000,
+        "warmup_reads": 1000,
+        "mix_percent": {
+          "get": 95,
+          "set": 5,
+          "reopen": 0
+        },
+        "expected_read_miss_fraction": 0.0625,
+        "cache_conditions": "prepopulated store; no OS cache eviction",
+        "load_model": "closed-loop",
+        "durability": "fdatasync-per-batch"
+      },
+      "trials": [
+        {
+          "trial": 1,
+          "duration_seconds": 0.554318303,
+          "passed": true,
+          "ok": 150455,
+          "misses": 9545,
+          "errors": 0,
+          "completed": 160000,
+          "attempted": 160000,
+          "ops_per_second": 288642.8233274484,
+          "attempted_ops_per_second": 288642.8233274484,
+          "failure_rate": 0,
+          "failed_operations": 0,
+          "maintenance_seconds": null,
+          "operations": {
+            "get": {
+              "ok": 142455,
+              "misses": 9545,
+              "errors": 0,
+              "completed": 152000,
+              "attempted": 152000,
+              "ops_per_second": 274210.682161076,
+              "attempted_ops_per_second": 274210.682161076,
+              "failure_rate": 0,
+              "latency": {
+                "samples": 152000,
+                "mean_seconds": 1.0305482085526317e-05,
+                "p50_seconds": 7.350000000000001e-07,
+                "p95_seconds": 1.695e-06,
+                "p99_seconds": 2.559e-06
+              }
+            },
+            "set": {
+              "ok": 8000,
+              "misses": 0,
+              "errors": 0,
+              "completed": 8000,
+              "attempted": 8000,
+              "ops_per_second": 14432.14116637242,
+              "attempted_ops_per_second": 14432.14116637242,
+              "failure_rate": 0,
+              "latency": {
+                "samples": 0,
+                "mean_seconds": null,
+                "p50_seconds": null,
+                "p95_seconds": null,
+                "p99_seconds": null
+              }
+            },
+            "compact": {
+              "ok": 0,
+              "misses": 0,
+              "errors": 0,
+              "completed": 0,
+              "attempted": 0,
+              "ops_per_second": 0,
+              "attempted_ops_per_second": 0,
+              "failure_rate": 0,
+              "latency": {
+                "samples": 0,
+                "mean_seconds": null,
+                "p50_seconds": null,
+                "p95_seconds": null,
+                "p99_seconds": null
+              }
+            },
+            "reopen": {
+              "ok": 0,
+              "misses": 0,
+              "errors": 0,
+              "completed": 0,
+              "attempted": 0,
+              "ops_per_second": 0,
+              "attempted_ops_per_second": 0,
+              "failure_rate": 0,
+              "latency": {
+                "samples": 0,
+                "mean_seconds": null,
+                "p50_seconds": null,
+                "p95_seconds": null,
+                "p99_seconds": null
+              }
+            },
+            "set_batch": {
+              "ok": 80,
+              "misses": 0,
+              "errors": 0,
+              "completed": 80,
+              "attempted": 80,
+              "ops_per_second": 144.3214116637242,
+              "attempted_ops_per_second": 144.3214116637242,
+              "failure_rate": 0,
+              "latency": {
+                "samples": 80,
+                "mean_seconds": 0.0072619813625,
+                "p50_seconds": 0.006553599,
+                "p95_seconds": 0.012845055000000001,
+                "p99_seconds": 0.026738687
+              }
+            }
+          },
+          "resources": {
+            "measured_process_cpu_seconds": 0.20881899999999998,
+            "process_lifetime_peak_rss_bytes": 5263360,
+            "final_wal_bytes": 981000,
+            "filesystem_available_bytes": 518735560704,
+            "wal_sync_count": null,
+            "failed_wal_sync_count": null,
+            "wal_sync_latency": null,
+            "bytes_written": null,
+            "compaction_bytes_processed": null
+          },
+          "error_messages": []
+        },
+        {
+          "trial": 2,
+          "duration_seconds": 0.504081487,
+          "passed": true,
+          "ok": 150455,
+          "misses": 9545,
+          "errors": 0,
+          "completed": 160000,
+          "attempted": 160000,
+          "ops_per_second": 317408.99859708594,
+          "attempted_ops_per_second": 317408.99859708594,
+          "failure_rate": 0,
+          "failed_operations": 0,
+          "maintenance_seconds": null,
+          "operations": {
+            "get": {
+              "ok": 142455,
+              "misses": 9545,
+              "errors": 0,
+              "completed": 152000,
+              "attempted": 152000,
+              "ops_per_second": 301538.54866723163,
+              "attempted_ops_per_second": 301538.54866723163,
+              "failure_rate": 0,
+              "latency": {
+                "samples": 152000,
+                "mean_seconds": 9.315879552631579e-06,
+                "p50_seconds": 7.030000000000001e-07,
+                "p95_seconds": 1.7270000000000002e-06,
+                "p99_seconds": 2.751e-06
+              }
+            },
+            "set": {
+              "ok": 8000,
+              "misses": 0,
+              "errors": 0,
+              "completed": 8000,
+              "attempted": 8000,
+              "ops_per_second": 15870.449929854298,
+              "attempted_ops_per_second": 15870.449929854298,
+              "failure_rate": 0,
+              "latency": {
+                "samples": 0,
+                "mean_seconds": null,
+                "p50_seconds": null,
+                "p95_seconds": null,
+                "p99_seconds": null
+              }
+            },
+            "compact": {
+              "ok": 0,
+              "misses": 0,
+              "errors": 0,
+              "completed": 0,
+              "attempted": 0,
+              "ops_per_second": 0,
+              "attempted_ops_per_second": 0,
+              "failure_rate": 0,
+              "latency": {
+                "samples": 0,
+                "mean_seconds": null,
+                "p50_seconds": null,
+                "p95_seconds": null,
+                "p99_seconds": null
+              }
+            },
+            "reopen": {
+              "ok": 0,
+              "misses": 0,
+              "errors": 0,
+              "completed": 0,
+              "attempted": 0,
+              "ops_per_second": 0,
+              "attempted_ops_per_second": 0,
+              "failure_rate": 0,
+              "latency": {
+                "samples": 0,
+                "mean_seconds": null,
+                "p50_seconds": null,
+                "p95_seconds": null,
+                "p99_seconds": null
+              }
+            },
+            "set_batch": {
+              "ok": 80,
+              "misses": 0,
+              "errors": 0,
+              "completed": 80,
+              "attempted": 80,
+              "ops_per_second": 158.70449929854297,
+              "attempted_ops_per_second": 158.70449929854297,
+              "failure_rate": 0,
+              "latency": {
+                "samples": 80,
+                "mean_seconds": 0.0062456628625,
+                "p50_seconds": 0.006029311000000001,
+                "p95_seconds": 0.011796479,
+                "p99_seconds": 0.012582911
+              }
+            }
+          },
+          "resources": {
+            "measured_process_cpu_seconds": 0.20581599999999994,
+            "process_lifetime_peak_rss_bytes": 5263360,
+            "final_wal_bytes": 981000,
+            "filesystem_available_bytes": 518735552512,
+            "wal_sync_count": null,
+            "failed_wal_sync_count": null,
+            "wal_sync_latency": null,
+            "bytes_written": null,
+            "compaction_bytes_processed": null
+          },
+          "error_messages": []
+        },
+        {
+          "trial": 3,
+          "duration_seconds": 0.470538794,
+          "passed": true,
+          "ok": 150455,
+          "misses": 9545,
+          "errors": 0,
+          "completed": 160000,
+          "attempted": 160000,
+          "ops_per_second": 340035.725088376,
+          "attempted_ops_per_second": 340035.725088376,
+          "failure_rate": 0,
+          "failed_operations": 0,
+          "maintenance_seconds": null,
+          "operations": {
+            "get": {
+              "ok": 142455,
+              "misses": 9545,
+              "errors": 0,
+              "completed": 152000,
+              "attempted": 152000,
+              "ops_per_second": 323033.93883395725,
+              "attempted_ops_per_second": 323033.93883395725,
+              "failure_rate": 0,
+              "latency": {
+                "samples": 152000,
+                "mean_seconds": 8.862315875e-06,
+                "p50_seconds": 6.71e-07,
+                "p95_seconds": 1.5350000000000001e-06,
+                "p99_seconds": 2.367e-06
+              }
+            },
+            "set": {
+              "ok": 8000,
+              "misses": 0,
+              "errors": 0,
+              "completed": 8000,
+              "attempted": 8000,
+              "ops_per_second": 17001.786254418803,
+              "attempted_ops_per_second": 17001.786254418803,
+              "failure_rate": 0,
+              "latency": {
+                "samples": 0,
+                "mean_seconds": null,
+                "p50_seconds": null,
+                "p95_seconds": null,
+                "p99_seconds": null
+              }
+            },
+            "compact": {
+              "ok": 0,
+              "misses": 0,
+              "errors": 0,
+              "completed": 0,
+              "attempted": 0,
+              "ops_per_second": 0,
+              "attempted_ops_per_second": 0,
+              "failure_rate": 0,
+              "latency": {
+                "samples": 0,
+                "mean_seconds": null,
+                "p50_seconds": null,
+                "p95_seconds": null,
+                "p99_seconds": null
+              }
+            },
+            "reopen": {
+              "ok": 0,
+              "misses": 0,
+              "errors": 0,
+              "completed": 0,
+              "attempted": 0,
+              "ops_per_second": 0,
+              "attempted_ops_per_second": 0,
+              "failure_rate": 0,
+              "latency": {
+                "samples": 0,
+                "mean_seconds": null,
+                "p50_seconds": null,
+                "p95_seconds": null,
+                "p99_seconds": null
+              }
+            },
+            "set_batch": {
+              "ok": 80,
+              "misses": 0,
+              "errors": 0,
+              "completed": 80,
+              "attempted": 80,
+              "ops_per_second": 170.01786254418803,
+              "attempted_ops_per_second": 170.01786254418803,
+              "failure_rate": 0,
+              "latency": {
+                "samples": 80,
+                "mean_seconds": 0.005544271875,
+                "p50_seconds": 0.005373951,
+                "p95_seconds": 0.005767167,
+                "p99_seconds": 0.011272191
+              }
+            }
+          },
+          "resources": {
+            "measured_process_cpu_seconds": 0.2158810000000001,
+            "process_lifetime_peak_rss_bytes": 5263360,
+            "final_wal_bytes": 981000,
+            "filesystem_available_bytes": 518735544320,
+            "wal_sync_count": null,
+            "failed_wal_sync_count": null,
+            "wal_sync_latency": null,
+            "bytes_written": null,
+            "compaction_bytes_processed": null
+          },
+          "error_messages": []
+        }
+      ],
+      "summary": {
+        "passed": true,
+        "repetitions": 3,
+        "valid_trials": 3,
+        "failed_trials": 0,
+        "duration_seconds": 1.528938584,
+        "ok": 451365,
+        "misses": 28635,
+        "errors": 0,
+        "completed": 480000,
+        "attempted": 480000,
+        "ops_per_second": 313943.28393768886,
+        "attempted_ops_per_second": 313943.28393768886,
+        "failure_rate": 0,
+        "median_ops_per_second": 317408.99859708594,
+        "min_ops_per_second": 288642.8233274484,
+        "max_ops_per_second": 340035.725088376,
+        "operations": {
+          "get": {
+            "ok": 427365,
+            "misses": 28635,
+            "errors": 0,
+            "completed": 456000,
+            "attempted": 456000,
+            "ops_per_second": 298246.1197408044,
+            "attempted_ops_per_second": 298246.1197408044,
+            "failure_rate": 0,
+            "latency": {
+              "samples": 456000,
+              "mean_seconds": 9.494559171052632e-06,
+              "p50_seconds": 7.030000000000001e-07,
+              "p95_seconds": 1.663e-06,
+              "p99_seconds": 2.559e-06
+            }
+          },
+          "set": {
+            "ok": 24000,
+            "misses": 0,
+            "errors": 0,
+            "completed": 24000,
+            "attempted": 24000,
+            "ops_per_second": 15697.164196884443,
+            "attempted_ops_per_second": 15697.164196884443,
+            "failure_rate": 0,
+            "latency": {
+              "samples": 0,
+              "mean_seconds": null,
+              "p50_seconds": null,
+              "p95_seconds": null,
+              "p99_seconds": null
+            }
+          },
+          "compact": {
+            "ok": 0,
+            "misses": 0,
+            "errors": 0,
+            "completed": 0,
+            "attempted": 0,
+            "ops_per_second": 0,
+            "attempted_ops_per_second": 0,
+            "failure_rate": 0,
+            "latency": {
+              "samples": 0,
+              "mean_seconds": null,
+              "p50_seconds": null,
+              "p95_seconds": null,
+              "p99_seconds": null
+            }
+          },
+          "reopen": {
+            "ok": 0,
+            "misses": 0,
+            "errors": 0,
+            "completed": 0,
+            "attempted": 0,
+            "ops_per_second": 0,
+            "attempted_ops_per_second": 0,
+            "failure_rate": 0,
+            "latency": {
+              "samples": 0,
+              "mean_seconds": null,
+              "p50_seconds": null,
+              "p95_seconds": null,
+              "p99_seconds": null
+            }
+          },
+          "set_batch": {
+            "ok": 240,
+            "misses": 0,
+            "errors": 0,
+            "completed": 240,
+            "attempted": 240,
+            "ops_per_second": 156.97164196884444,
+            "attempted_ops_per_second": 156.97164196884444,
+            "failure_rate": 0,
+            "latency": {
+              "samples": 240,
+              "mean_seconds": 0.0063506387,
+              "p50_seconds": 0.005898239,
+              "p95_seconds": 0.011796479,
+              "p99_seconds": 0.014155775
+            }
+          }
+        }
+      }
+    }
+  ],
+  "passed": true
+}
