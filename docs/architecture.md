@@ -1,6 +1,6 @@
 # KVStore architecture
 
-Keep the repository name `kvstore`. Its main job is to store and retrieve values by key. It is **embedded**, which means the C++ library runs inside the application on one machine. Recent writes stay in memory for quick reads, and the engine keeps data on disk so the database can grow beyond the write buffer. A fixed view of the data also feeds local MapReduce jobs and Spark-to-Iceberg analytics.
+KVStore's main job is to store and retrieve values by key. It is **embedded**, which means the C++ library runs inside the application on one machine. Recent writes stay in memory for quick reads, and the engine keeps data on disk so the database can grow beyond the write buffer. A fixed view of the data also feeds local MapReduce jobs and Spark-to-Iceberg analytics.
 
 ## System at a glance
 
@@ -34,6 +34,45 @@ Both data-processing paths stream a snapshot, a view of the database at a single
 | Performance measurement | [bench.cpp](../bench.cpp), [benchmarks/compare.py](../benchmarks/compare.py) | Repeatable workload trials, latency distributions, JSON, and baseline comparison |
 | Observability | [monitor](../monitor), [metrics.cpp](../metrics.cpp) | Browser-based status and app launcher, plus Prometheus metrics, Grafana panels, and alerts |
 
+## How data flows
+
+An application links the KVStore library or uses its command-line interface. Each key is routed to one of 16 shards. A shard keeps recent writes in memory, records them in a log on disk, and moves them into sorted files as its memory buffer fills.
+
+```mermaid
+flowchart TD
+    Write["Set or SetBatch"] --> Route["Pick the shard from the key"]
+    Route --> WAL["Append to the log and sync"]
+    WAL --> Mem["Update the memtable"]
+    Mem --> Done["Report success"]
+    Mem -. "buffer full, handled by a later write" .-> Flush["Flush to a sorted table"]
+    Flush -. "eight tables, handled by the next write" .-> Merge["Compact into fewer tables"]
+    Read["Get"] --> Pick["Pick the shard from the key"]
+    Pick --> Check["Check the memtable"]
+    Check -- "not found" --> Tables["Search sorted tables, newest first"]
+```
+
+1. **Write.** The engine picks the shard, makes room in its buffer if needed, appends the change to the log, and syncs it. It then updates memory and reports success.
+2. **Flush and merge.** When the next write would overfill a buffer, the engine first saves the buffer as a sorted file and starts a new log. Once a shard has eight sorted files, its next write attempts to merge them.
+3. **Read.** The engine picks the same shard and checks memory first. If the key is not there, it searches that shard's sorted files from newest to oldest.
+4. **Restart.** The engine uses each shard's manifest to find the current files, then replays the log to rebuild writes that had not been flushed.
+5. **Damage and restore.** In degraded mode, a damaged shard is taken out of service while the others keep handling individual keys. An operator can restore that shard from a checkpoint.
+
+Three other paths sit around the engine:
+
+- **Analytics.** A snapshot streams the database as it was at one moment. It can feed the local MapReduce runner, or be exported and published through Spark into an Iceberg table. Writes wait while the snapshot is open.
+- **Monitoring.** When metrics are enabled, the engine records operation counts and timings. The command-line interface serves them to Prometheus, and Grafana charts them.
+- **Benchmarking.** A separate harness drives the engine with set workloads and saves the results as JSON.
+
+## Design decisions
+
+| Decision | Reason | Cost |
+| --- | --- | --- |
+| 16 shards | Limits damage to one part of the data, and lets reads on other shards continue during a write | Shards do not make writes parallel, because a global lock serializes them |
+| Log each change before applying it | Confirmed writes can be replayed after a crash | A write waits for a disk sync |
+| Buffer writes, then flush sorted files | Writes append to a log, and files stay fixed once written | A lookup may need to check several files |
+| Merge at eight sorted files | Bounds the build-up of files during ordinary writes. Eight is a fixed threshold | The write that triggers a merge takes longer |
+| Batches within one shard | One log and one sync cover the batch | A batch cannot span shards, and an interrupted batch can recover partially |
+
 ## Embedded storage engine
 
 Each key identifies one value, with an optional expiration time. The C++ API accepts arbitrary bytes, so the application decides whether a value contains text, a structured record, or other data. Keys can be up to 1 MiB and values up to 256 MiB. The command-line interface accepts text commands.
@@ -65,6 +104,22 @@ A **flush** turns a shard's write buffer into a sorted file. The engine syncs th
 
 On restart, the engine checks the active files and replays the WAL to rebuild recent writes. It can discard an incomplete final record or a final record with a bad checksum. Each batch uses the same record format as a single write, so an interrupted batch can leave some of its records on disk and recover partially. A bad final checksum can also discard an acknowledged record damaged after the sync. Length fields and block offsets have no separate checksums, so some corruption after startup can make a lookup miss a record or make recovery misread a record boundary. Crash durability depends on the filesystem and device honoring syncs.
 
+### Crash test points
+
+The crash test confirms one write, stops a child process at a chosen point, reopens the database, checks that earlier data survived, and writes again.
+
+| Point | The process stops |
+| ---: | --- |
+| 1 | Partway through appending a log record |
+| 2 | While writing a new sorted table |
+| 3 | After syncing the new sorted table |
+| 4 | After renaming the new manifest into place |
+| 5 | After syncing the directory that holds the new manifest |
+| 6 | Before removing the old log |
+| 7 | After removing the old log |
+
+The first point interrupts a write. The other six interrupt a flush started by `Compact()`. These tests simulate process crashes, not power loss. Interrupted merges, batches, restores, and migrations have separate tests. [Crash tests](../tests/failure_tests.cpp)
+
 ### Compaction and snapshots
 
 **Compaction** merges sorted files so reads have fewer files to check. When a shard has eight sorted files, its next write attempts a merge. The merge happens during the write and can delay other writes and reads on that shard. A recoverable merge failure leaves the current files in use. The next attempt follows another flush. `Compact()` also flushes and merges on demand. Both paths keep the newest value and can drop deleted or expired entries when every older copy is covered. The engine syncs the merged file and switches the manifest before removing the files it replaced.
@@ -75,7 +130,7 @@ On restart, the engine checks the active files and replays the WAL to rebuild re
 
 In the default strict mode, a shard failure can stop the whole database. In **degraded mode**, the engine takes the damaged shard out of service. The healthy shards can still read and write individual keys. Requests to read a damaged shard report an error. Whole-database scans, counts, and snapshots require every shard.
 
-A **checkpoint** is a verified copy of the database at one point in time. It can be made through the C++ API while writes wait, or from the CLI after other processes close the database. To restore one shard, the engine verifies a replacement from a checkpoint of the same database and switches that shard to the replacement in one rename. Other shards keep their current data. The old shard files stay available for diagnosis. For databases using legacy routing, restore records the new format before switching the shard so an older binary refuses to open stale files.
+A **checkpoint** is a verified copy of the database at one point in time. It can be made through the C++ API while writes wait, or from the CLI after other processes close the database. To restore one shard, the engine verifies a replacement from a checkpoint of the same database and switches that shard to the replacement in one rename. Other shards keep their current data. The restored shard returns to its checkpoint state, so it loses changes made to that shard afterward. The old shard files stay available for diagnosis. For databases using legacy routing, restore records the new format before switching the shard so an older binary refuses to open stale files.
 
 After host loss, an operator can bring up the latest checkpoint on another host and redirect the application once the original host can no longer accept writes. Recovery reaches the point captured by that checkpoint.
 
@@ -110,6 +165,10 @@ The 95% read and 5% write comparison used a Release build, four threads, and 1,0
 
 This run used an Intel i9-13900H. The 1,000 preloaded keys fit in memory. Workers collect writes during the read loop and submit them in bursts. Write call latency starts when the batch is submitted and includes time waiting for locks and syncing the WAL. Throughput also includes time spent collecting the batch. The largest batch size produced 24 timed write calls, so its p99 reflects the slowest calls in a small sample.
 
+With one write per call, every write waits for its own sync while holding the global writer lock, so writers queue behind one another. A batch shares one sync across many updates. The tradeoff is that the caller must collect updates, and none is confirmed until the batch call returns.
+
+The [recorded results](../benchmarks/results/read-heavy-hot-shards) note that the source tree had uncommitted changes when the build was configured. The runs with large batches are also very short: the first trial with 1,000 writes per call took under 0.1 seconds. Treat the figures as measurements of this setup, and confirm them with longer runs from a clean commit.
+
 ### Reproduce the read-heavy benchmark
 
 Use a Release build and run the four configurations sequentially. Each uses the same hot keys, read/write ratio, and write-shard assignments.
@@ -129,53 +188,16 @@ The HTML report compares matching workload parameters and checks the host, compi
 
 Run `./monitor` to start monitoring and open the browser launcher. The CLI can expose a local `/metrics` endpoint with operation counts and timing buckets. It omits keys, values, and database paths from metric labels and avoids taking storage locks. Prometheus collects the measurements and checks four alert conditions. Grafana shows how throughput, latency, errors, and storage activity change over time. Its live charts count each `SetBatch()` call as one request. The benchmark reports each key written as an operation. [Monitoring setup](../README.md#local-monitoring)
 
-## Resume bullets and explanations
+## Limits and possible next steps
 
-**Embedded Key-Value Store (Disk-Backed)** | *C++20, Linux, Spark, Iceberg, Prometheus, Grafana*
-
-### Recommended four
-
-- Measured **1.91M ops/s** at **1.47 µs p99 read latency** on a warm 95/5 workload with 1,000-write batches.
-
-  For every 100 operations, 95 were reads and five were writes. Four workers read mostly from a small set of frequently used keys and wrote in groups of 1,000, with one durable log sync per group. Each read or key update counted as one operation. About 99 out of 100 reads finished within 1.47 microseconds. [Benchmark setup and results](#benchmarks-and-monitoring)
-
-- Stored **12 MiB with a 1 MiB write buffer** by flushing updates to sorted files across **16 shards**.
-
-  A local capacity check inserted 768 values of 16 KiB each. As the buffer filled, the engine moved data to disk. After updating and deleting some keys, the check reopened the store and verified single-key reads and a range scan. The 1 MiB figure is the configured limit for recent writes. Other parts of the process use memory too. [Write and read paths](#write-and-read-paths)
-
-- Kept **15 of 16 shards** readable by isolating a failed shard, then restored it from backup.
-
-  A shard holds part of the database. The test made one shard's data file unavailable and read a known key from each of the 15 healthy shards. It then restored the damaged shard from a verified backup and checked the restored value after reopening. [Shard recovery tests](../tests/failure_tests.cpp)
-
-- Enabled SQL queries on **2 Iceberg table versions** by publishing database snapshots with Spark.
-
-  The test exported the live database, changed and deleted keys, then exported it again. Spark published both exports into an Iceberg table. A query against the newest version saw the changes, and a query against the first version still saw the original data. KVStore supplies the snapshot and export pipeline. Spark and Iceberg provide the processing and versioned table. [Live export verification](../lakehouse/verify.py)
-
-### Alternate bullets
-
-- Kept **15 of 16 shards** open to reads during a single-shard write using per-shard read/write locks.
-
-  A write blocks reads on its own shard while it saves changes and updates memory. Readers can still look up keys on other shards. A separate lock makes all writers take turns. [Locking and write path](#write-and-read-paths)
-
-- Made writes durable across **16 shards** by syncing a checksummed log before updating the in-memory buffer.
-
-  The write-ahead log records each change before the engine updates the in-memory buffer. The disk sync makes acknowledged writes recoverable when storage honors the sync, and the checksum helps detect corrupted records during replay. [Flush and restart](#flush-and-restart)
-
-- Reduced **8 sorted files to 1** in a storage test by triggering compaction automatically during writes.
-
-  The test filled one shard with eight sorted files. The next write automatically merged them and left one active sorted file for that shard. The test reopened the database and checked that the latest write was still there. [Compaction tests](../tests/failure_tests.cpp)
-
-- Preserved deletes through **2 simulated compaction crashes** by publishing merged tables before removing old files.
-
-  The test stopped the process before publishing the new file list and just after swapping it in. Reopening in either case kept the deleted key absent and let the store accept a new write. [Crash recovery tests](../tests/failure_tests.cpp)
-
-- Verified consistent hashing across **8,192 keys** by testing which keys moved when a shard was added or removed.
-
-  The test routed the same keys with 15, 16, and 17 candidate shards. Adding a candidate moved keys only to that candidate, and removing a candidate moved only its former keys. The database itself runs with 16 shards. [Routing tests](../tests/failure_tests.cpp)
-
-- Added **4 Prometheus alerts** for elevated errors, low disk space, missing metrics, and quarantined shards.
-
-  Prometheus checks the metrics exposed by the engine. A quarantined shard is one the engine has taken out of service after detecting a failure. Grafana shows the metrics and alert status. [Alert rules](../monitoring/alerts.yml)
+| Current limit | Possible next step |
+| --- | --- |
+| Concurrent `Set()` calls each sync separately | Group commit, so waiting writers share a sync |
+| A global lock serializes writes and flushes | Finer-grained write locking |
+| Merging runs inside a write | Background compaction |
+| A lookup can search several sorted tables | Bloom filters to skip tables that cannot hold the key |
+| Disk lookups and scans share one lock | Allow independent disk reads to run together |
+| Recovery after host loss is manual and limited to the checkpoint | Replication with a rule for which host may write |
 
 ## Verification
 
